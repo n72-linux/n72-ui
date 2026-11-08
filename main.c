@@ -18,6 +18,8 @@
  *                  through /dev/mbx when present)
  *   N72_SLEEP      set to 0 for Power to only blank the screen instead of
  *                  suspending the system
+ *   N72_IDLE_SLEEP seconds without input before sleeping (default 120, 0
+ *                  never); not while USB power is present
  *
  * n72-ui --bench times full-screen redraws and exits.
  */
@@ -48,7 +50,7 @@
 
 static char *self_argv[4];
 static lv_obj_t *home_scr;
-static lv_obj_t *clock_lbl, *date_lbl;
+static lv_obj_t *clock_lbl, *date_lbl, *batt_lbl;
 static bool in_demo;
 static int keys_fd = -1;
 static int touch_wait_fd = -1;		/* own handle on the touch device, for poll() */
@@ -607,6 +609,52 @@ static void open_demo(lv_event_t *e)
 
 /* ----------------------------------------------------------------- home */
 
+static int read_sysfs_int(const char *path, int def)
+{
+	FILE *f = fopen(path, "r");
+	int v = def;
+
+	if (f) {
+		if (fscanf(f, "%d", &v) != 1)
+			v = def;
+		fclose(f);
+	}
+	return v;
+}
+
+static bool usb_powered(void)
+{
+	return read_sysfs_int("/sys/class/power_supply/usb/online", 0) == 1;
+}
+
+/* Battery icon and percentage from the PMU's power supply. */
+static void battery_update(void)
+{
+	char st[16] = "";
+	const char *icon;
+	FILE *f;
+	int cap;
+
+	if (!batt_lbl)
+		return;
+	cap = read_sysfs_int("/sys/class/power_supply/battery/capacity", -1);
+	if (cap < 0) {
+		lv_label_set_text(batt_lbl, "");
+		return;
+	}
+	f = fopen("/sys/class/power_supply/battery/status", "r");
+	if (f) {
+		if (!fgets(st, sizeof(st), f))
+			st[0] = 0;
+		fclose(f);
+	}
+	icon = cap > 87 ? LV_SYMBOL_BATTERY_FULL : cap > 62 ? LV_SYMBOL_BATTERY_3 :
+	       cap > 37 ? LV_SYMBOL_BATTERY_2 : cap > 12 ? LV_SYMBOL_BATTERY_1 :
+	       LV_SYMBOL_BATTERY_EMPTY;
+	lv_label_set_text_fmt(batt_lbl, "%s%d%% %s", strncmp(st, "Charging", 8) ? "" :
+			      LV_SYMBOL_CHARGE " ", cap, icon);
+}
+
 static void clock_update(lv_timer_t *t)
 {
 	static const char *const days[] = { "Sunday", "Monday", "Tuesday",
@@ -617,7 +665,11 @@ static void clock_update(lv_timer_t *t)
 	time_t now = time(NULL);
 	struct tm tm;
 
+	static unsigned int ticks;
+
 	LV_UNUSED(t);
+	if (ticks++ % 10 == 0)
+		battery_update();
 	localtime_r(&now, &tm);
 	lv_label_set_text_fmt(clock_lbl, "%02d:%02d", tm.tm_hour, tm.tm_min);
 	if (tm.tm_year + 1900 < 2024)
@@ -657,6 +709,11 @@ static void build_home(void)
 	lv_label_set_text(lbl, "iPod touch  " LV_SYMBOL_USB);
 	lv_obj_set_style_text_opa(lbl, LV_OPA_70, 0);
 	lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 12, 8);
+
+	batt_lbl = lv_label_create(home_scr);
+	lv_label_set_text(batt_lbl, "");
+	lv_obj_set_style_text_opa(batt_lbl, LV_OPA_70, 0);
+	lv_obj_align(batt_lbl, LV_ALIGN_TOP_RIGHT, -12, 8);
 
 	clock_lbl = lv_label_create(home_scr);
 	lv_obj_set_style_text_font(clock_lbl, &lv_font_montserrat_48, 0);
@@ -764,6 +821,28 @@ static bool system_sleep(void)
 	return r == 6;
 }
 
+/* Sleep after a while without input, unless running from USB power. */
+static void idle_check(lv_timer_t *t)
+{
+	static long idle_ms = -1;
+
+	LV_UNUSED(t);
+	if (idle_ms < 0) {
+		const char *e = getenv("N72_IDLE_SLEEP");
+
+		idle_ms = (e ? atol(e) : 120) * 1000;
+	}
+	if (!idle_ms || screen_off || lv_display_get_inactive_time(NULL) < (uint32_t)idle_ms)
+		return;
+	if (usb_powered())
+		return;
+	if (!system_sleep()) {
+		screen_off = true;
+		backlight_power(false);
+	}
+	lv_display_trigger_activity(NULL);
+}
+
 /* -------------------------------------------------------------- buttons */
 
 static void keys_poll(lv_timer_t *t)
@@ -776,6 +855,7 @@ static void keys_poll(lv_timer_t *t)
 	while (read(keys_fd, &ev, sizeof(ev)) == sizeof(ev)) {
 		if (ev.type != EV_KEY || ev.value != 1)
 			continue;
+		lv_display_trigger_activity(NULL);
 		switch (ev.code) {
 		case KEY_HOMEPAGE:
 			if (screen_off) {
@@ -969,6 +1049,7 @@ int main(int argc, char **argv)
 	if (keys)
 		keys_fd = open(keys, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 	lv_timer_create(keys_poll, 30, NULL);
+	lv_timer_create(idle_check, 1000, NULL);
 
 	build_home();
 	if (argc > 1 && !strcmp(argv[1], "--bench"))
