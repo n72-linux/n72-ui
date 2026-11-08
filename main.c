@@ -34,7 +34,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <sys/ioctl.h>
+#include <sys/klog.h>
+#include <sys/socket.h>
 #include <sys/reboot.h>
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
@@ -558,6 +563,149 @@ static void open_system(lv_event_t *e)
 	show(scr);
 }
 
+/* ---------------------------------------------------------------- logs */
+
+/*
+ * The kernel log on the screen, for when there is no USB or Wi-Fi to read it
+ * over (e.g. after a suspend to RAM): the network addresses, then the tail of
+ * the ring buffer, refreshed every 2 s and kept scrolled to the end.
+ */
+#define LOGS_TAIL 6144
+
+static lv_obj_t *logs_net, *logs_text, *logs_box;
+static lv_timer_t *logs_timer;
+static char *logs_buf;
+static int logs_len = -1;
+static bool logs_follow = true;		/* keep the newest lines in view */
+
+static void logs_addr(const char *ifname, char *out, size_t len)
+{
+	struct ifreq ifr;
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+	snprintf(out, len, "%s: -", ifname);
+	if (fd < 0)
+		return;
+	memset(&ifr, 0, sizeof(ifr));
+	snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", ifname);
+	if (!ioctl(fd, SIOCGIFADDR, &ifr))
+		snprintf(out, len, "%s: %s", ifname,
+			 inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr));
+	close(fd);
+}
+
+static void logs_update(lv_timer_t *t)
+{
+	char usb[48], wlan[48];
+	int size, n, i, o, start;
+	char *raw;
+
+	LV_UNUSED(t);
+	logs_addr("usb0", usb, sizeof(usb));
+	logs_addr("wlan0", wlan, sizeof(wlan));
+	lv_label_set_text_fmt(logs_net, "%s    %s", usb, wlan);
+
+	size = klogctl(10, NULL, 0);		/* SYSLOG_ACTION_SIZE_BUFFER */
+	if (size <= 0)
+		size = 1 << 17;
+	raw = malloc(size + 1);
+	if (!raw)
+		return;
+	n = klogctl(3, raw, size);		/* SYSLOG_ACTION_READ_ALL */
+	if (n < 0)
+		n = 0;
+	if (n == logs_len) {			/* nothing new */
+		free(raw);
+		return;
+	}
+	logs_len = n;
+	/* the last LOGS_TAIL bytes, from a line start, without "<level>" */
+	start = n > LOGS_TAIL ? n - LOGS_TAIL : 0;
+	while (start > 0 && start < n && raw[start - 1] != '\n')
+		start++;
+	for (i = start, o = 0; i < n && o < LOGS_TAIL; ) {
+		if (raw[i] == '<' && (i == start || raw[i - 1] == '\n')) {
+			int j = i + 1;
+
+			while (j < n && raw[j] >= '0' && raw[j] <= '9')
+				j++;
+			if (j < n && raw[j] == '>') {
+				i = j + 1;
+				continue;
+			}
+		}
+		logs_buf[o++] = raw[i++];
+	}
+	logs_buf[o] = 0;
+	free(raw);
+	lv_label_set_text_static(logs_text, logs_buf);
+	lv_obj_update_layout(logs_box);
+	if (logs_follow)
+		lv_obj_scroll_to_y(logs_box, LV_COORD_MAX, LV_ANIM_OFF);
+}
+
+/* Volume up/down scroll the log (no touch needed); back at the end, follow. */
+static bool logs_scroll(int dir)
+{
+	if (!logs_box)
+		return false;
+	lv_obj_scroll_by(logs_box, 0, dir * 160, LV_ANIM_OFF);
+	logs_follow = lv_obj_get_scroll_bottom(logs_box) <= 0;
+	return true;
+}
+
+static void logs_delete_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	if (logs_timer)
+		lv_timer_delete(logs_timer);
+	logs_timer = NULL;
+	free(logs_buf);
+	logs_buf = NULL;
+	logs_box = NULL;
+}
+
+static void open_logs(lv_event_t *e)
+{
+	lv_obj_t *scr, *body;
+
+	LV_UNUSED(e);
+	logs_buf = malloc(LOGS_TAIL + 1);
+	if (!logs_buf)
+		return;
+	logs_buf[0] = 0;
+	logs_len = -1;
+	logs_follow = true;
+	body = app_screen("Logs", &scr);
+	lv_obj_set_style_pad_all(body, 6, 0);
+	lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_pad_row(body, 4, 0);
+
+	logs_net = lv_label_create(body);
+	lv_obj_set_width(logs_net, lv_pct(100));
+	lv_obj_set_style_text_font(logs_net, &lv_font_montserrat_12, 0);
+	lv_obj_set_style_text_color(logs_net, lv_color_hex(0x8ab4ff), 0);
+
+	logs_box = lv_obj_create(body);
+	lv_obj_set_width(logs_box, lv_pct(100));
+	lv_obj_set_flex_grow(logs_box, 1);
+	lv_obj_set_style_pad_all(logs_box, 4, 0);
+	lv_obj_set_style_bg_color(logs_box, lv_color_hex(0x05070b), 0);
+	lv_obj_set_style_border_width(logs_box, 0, 0);
+	lv_obj_set_scroll_dir(logs_box, LV_DIR_VER);
+
+	logs_text = lv_label_create(logs_box);
+	lv_obj_set_width(logs_text, lv_pct(100));
+	lv_label_set_long_mode(logs_text, LV_LABEL_LONG_WRAP);
+	lv_obj_set_style_text_font(logs_text, &lv_font_montserrat_12, 0);
+	lv_obj_set_style_text_color(logs_text, lv_color_hex(0xd0d6e0), 0);
+
+	logs_update(NULL);
+	logs_timer = lv_timer_create(logs_update, 2000, NULL);
+	lv_obj_add_event_cb(scr, logs_delete_cb, LV_EVENT_DELETE, NULL);
+	show(scr);
+}
+
 /* ---------------------------------------------------------------- power */
 
 static void power_do(lv_event_t *e)
@@ -693,6 +841,7 @@ static const struct app apps[] = {
 	{ "Paint",    LV_SYMBOL_EDIT,     0xffb84d, 0xe67e00, open_paint, 0 },
 	{ "Settings", LV_SYMBOL_SETTINGS, 0x9aa5b8, 0x5b6578, open_settings, 0 },
 	{ "System",   LV_SYMBOL_EYE_OPEN, 0x45d6a8, 0x14946b, open_system, 0 },
+	{ "Logs",     LV_SYMBOL_FILE,     0x6c7a96, 0x3a4560, open_logs, 0 },
 	{ "Power",    LV_SYMBOL_POWER,    0xff6b5b, 0xc23021, open_power, 0 },
 };
 
@@ -852,18 +1001,36 @@ static void keys_poll(lv_timer_t *t)
 	LV_UNUSED(t);
 	if (keys_fd < 0)
 		return;
+	static uint64_t home_down_us;
+
 	while (read(keys_fd, &ev, sizeof(ev)) == sizeof(ev)) {
-		if (ev.type != EV_KEY || ev.value != 1)
+		if (ev.type != EV_KEY)
 			continue;
+		/*
+		 * Home acts on release: held for a second or more it opens the
+		 * log view, which needs no touch (touch may be what is broken).
+		 */
+		if (ev.code == KEY_HOMEPAGE) {
+			if (ev.value == 1)
+				home_down_us = mono_us();
+			if (ev.value != 0)
+				continue;
+		} else if (ev.value != 1) {
+			continue;
+		}
 		lv_display_trigger_activity(NULL);
 		switch (ev.code) {
 		case KEY_HOMEPAGE:
 			if (screen_off) {
 				screen_off = false;
 				backlight_power(true);
+			} else if (home_down_us && mono_us() - home_down_us >= 1000000) {
+				go_home();
+				open_logs(NULL);
 			} else {
 				go_home();
 			}
+			home_down_us = 0;
 			break;
 		case KEY_POWER:
 			/* a late report of the press that woke us */
@@ -875,10 +1042,12 @@ static void keys_poll(lv_timer_t *t)
 			backlight_power(!screen_off);
 			break;
 		case KEY_VOLUMEUP:
-			backlight_set(backlight_get() + 10);
+			if (!logs_scroll(1))
+				backlight_set(backlight_get() + 10);
 			break;
 		case KEY_VOLUMEDOWN:
-			backlight_set(backlight_get() - 10);
+			if (!logs_scroll(-1))
+				backlight_set(backlight_get() - 10);
 			break;
 		}
 	}
