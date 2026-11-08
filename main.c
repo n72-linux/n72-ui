@@ -709,10 +709,11 @@ static double redraw_ms(int n)
 static int bench(void)
 {
 	lv_obj_t *scr;
-	double home, rects;
+	double home, rects, overlay;
 	int i;
 
 	home = redraw_ms(20);
+	fprintf(stderr, "bench: home %.1f ms\n", home);
 
 	scr = lv_obj_create(NULL);
 	lv_obj_set_style_bg_color(scr, lv_color_hex(0x203040), 0);
@@ -728,12 +729,45 @@ static int bench(void)
 	}
 	lv_screen_load(scr);
 	rects = redraw_ms(20);
+	fprintf(stderr, "bench: rectangles %.1f ms\n", rects);
 
-	printf("n72-ui bench (%s): home screen %.1f ms, 24 rectangles %.1f ms per full redraw\n",
-	       mbx_gpu_stats.submits ? "GPU" : "CPU", home, rects);
-	printf("  GPU submits %lu, fills %lu, flushes %lu, pool misses %lu\n",
-	       mbx_gpu_stats.submits, mbx_gpu_stats.fills, mbx_gpu_stats.flushes,
-	       mbx_gpu_stats.pool_misses);
+	/* Translucent plain panels and an opacity layer over the rectangles. */
+	for (i = 0; i < 3; i++) {
+		lv_obj_t *p = lv_obj_create(scr);
+
+		lv_obj_set_size(p, 280, 110);
+		lv_obj_set_pos(p, 20, 20 + i * 150);
+		lv_obj_set_style_radius(p, 0, 0);
+		lv_obj_set_style_border_width(p, 0, 0);
+		lv_obj_set_style_bg_color(p, lv_color_white(), 0);
+		lv_obj_set_style_bg_opa(p, LV_OPA_30, 0);
+	}
+	{
+		lv_obj_t *grp = lv_obj_create(scr), *l;
+
+		lv_obj_set_size(grp, 240, 300);
+		lv_obj_center(grp);
+		lv_obj_set_style_opa_layered(grp, LV_OPA_70, 0);	/* drawn via a layer */
+		lv_obj_set_style_radius(grp, 0, 0);
+		lv_obj_set_style_bg_color(grp, lv_color_hex(0x2a9d8f), 0);
+		l = lv_label_create(grp);
+		lv_label_set_text(l, "Layer with 70% opacity");
+		lv_obj_center(l);
+	}
+	overlay = redraw_ms(20);
+
+	printf("n72-ui bench (%s): home %.1f ms, 24 rectangles %.1f ms, + translucent panels and layer %.1f ms\n",
+	       mbx_gpu_stats.submits ? "GPU" : "CPU", home, rects, overlay);
+	printf("  GPU submits %lu: fills %lu, blended fills %lu, layers %lu, flushes %lu; pool misses %lu\n",
+	       mbx_gpu_stats.submits, mbx_gpu_stats.fills, mbx_gpu_stats.blends,
+	       mbx_gpu_stats.layers, mbx_gpu_stats.flushes, mbx_gpu_stats.pool_misses);
+	printf("  tasks seen by type:");
+	for (i = 0; i < 16; i++)
+		if (mbx_gpu_stats.seen[i])
+			printf(" %d:%lu", i, mbx_gpu_stats.seen[i]);
+	printf("\n");
+	if (getenv("N72_BENCH_SHOT"))
+		sleep(2);	/* leave the last frame up for a screenshot */
 	return 0;
 }
 

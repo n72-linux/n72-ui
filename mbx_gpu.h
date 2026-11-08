@@ -5,7 +5,8 @@
 #include "lvgl/lvgl.h"
 
 struct mbx_gpu_stats {
-	unsigned long submits, fills, flushes, pool_misses;
+	unsigned long submits, fills, blends, layers, flushes, pool_misses;
+	unsigned long seen[16];	/* draw tasks evaluated, by type */
 };
 extern struct mbx_gpu_stats mbx_gpu_stats;
 

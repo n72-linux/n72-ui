@@ -16,16 +16,24 @@ When `/dev/mbx` exists (the PowerVR MBX Lite driver in the n72 kernel), n72-ui
 draws through the GPU's 2D engine (`mbx_gpu.c`):
 
 - every LVGL draw buffer comes from one GPU-mapped, CPU-cached pool;
-- large plain fills (no radius, no gradient, opaque) run on the GPU;
+- large plain fills (no radius, no gradient) run on the GPU: opaque ones on
+  the 2D engine, translucent ones on the 3D core;
+- opacity layers are composited by the 3D core;
 - the display renders into a full-screen pool buffer and the GPU copies the
   refreshed areas to the framebuffer.
 
 `n72-ui --bench` times full-screen redraws; `N72_GPU=0` forces the CPU path.
 
-| Scene | CPU | GPU |
+Translucent plain fills are blended by the GPU's 3D core, and opacity layers
+(`opa_layered`) are composited by it as textured copies (exact two-pass
+blending below full opacity). GPU and CPU frames agree to within 2 per colour
+channel.
+
+| Scene (full redraw) | CPU | GPU |
 | --- | --- | --- |
-| Home screen | 34.9 ms | 24.1 ms |
-| 24 plain rectangles | 13.2 ms | 9.9 ms |
+| Home screen | 35.0 ms | 24.1 ms |
+| 24 plain rectangles | 12.8 ms | 9.9 ms |
+| + translucent panels and a 70% opacity layer | 34.5 ms | 28.6 ms |
 
 ## Build
 
