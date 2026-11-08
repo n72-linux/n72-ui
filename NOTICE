@@ -1,0 +1,26 @@
+n72-ui is under the MIT licence (LICENSE). It contains or is built from
+the following work of others:
+
+clock_font.h
+    Montserrat SemiBold 8.000, embedded as a TrueType file (the lock
+    screen's clock).
+    Copyright 2011 The Montserrat Project Authors
+    (https://github.com/JulietaUla/Montserrat)
+    SIL Open Font License 1.1: LICENSES/OFL-1.1.txt
+
+n72_icons.c
+    One glyph drawn from "gamepad-variant" of Material Design Icons 7.4.47
+    by Pictogrammers (https://pictogrammers.com), converted by
+    tools/svg2glyph.py.
+    Apache License 2.0: LICENSES/Apache-2.0.txt
+
+tz_table.h
+    Generated from the IANA Time Zone Database, which is in the public
+    domain.
+
+lv_conf.h
+    From LVGL's lv_conf_template.h. LVGL itself is not in this repository;
+    the binary links it (MIT licence, Copyright (c) 2021 LVGL Kft).
+
+The binary also links libn72mbxmem (MIT) from n72-gles and reads
+<drm/apple_mbx_drm.h>, a kernel uapi header (GPL-2.0 WITH Linux-syscall-note).
