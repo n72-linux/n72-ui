@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <linux/kd.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +48,67 @@ static lv_obj_t *home_scr;
 static lv_obj_t *clock_lbl, *date_lbl;
 static bool in_demo;
 static int keys_fd = -1;
+static int touch_wait_fd = -1;		/* own handle on the touch device, for poll() */
+static lv_indev_t *touch_indev;
+
+/* Touch-to-screen latency (N72_LATENCY=1): newest touch event -> flush end. */
+static bool lat_on;
+static uint64_t lat_event_us;		/* newest touch event not yet on screen */
+static uint64_t lat_sum_us, lat_max_us;
+static unsigned int lat_n;
+static uint32_t lat_report_ms;
+
+static uint32_t tick_ms(void);
+
+static uint64_t mono_us(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static uint64_t lat_render_max_us, lat_wake_sum_us, lat_read_us;
+static bool lat_input_frame;
+
+/* Render pending changes immediately (after input), timing the render. */
+static void render_now(void)
+{
+	uint64_t t0 = mono_us(), d;
+
+	lat_input_frame = true;
+	lv_refr_now(NULL);
+	lat_input_frame = false;
+	lat_event_us = 0;	/* nothing to show for this input: don't count it */
+	d = mono_us() - t0;
+	lat_render_max_us = LV_MAX(lat_render_max_us, d);
+}
+
+/* Called when a frame has been flushed to the screen. */
+void n72_frame_shown(void)
+{
+	uint64_t d;
+
+	/* only frames drawn because of touch input count */
+	if (!lat_on || !lat_event_us || !lat_input_frame)
+		return;
+	d = mono_us() - lat_event_us;
+	lat_wake_sum_us += lat_read_us - lat_event_us;
+	lat_event_us = 0;
+	lat_sum_us += d;
+	lat_max_us = LV_MAX(lat_max_us, d);
+	lat_n++;
+	if (tick_ms() - lat_report_ms >= 2000 && lat_n) {
+		fprintf(stderr, "t=%llu touch->screen: %u input frames, average %.1f ms "
+			"(wake %.1f), max %.1f ms; slowest touch render %.1f ms\n",
+			(unsigned long long)(mono_us() / 1000000), lat_n,
+			lat_sum_us / 1000.0 / lat_n, lat_wake_sum_us / 1000.0 / lat_n,
+			lat_max_us / 1000.0, lat_render_max_us / 1000.0);
+		lat_sum_us = lat_max_us = lat_render_max_us = lat_wake_sum_us = 0;
+		lat_n = 0;
+		lat_report_ms = tick_ms();
+	}
+}
 static int tty_fd = -1;
 
 /* ---------------------------------------------------------------- utils */
@@ -837,6 +899,16 @@ int main(int argc, char **argv)
 		}
 		if (indev && swap && *swap == '1')
 			lv_evdev_set_swap_axes(indev, true);
+		if (indev) {
+			touch_indev = indev;
+			touch_wait_fd = open(touch, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+			if (touch_wait_fd >= 0) {
+				int clk = CLOCK_MONOTONIC;
+
+				ioctl(touch_wait_fd, EVIOCSCLOCKID, &clk);
+			}
+		}
+		lat_on = getenv("N72_LATENCY") && *getenv("N72_LATENCY") == '1';
 	}
 
 	if (!keys)
@@ -849,10 +921,39 @@ int main(int argc, char **argv)
 	if (argc > 1 && !strcmp(argv[1], "--bench"))
 		return bench();
 
+	/*
+	 * Sleep until the next LVGL timer or until the touch screen or a button
+	 * has something, and hand touch input to LVGL straight away instead of
+	 * waiting for its read timer.
+	 */
 	for (;;) {
+		struct pollfd pf[2] = {
+			{ .fd = touch_wait_fd, .events = POLLIN },
+			{ .fd = keys_fd, .events = POLLIN },
+		};
 		uint32_t idle = lv_timer_handler();
 
-		usleep(LV_CLAMP(1, idle, 20) * 1000);
+		if (poll(pf, 2, LV_MIN(idle, LV_DEF_REFR_PERIOD)) > 0) {
+			if (pf[0].revents & POLLIN) {
+				struct input_event ev[16];
+				ssize_t r;
+
+				while ((r = read(touch_wait_fd, ev, sizeof(ev))) > 0) {
+					const struct input_event *e = &ev[r / sizeof(ev[0]) - 1];
+
+					/* time the newest event still waiting for a frame */
+					if (!lat_event_us)
+						lat_event_us = (uint64_t)e->input_event_sec * 1000000 +
+							       e->input_event_usec;
+				}
+				lat_read_us = mono_us();
+				lv_indev_read(touch_indev);
+				/* draw the result now, not at the next refresh tick */
+				render_now();
+			}
+			if (pf[1].revents & POLLIN)
+				keys_poll(NULL);
+		}
 	}
 	return 0;
 }

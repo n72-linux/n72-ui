@@ -26,6 +26,8 @@
 #include "mbx_gpu.h"
 #include "mbx_cmd.h"
 
+void n72_frame_shown(void);
+
 #define DRAW_UNIT_ID_MBX	5
 #define POOL_SIZE		(3 * 1024 * 1024)
 #define POOL_ALIGN		128	/* the 3D core needs 128-byte aligned surfaces */
@@ -432,6 +434,7 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 	if (lv_display_flush_is_last(disp) && flush_n) {
 		submit(flush_words, flush_n);
 		flush_n = 0;
+		n72_frame_shown();
 	}
 	lv_display_flush_ready(disp);
 }

@@ -35,6 +35,13 @@ channel.
 | 24 plain rectangles | 12.8 ms | 9.9 ms |
 | + translucent panels and a 70% opacity layer | 34.5 ms | 28.6 ms |
 
+## Responsiveness
+
+The main loop sleeps in `poll()` on the touch screen and buttons, hands touch
+input to LVGL as soon as it arrives and renders the result straight away;
+LVGL's own timers run at 16 ms. With the kernel's fast touch reads (zephyr2
+at 4.5 MHz, ~0.2 ms per frame) touch reports arrive at ~60 Hz instead of ~42.
+
 ## Build
 
 LVGL goes in `../lvgl-src/lvgl` (`git clone -b v9.2.2 https://github.com/lvgl/lvgl`).
@@ -55,6 +62,7 @@ boot (add `noui` to the kernel command line to skip it).
 | `N72_TOUCH_CAL` | `min_x min_y max_x max_y` raw touch range; swap a pair to flip an axis |
 | `N72_TOUCH_SWAP` | `1` swaps the touch axes |
 | `N72_GPU` | `0` draws with the CPU only (default: GPU when `/dev/mbx` exists) |
+| `N72_LATENCY` | `1` logs touch-to-screen latency every 2 s (stderr) |
 | `TZ` | Clock time zone (the initramfs sets it from `/etc/TZ`) |
 
 ## Kernel
