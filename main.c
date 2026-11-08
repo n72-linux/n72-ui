@@ -4,7 +4,8 @@
  *
  * Display: /dev/fb0 (simplefb, 320x480 XRGB8888). Touch: the Zephyr2
  * evdev device. Buttons: gpio-keys (Home returns to the launcher, Power
- * blanks the screen, the volume keys change the brightness).
+ * puts the system to sleep (s2idle) and Power or Home wakes it, the volume
+ * keys change the brightness).
  *
  * Environment:
  *   N72_FB         framebuffer device (default /dev/fb0)
@@ -15,6 +16,8 @@
  *   N72_TOUCH_SWAP set to 1 to swap the touch axes
  *   N72_GPU        set to 0 to draw with the CPU only (default: MBX GPU
  *                  through /dev/mbx when present)
+ *   N72_SLEEP      set to 0 for Power to only blank the screen instead of
+ *                  suspending the system
  *
  * n72-ui --bench times full-screen redraws and exits.
  */
@@ -716,6 +719,51 @@ static void build_home(void)
 	lv_screen_load(home_scr);
 }
 
+/* ---------------------------------------------------------------- sleep */
+
+static uint64_t woke_us;	/* when the last system sleep ended */
+
+static void drain(int fd)
+{
+	struct input_event ev[16];
+
+	if (fd >= 0)
+		while (read(fd, ev, sizeof(ev)) > 0)
+			;
+}
+
+/*
+ * Suspend to idle: the write returns once Power or Home has woken the
+ * system. Returns false when sleep is unavailable or refused, so the
+ * caller can fall back to blanking the screen.
+ */
+static bool system_sleep(void)
+{
+	const char *e = getenv("N72_SLEEP");
+	int fd;
+	ssize_t r;
+
+	if (e && !strcmp(e, "0"))
+		return false;
+	fd = open("/sys/power/state", O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+	backlight_power(false);
+	r = write(fd, "freeze", 6);
+	close(fd);
+	woke_us = mono_us();
+	if (r != 6)
+		fprintf(stderr, "n72-ui: suspend failed: %s\n", strerror(errno));
+
+	/* the wake press and anything touched meanwhile are not input */
+	drain(keys_fd);
+	drain(touch_wait_fd);
+	screen_off = false;
+	backlight_power(true);
+	lv_obj_invalidate(lv_screen_active());
+	return r == 6;
+}
+
 /* -------------------------------------------------------------- buttons */
 
 static void keys_poll(lv_timer_t *t)
@@ -738,6 +786,11 @@ static void keys_poll(lv_timer_t *t)
 			}
 			break;
 		case KEY_POWER:
+			/* a late report of the press that woke us */
+			if (mono_us() - woke_us < 500000)
+				break;
+			if (!screen_off && system_sleep())
+				break;
 			screen_off = !screen_off;
 			backlight_power(!screen_off);
 			break;
