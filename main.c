@@ -938,28 +938,77 @@ static void drain(int fd)
 			;
 }
 
+/* n72_lcd.panel_sleep reads "Y" or "N". */
+static bool panel_sleep_param_yes(void)
+{
+	char c = 0;
+	FILE *f = fopen("/sys/module/n72_lcd/parameters/panel_sleep", "r");
+
+	if (!f)
+		return false;
+	if (fread(&c, 1, 1, f) != 1)
+		c = 0;
+	fclose(f);
+	return c == 'Y';
+}
+
+/* Does the kernel offer this sleep state ("mem" only with n72_sleep.deep=1)? */
+static bool sleep_offered(const char *state)
+{
+	char buf[64] = "";
+	FILE *f = fopen("/sys/power/state", "r");
+
+	if (!f)
+		return false;
+	if (!fgets(buf, sizeof(buf), f))
+		buf[0] = 0;
+	fclose(f);
+	return strstr(buf, state) != NULL;
+}
+
+static bool write_sleep_state(const char *state)
+{
+	int fd = open("/sys/power/state", O_WRONLY | O_CLOEXEC);
+	ssize_t r;
+
+	if (fd < 0)
+		return false;
+	r = write(fd, state, strlen(state));
+	close(fd);
+	if (r != (ssize_t)strlen(state))
+		fprintf(stderr, "n72-ui: %s failed: %s\n", state, strerror(errno));
+	return r == (ssize_t)strlen(state);
+}
+
 /*
- * Suspend to idle: the write returns once Power or Home has woken the
- * system. Returns false when sleep is unavailable or refused, so the
- * caller can fall back to blanking the screen.
+ * Sleep until Power or Home wakes the system. On battery, suspend to RAM
+ * when the kernel offers it (the SoC powers off); on USB power suspend to
+ * idle, since the charger's events wake the PMU straight out of
+ * hibernate (and plugging in should wake us anyway). N72_SLEEP=0 turns
+ * sleep off, N72_SLEEP=freeze always uses suspend to idle. Returns false
+ * when sleep is unavailable or refused, so the caller can fall back to
+ * blanking the screen.
  */
 static bool system_sleep(void)
 {
 	const char *e = getenv("N72_SLEEP");
-	int fd;
-	ssize_t r;
+	bool deep, ok;
 
 	if (e && !strcmp(e, "0"))
 		return false;
-	fd = open("/sys/power/state", O_WRONLY | O_CLOEXEC);
-	if (fd < 0)
-		return false;
-	backlight_power(false);
-	r = write(fd, "freeze", 6);
-	close(fd);
+	deep = !(e && !strcmp(e, "freeze")) && !usb_powered() && sleep_offered("mem");
+	/*
+	 * The display driver switches the backlight and the panel off
+	 * together and back on once the picture is back, unless it leaves the
+	 * panel on in s2idle: blanking here first only showed a dim, unlit
+	 * picture for a moment on the way down and up.
+	 */
+	if (!deep && !panel_sleep_param_yes())
+		backlight_power(false);
+	ok = deep && write_sleep_state("mem");
+	if (!ok)	/* not deep, or the PMU refused: suspend to idle */
+		ok = write_sleep_state("freeze");
 	woke_us = mono_us();
-	if (r != 6)
-		fprintf(stderr, "n72-ui: suspend failed: %s\n", strerror(errno));
 
 	/* the wake press and anything touched meanwhile are not input */
 	drain(keys_fd);
@@ -967,7 +1016,7 @@ static bool system_sleep(void)
 	screen_off = false;
 	backlight_power(true);
 	lv_obj_invalidate(lv_screen_active());
-	return r == 6;
+	return ok;
 }
 
 /* Sleep after a while without input, unless running from USB power. */
