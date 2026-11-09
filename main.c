@@ -111,10 +111,77 @@ static void render_now(void)
 	}
 }
 
+/*
+ * N72_FPS=1: frame pacing. Frames less than 100 ms apart form a burst (an
+ * animation); at the end of one, print its frame count, intervals and the
+ * time spent rendering (refresh start to flush).
+ */
+static bool fps_on;
+static uint64_t fps_last_us, fps_first_us, fps_refr_us, fps_int_max, fps_rend_sum, fps_rend_max;
+static unsigned int fps_n, fps_slow;
+static struct mbx_gpu_stats fps_g0;
+
+void n72_refr_start(void)
+{
+	fps_refr_us = mono_us();
+}
+
+static void fps_frame(void)
+{
+	uint64_t now = mono_us(), rend = now - fps_refr_us, iv = now - fps_last_us;
+
+	if (fps_n && iv > 100000) {
+		if (fps_n >= 4)
+			fprintf(stderr, "burst: %u frames in %.0f ms (%.1f fps), interval max %.1f ms, "
+				"%u over 20 ms; render avg %.1f max %.1f ms\n", fps_n,
+				(fps_last_us - fps_first_us) / 1000.0,
+				(fps_n - 1) * 1e6 / (double)(fps_last_us - fps_first_us + 1),
+				fps_int_max / 1000.0, fps_slow, fps_rend_sum / 1000.0 / fps_n,
+				fps_rend_max / 1000.0);
+		if (fps_n >= 4) {
+			struct mbx_gpu_stats *g = &mbx_gpu_stats;
+			int i;
+
+			fprintf(stderr, "  per frame: GPU fills %.1f (rounded %.1f) blends %.1f layers %.1f; "
+				"CPU fills radius %.1f small %.1f; GPU ioctl ms: sync %.1f submit %.1f 3d %.1f; tasks",
+				(g->fills - fps_g0.fills) / (double)fps_n,
+				(g->fill_corners - fps_g0.fill_corners) / (double)fps_n,
+				(g->blends - fps_g0.blends) / (double)fps_n,
+				(g->layers - fps_g0.layers) / (double)fps_n,
+				(g->fill_radius - fps_g0.fill_radius) / (double)fps_n,
+				(g->fill_small - fps_g0.fill_small) / (double)fps_n,
+				(g->sync_us - fps_g0.sync_us) / 1000 / fps_n,
+				(g->submit_us - fps_g0.submit_us) / 1000 / fps_n,
+				(g->blit3d_us - fps_g0.blit3d_us) / 1000 / fps_n);
+			for (i = 0; i < 16; i++)
+				if (g->seen[i] != fps_g0.seen[i])
+					fprintf(stderr, " %d:%.1f", i, (g->seen[i] - fps_g0.seen[i]) / (double)fps_n);
+			fprintf(stderr, "\n");
+		}
+		fps_n = 0;
+	}
+	if (!fps_n) {
+		fps_g0 = mbx_gpu_stats;
+		fps_first_us = now;
+		fps_int_max = fps_rend_sum = fps_rend_max = 0;
+		fps_slow = 0;
+	} else {
+		fps_int_max = LV_MAX(fps_int_max, iv);
+		fps_slow += iv > 20000;
+	}
+	fps_rend_sum += rend;
+	fps_rend_max = LV_MAX(fps_rend_max, rend);
+	fps_n++;
+	fps_last_us = now;
+}
+
 /* Called when a frame has been flushed to the screen. */
 void n72_frame_shown(void)
 {
 	uint64_t d;
+
+	if (fps_on)
+		fps_frame();
 
 	/* only frames drawn because of touch input count */
 	if (!lat_on || !lat_event_us || !lat_input_frame)
@@ -604,6 +671,7 @@ int main(int argc, char **argv)
 			}
 		}
 		lat_on = getenv("N72_LATENCY") && *getenv("N72_LATENCY") == '1';
+		fps_on = getenv("N72_FPS") && *getenv("N72_FPS") == '1';
 	}
 
 	if (!keys)

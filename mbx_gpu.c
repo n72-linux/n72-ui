@@ -28,9 +28,10 @@
 #include "mbx_cmd.h"
 
 void n72_frame_shown(void);
+void n72_refr_start(void);
 
 #define DRAW_UNIT_ID_MBX	5
-#define POOL_SIZE		(3 * 1024 * 1024)
+#define POOL_SIZE		(6 * 1024 * 1024)	/* display, layers, snapshots */
 #define POOL_ALIGN		128	/* the 3D core needs 128-byte aligned surfaces */
 #define POOL_BLOCKS		256
 
@@ -305,6 +306,28 @@ static bool layer_ok(const lv_draw_task_t *t, const lv_layer_t *src)
 	       !d->bitmap_mask_src;
 }
 
+/*
+ * An image the GPU can copy: a variable-source image (an lv_draw_buf_t, as
+ * lv_snapshot_take() makes) whose pixels live in the GPU pool, drawn 1:1.
+ */
+static bool image_ok(const lv_draw_task_t *t)
+{
+	const lv_draw_image_dsc_t *d = t->draw_dsc;
+	const lv_image_dsc_t *img = d->src;
+
+	if (lv_image_src_get_type(d->src) != LV_IMAGE_SRC_VARIABLE || !img->data ||
+	    !in_pool(img->data) || ((uintptr_t)img->data - (uintptr_t)pool) & 127 ||
+	    (img->header.stride & 31) || d->tile || !cf_ok(img->header.cf))
+		return false;
+	if (lv_area_get_width(&d->image_area) != img->header.w ||
+	    lv_area_get_height(&d->image_area) != img->header.h)
+		return false;
+	return d->rotation == 0 && d->scale_x == LV_SCALE_NONE &&
+	       d->scale_y == LV_SCALE_NONE && d->skew_x == 0 && d->skew_y == 0 &&
+	       d->recolor_opa <= LV_OPA_MIN && d->blend_mode == LV_BLEND_MODE_NORMAL &&
+	       d->clip_radius == 0 && !d->bitmap_mask_src;
+}
+
 static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 {
 	const lv_draw_dsc_base_t *base = t->draw_dsc;
@@ -320,13 +343,19 @@ static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 	if (t->type == LV_DRAW_TASK_TYPE_FILL) {
 		const lv_draw_fill_dsc_t *d = t->draw_dsc;
 
-		if (d->radius != 0)
+		/*
+		 * Rounded opaque fills: the GPU fills the body, the CPU only
+		 * the corner squares (mbx_fill). Translucent rounded ones stay
+		 * on the CPU.
+		 */
+		if (d->radius != 0 && d->opa < LV_OPA_MAX)
 			mbx_gpu_stats.fill_radius++;
 		else if (d->grad.dir != LV_GRAD_DIR_NONE)
 			mbx_gpu_stats.fill_grad++;
 		else if (size < 8192)
 			mbx_gpu_stats.fill_small++;
-		if (d->radius != 0 || d->grad.dir != LV_GRAD_DIR_NONE || d->opa <= LV_OPA_MIN)
+		if ((d->radius != 0 && d->opa < LV_OPA_MAX) ||
+		    d->grad.dir != LV_GRAD_DIR_NONE || d->opa <= LV_OPA_MIN)
 			return 0;
 		/*
 		 * A GPU job costs ioctls and an interrupt (~0.5-0.7 ms): only large
@@ -342,6 +371,9 @@ static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 		if (dcf != LV_COLOR_FORMAT_XRGB8888 || size < 4096 ||
 		    !layer_ok(t, (const lv_layer_t *)d->src))
 			return 0;
+	} else if (t->type == LV_DRAW_TASK_TYPE_IMAGE) {
+		if (dcf != LV_COLOR_FORMAT_XRGB8888 || size < 4096 || !image_ok(t))
+			return 0;
 	} else {
 		return 0;
 	}
@@ -352,26 +384,74 @@ static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 	return 1;
 }
 
+/* One opaque rectangle (in screen coordinates) on the 2D engine. */
+static void gpu_rect(lv_layer_t *layer, const lv_area_t *clip, const lv_area_t *r,
+		     lv_color_t color)
+{
+	lv_draw_buf_t *b = layer->draw_buf;
+	uint32_t w[16];
+	lv_area_t a;
+
+	if (!lv_area_intersect(&a, r, clip))
+		return;
+	lv_area_move(&a, -layer->buf_area.x1, -layer->buf_area.y1);
+	buf_invalidate(b, &a);			/* drop CPU lines over the area */
+	submit(w, put_fill(w, gpu_addr(b->data), b->header.stride,
+			   0xff000000 | lv_color_to_u32(color),
+			   a.x1, a.y1, lv_area_get_width(&a), lv_area_get_height(&a)));
+	mbx_gpu_stats.fills++;
+}
+
 static void mbx_fill(lv_draw_unit_t *u, lv_draw_task_t *t)
 {
 	lv_layer_t *layer = u->target_layer;
 	lv_draw_buf_t *b = layer->draw_buf;
-	const lv_draw_fill_dsc_t *d = t->draw_dsc;
-	lv_area_t a;
-	uint32_t w[16];
+	lv_draw_fill_dsc_t *d = t->draw_dsc;
+	const lv_area_t *clip = u->clip_area, *c = &t->area;
+	int32_t wd = lv_area_get_width(c), ht = lv_area_get_height(c);
+	int32_t r = LV_MIN(d->radius, LV_MIN(wd, ht) / 2);
+	lv_area_t a, band, corner, cclip;
+	int i;
 
-	if (!lv_area_intersect(&a, &t->area, u->clip_area))
+	if (!lv_area_intersect(&a, c, clip))
 		return;
 	if (!in_pool(b->data)) {
-		lv_draw_sw_fill(u, (lv_draw_fill_dsc_t *)d, &t->area);
+		lv_draw_sw_fill(u, d, c);
 		return;
 	}
-	lv_area_move(&a, -layer->buf_area.x1, -layer->buf_area.y1);
-	buf_invalidate(b, &a);			/* drop CPU lines over the area */
-	submit(w, put_fill(w, gpu_addr(b->data), b->header.stride,
-			   0xff000000 | lv_color_to_u32(d->color) ,
-			   a.x1, a.y1, lv_area_get_width(&a), lv_area_get_height(&a)));
-	mbx_gpu_stats.fills++;
+	if (r <= 0) {
+		gpu_rect(layer, clip, c, d->color);
+		return;
+	}
+	/*
+	 * Rounded: the GPU fills a cross (full-width middle band, and the
+	 * top and bottom bands between the corners); then, once it is done,
+	 * the CPU draws the r x r corner squares, clipped to each corner.
+	 */
+	band = (lv_area_t){ c->x1, c->y1 + r, c->x2, c->y2 - r };
+	if (band.y2 >= band.y1)
+		gpu_rect(layer, clip, &band, d->color);
+	band = (lv_area_t){ c->x1 + r, c->y1, c->x2 - r, c->y1 + r - 1 };
+	if (band.x2 >= band.x1) {
+		gpu_rect(layer, clip, &band, d->color);
+		band.y1 = c->y2 - r + 1;
+		band.y2 = c->y2;
+		gpu_rect(layer, clip, &band, d->color);
+	}
+	gpu_wait(last_seq);
+	last_seq = 0;
+	for (i = 0; i < 4; i++) {
+		corner.x1 = i & 1 ? c->x2 - r + 1 : c->x1;
+		corner.x2 = corner.x1 + r - 1;
+		corner.y1 = i & 2 ? c->y2 - r + 1 : c->y1;
+		corner.y2 = corner.y1 + r - 1;
+		if (!lv_area_intersect(&cclip, &corner, clip))
+			continue;
+		u->clip_area = &cclip;
+		lv_draw_sw_fill(u, d, c);
+	}
+	u->clip_area = clip;
+	mbx_gpu_stats.fill_corners++;
 }
 
 /* Blend a translucent plain fill with the 3D core. */
@@ -398,42 +478,44 @@ static void mbx_fill_blend(lv_draw_unit_t *u, lv_draw_task_t *t)
 	mbx_gpu_stats.blends++;
 }
 
-/* Composite a layer onto its parent: a 3D textured copy, blended per pixel. */
-static void mbx_layer(lv_draw_unit_t *u, lv_draw_task_t *t)
+/*
+ * Copy @sb (whose pixel (0,0) is at screen @sx,@sy) onto the target layer
+ * over t->area: a 3D textured copy, blended per pixel. False: not possible
+ * here, the caller draws it in software.
+ */
+static bool gpu_copy(lv_draw_unit_t *u, lv_draw_task_t *t, lv_draw_buf_t *sb,
+		     int32_t sx, int32_t sy, lv_opa_t opa, bool clean_src)
 {
 	lv_layer_t *layer = u->target_layer;
 	lv_draw_buf_t *b = layer->draw_buf;
-	lv_draw_image_dsc_t *d = t->draw_dsc;
-	lv_layer_t *src = (lv_layer_t *)d->src;
-	lv_draw_buf_t *sb = src->draw_buf;
 	lv_area_t a, sa, da;
 	uint32_t w[48];
 	int blend, n, ret;
 
-	if (!sb || !lv_area_intersect(&a, &t->area, u->clip_area))
-		return;
+	if (!lv_area_intersect(&a, &t->area, u->clip_area))
+		return true;
 	if (!in_pool(b->data) || !in_pool(sb->data) || (b->header.stride & 31) ||
-	    (sb->header.stride & 31) || ((uintptr_t)sb->data - (uintptr_t)pool) & 127) {
-		lv_draw_sw_layer(u, d, &t->area);	/* software fallback */
-		return;
-	}
+	    (sb->header.stride & 31) || ((uintptr_t)sb->data - (uintptr_t)pool) & 127)
+		return false;
 	sa = a;
-	lv_area_move(&sa, -src->buf_area.x1, -src->buf_area.y1);
+	lv_area_move(&sa, -sx, -sy);
 	da = a;
 	lv_area_move(&da, -layer->buf_area.x1, -layer->buf_area.y1);
-	buf_clean(sb, &sa);			/* the CPU drew the layer */
+	if (clean_src)
+		buf_clean(sb, &sa);		/* the CPU drew the layer */
 	buf_invalidate(b, &da);
 	/*
 	 * Opaque XRGB layer: plain copy. Full opacity: one blended pass with
 	 * per-pixel alpha. Lower opacity: two passes (the hardware's destination
 	 * factor ignores the opacity in a single pass).
 	 */
-	blend = !(d->opa >= LV_OPA_MAX && sb->header.cf == LV_COLOR_FORMAT_XRGB8888);
+	blend = !(opa >= LV_OPA_MAX && sb->header.cf == LV_COLOR_FORMAT_XRGB8888);
 	n = mbx_cmd_copy(w, blend, b->header.stride, sb->header.stride, sa.x1, sa.y1,
-			 da.x1, da.y1, lv_area_get_width(&a), lv_area_get_height(&a), d->opa);
+			 da.x1, da.y1, lv_area_get_width(&a), lv_area_get_height(&a), opa);
 	if (!blend) {
+		/* (the 3D copy: ~3 ms a screen, the 2D engine's takes ~8) */
 		ret = blit3d(8, gpu_addr(b->data), gpu_addr(sb->data), w, n);
-	} else if (d->opa >= LV_OPA_MAX) {
+	} else if (opa >= LV_OPA_MAX) {
 		mbx_cmd_copy_blend(w, MBX_COPY_ALPHA);
 		ret = blit3d(9, gpu_addr(b->data), gpu_addr(sb->data), w, n);
 	} else {
@@ -442,9 +524,32 @@ static void mbx_layer(lv_draw_unit_t *u, lv_draw_task_t *t)
 		mbx_cmd_copy_blend(w, MBX_COPY_PASS2);
 		ret = ret ?: blit3d(9, gpu_addr(b->data), gpu_addr(sb->data), w, n);
 	}
-	if (ret)
-		lv_draw_sw_layer(u, d, &t->area);
 	mbx_gpu_stats.layers++;
+	return !ret;
+}
+
+/* Composite a layer onto its parent. */
+static void mbx_layer(lv_draw_unit_t *u, lv_draw_task_t *t)
+{
+	lv_draw_image_dsc_t *d = t->draw_dsc;
+	lv_layer_t *src = (lv_layer_t *)d->src;
+
+	if (!src->draw_buf)
+		return;
+	if (!gpu_copy(u, t, src->draw_buf, src->buf_area.x1, src->buf_area.y1, d->opa, true))
+		lv_draw_sw_layer(u, d, &t->area);	/* software fallback */
+}
+
+/* Draw a pool-resident image 1:1 (a snapshot, during transitions). */
+static void mbx_image(lv_draw_unit_t *u, lv_draw_task_t *t)
+{
+	lv_draw_image_dsc_t *d = t->draw_dsc;
+
+	/* the CPU does not write snapshots after taking them: no clean */
+	if (!gpu_copy(u, t, (lv_draw_buf_t *)d->src, d->image_area.x1, d->image_area.y1,
+		      d->opa, false))
+		lv_draw_sw_image(u, d, &t->area);
+	mbx_gpu_stats.images++;
 }
 
 /*
@@ -507,6 +612,8 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 	u->clip_area = &t->clip_area;
 	if (t->type == LV_DRAW_TASK_TYPE_LAYER)
 		mbx_layer(u, t);
+	else if (t->type == LV_DRAW_TASK_TYPE_IMAGE)
+		mbx_image(u, t);
 	else if (((lv_draw_fill_dsc_t *)t->draw_dsc)->opa >= LV_OPA_MAX)
 		mbx_fill(u, t);
 	else
@@ -536,11 +643,15 @@ static uint32_t flush_seq;		/* the last display copy */
 static uint32_t flush_words[16 * 64];
 static int flush_n;
 
+static int flush3d = -1;
+
 static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
 	uint32_t stride = fb.stride;
 
 	LV_UNUSED(px_map);
+	if (flush3d < 0)
+		flush3d = getenv("N72_FLUSH3D") != NULL;	/* no faster: memory bound */
 	sync_range(disp_buf + area->y1 * stride, lv_area_get_height(area) * stride,
 		   MBX_SYNC_CLEAN);
 	if (flush_n > (int)(sizeof(flush_words) / 4) - 16) {
@@ -549,17 +660,42 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 		last_seq = 0;
 		flush_n = 0;
 	}
+	if (flush3d) {
+		/*
+		 * The 3D core copies a full screen in ~3 ms, the 2D engine in
+		 * ~8: large areas go through it (one job per area).
+		 */
+		uint32_t cw[48];
+		int n = mbx_cmd_copy(cw, 0, fb.stride, stride, area->x1, area->y1, area->x1,
+				     area->y1, lv_area_get_width(area),
+				     lv_area_get_height(area), LV_OPA_COVER);
+
+		if (flush_n) {
+			submit(flush_words, flush_n);
+			gpu_wait(last_seq);
+			last_seq = 0;
+			flush_n = 0;
+		}
+		if (!blit3d(8, fb.gpu_addr, gpu_addr(disp_buf), cw, n)) {
+			gpu_wait(last_seq);
+			last_seq = 0;
+			goto copied;
+		}
+	}
 	flush_n += put_copy(flush_words + flush_n, fb.gpu_addr, fb.stride,
 			    gpu_addr(disp_buf), stride, area->x1, area->y1,
 			    area->x1, area->y1, lv_area_get_width(area),
 			    lv_area_get_height(area));
+copied:
 	mbx_gpu_stats.flushes++;
-	if (lv_display_flush_is_last(disp) && flush_n) {
-		submit(flush_words, flush_n);
-		/* the next frame waits for it before drawing (refr_start_cb) */
-		flush_seq = last_seq;
-		last_seq = 0;
-		flush_n = 0;
+	if (lv_display_flush_is_last(disp)) {
+		if (flush_n) {
+			submit(flush_words, flush_n);
+			/* the next frame waits for it before drawing (refr_start_cb) */
+			flush_seq = last_seq;
+			last_seq = 0;
+			flush_n = 0;
+		}
 		n72_frame_shown();
 	}
 	lv_display_flush_ready(disp);
@@ -572,6 +708,7 @@ static void refr_start_cb(lv_event_t *e)
 	ADBG("mbx: refresh start, waiting for flush seq %u\n", flush_seq);
 	gpu_wait(flush_seq);
 	flush_seq = 0;
+	n72_refr_start();
 }
 
 lv_display_t *mbx_gpu_display_create(void)
@@ -639,4 +776,35 @@ fail:
 	close(mbx);
 	mbx = -1;
 	return NULL;
+}
+
+/*
+ * A copy of what is on the screen now (the display buffer), made by the
+ * GPU: the "before" picture of a transition without rendering it again.
+ */
+lv_draw_buf_t *mbx_gpu_grab_screen(void)
+{
+	lv_draw_buf_t *b;
+	lv_area_t all;
+	uint32_t w[16];
+
+	if (mbx < 0)
+		return NULL;
+	b = lv_draw_buf_create(fb.width, fb.height, LV_COLOR_FORMAT_XRGB8888, 0);
+	if (!b)
+		return NULL;
+	if (!in_pool(b->data) || (b->header.stride & 31) ||
+	    ((uintptr_t)b->data - (uintptr_t)pool) & 127) {
+		lv_draw_buf_destroy(b);
+		return NULL;
+	}
+	lv_area_set(&all, 0, 0, fb.width - 1, fb.height - 1);
+	gpu_wait(flush_seq);		/* the last frame is complete */
+	flush_seq = 0;
+	buf_invalidate(b, &all);
+	submit(w, put_copy(w, gpu_addr(b->data), b->header.stride, gpu_addr(disp_buf),
+			   fb.stride, 0, 0, 0, 0, fb.width, fb.height));
+	gpu_wait(last_seq);
+	last_seq = 0;
+	return b;
 }

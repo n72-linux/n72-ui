@@ -284,9 +284,152 @@ static bool in_demo;		/* (no demos any more; kept for main.c) */
 
 static void back_cb(lv_event_t *e);
 
+/*
+ * Transitions. LVGL's own screen animations redraw both screens, text and
+ * all, every frame (15-30 ms on this CPU: choppy). Instead each picture is
+ * rendered once with lv_snapshot_take() into GPU memory, and the frames
+ * only move those pictures, which the GPU copies (a few ms per frame).
+ */
+#define TR_MS 220
+
+static struct {
+	lv_obj_t *scr, *bg, *fg;	/* transition screen and its two pictures */
+	lv_draw_buf_t *sbg, *sfg;
+	lv_obj_t *to, *from;		/* screen to load at the end, and to delete */
+	int kind;			/* 0 slide left, 1 slide right, 2 shade */
+	void (*done)(void);
+} tr;
+
+static void tr_exec(void *var, int32_t v)
+{
+	LV_UNUSED(var);
+	if (tr.kind == 2) {
+		lv_obj_set_y(tr.fg, v);
+		return;
+	}
+	lv_obj_set_x(tr.bg, v);
+	lv_obj_set_x(tr.fg, v + (tr.kind == 0 ? W : -W));
+}
+
+static void tr_free(lv_draw_buf_t **b)
+{
+	if (*b) {
+		lv_image_cache_drop(*b);
+		lv_draw_buf_destroy(*b);
+		*b = NULL;
+	}
+}
+
+static void tr_finish(void)
+{
+	lv_obj_t *scr = tr.scr, *from = tr.from;
+	void (*done)(void) = tr.done;
+
+	if (!scr)
+		return;
+	tr.scr = NULL;
+	tr.from = NULL;
+	tr.done = NULL;
+	lv_anim_delete(&tr, tr_exec);
+	lv_screen_load(tr.to);
+	lv_obj_delete(scr);
+	tr_free(&tr.sbg);
+	tr_free(&tr.sfg);
+	if (from)
+		lv_obj_delete(from);
+	if (done)
+		done();
+}
+
+static void tr_done_cb(lv_anim_t *a)
+{
+	LV_UNUSED(a);
+	tr_finish();
+}
+
+static lv_draw_buf_t *snap(lv_obj_t *obj, lv_color_format_t cf)
+{
+	lv_draw_buf_t *b;
+
+	lv_obj_update_layout(obj);
+	b = lv_snapshot_take(obj, cf);
+	if (b)
+		lv_draw_buf_flush_cache(b, NULL);	/* the GPU reads it */
+	return b;
+}
+
+/* The screen on display: copied from the display buffer when it is current. */
+static lv_draw_buf_t *grab_or_snap(lv_obj_t *scr)
+{
+	lv_draw_buf_t *b = NULL;
+
+	if (scr == lv_screen_active()) {
+		lv_refr_now(NULL);	/* pending changes (a pressed row) first */
+		b = mbx_gpu_grab_screen();
+	}
+	return b ? b : snap(scr, LV_COLOR_FORMAT_XRGB8888);
+}
+
+static lv_obj_t *tr_image(lv_draw_buf_t *b)
+{
+	lv_obj_t *i = lv_image_create(tr.scr);
+
+	lv_image_set_src(i, b);
+	lv_obj_remove_flag(i, LV_OBJ_FLAG_CLICKABLE);
+	return i;
+}
+
+/* Start a transition with pictures @bg and @fg; false: no memory for them. */
+static bool tr_start(lv_draw_buf_t *bg, lv_draw_buf_t *fg, int kind, lv_obj_t *to,
+		     lv_obj_t *del, int32_t from_v, int32_t to_v)
+{
+	lv_anim_t a;
+
+	if (!bg || !fg) {
+		tr_free(&bg);
+		tr_free(&fg);
+		return false;
+	}
+	tr.sbg = bg;
+	tr.sfg = fg;
+	tr.kind = kind;
+	tr.to = to;
+	tr.from = del;
+	tr.scr = lv_obj_create(NULL);
+	m3_screen(tr.scr);
+	tr.bg = tr_image(bg);
+	tr.fg = tr_image(fg);
+	tr_exec(NULL, from_v);
+	lv_screen_load(tr.scr);
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, &tr);
+	lv_anim_set_exec_cb(&a, tr_exec);
+	lv_anim_set_values(&a, from_v, to_v);
+	lv_anim_set_duration(&a, TR_MS);
+	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+	lv_anim_set_completed_cb(&a, tr_done_cb);
+	lv_anim_start(&a);
+	return true;
+}
+
+/* Slide to @to: left for forward, right for back; @del_from: delete the old screen. */
+static void slide(lv_obj_t *to, bool left, bool del_from)
+{
+	lv_obj_t *from;
+
+	tr_finish();
+	from = lv_screen_active();
+	if (from == to)
+		return;
+	if (!tr_start(grab_or_snap(from), snap(to, LV_COLOR_FORMAT_XRGB8888),
+		      left ? 0 : 1, to, del_from ? from : NULL, 0, left ? -W : W))
+		lv_screen_load_anim(to, left ? LV_SCR_LOAD_ANIM_MOVE_LEFT :
+				    LV_SCR_LOAD_ANIM_MOVE_RIGHT, TR_MS, 0, del_from);
+}
+
 static void show(lv_obj_t *scr)
 {
-	lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+	slide(scr, true, false);
 }
 
 /* Back goes to the previous page; pages are a small stack. */
@@ -298,6 +441,7 @@ static void shade_set(bool open, bool anim);
 
 static void go_home(void)
 {
+	tr_finish();
 	shade_set(false, false);
 	while (nav_n > 0) {
 		lv_obj_t *s = nav[--nav_n];
@@ -306,7 +450,7 @@ static void go_home(void)
 			lv_obj_delete_async(s);
 	}
 	if (lv_screen_active() != home_scr)
-		lv_screen_load_anim(home_scr, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, true);
+		slide(home_scr, false, true);
 }
 
 static void go_back(void)
@@ -319,7 +463,7 @@ static void go_back(void)
 	}
 	nav_n--;
 	prev = nav[nav_n - 1];
-	lv_screen_load_anim(prev, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, true);
+	slide(prev, false, true);
 }
 
 static void back_cb(lv_event_t *e)
@@ -750,44 +894,45 @@ static void home_bright_cb(lv_event_t *e)
 
 #define SHADE_H 312
 
-static void shade_y_cb(void *obj, int32_t v)
+static void shade_closed(void)
 {
-	lv_obj_set_y(obj, v);
+	lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void shade_hidden_cb(lv_anim_t *a)
-{
-	LV_UNUSED(a);
-	if (!shade_open)
-		lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
-}
-
+/*
+ * Open or close the shade. Animated: a picture of home (with the scrim,
+ * without the shade) and a picture of the shade, moved by the GPU.
+ */
 static void shade_set(bool open, bool anim)
 {
-	lv_anim_t a;
+	lv_draw_buf_t *bg, *fg;
 
 	if (!shade || open == shade_open)
 		return;
+	tr_finish();
 	shade_open = open;
-	lv_anim_delete(shade, shade_y_cb);
 	if (open) {
 		lv_slider_set_value(home_bright, backlight_get(), LV_ANIM_OFF);
-		lv_obj_remove_flag(scrim, LV_OBJ_FLAG_HIDDEN);
 		home_wake();
 	}
-	if (!anim) {
+	lv_obj_remove_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+	if (anim && lv_screen_active() == home_scr) {
+		lv_obj_set_y(shade, -SHADE_H);
+		lv_obj_add_flag(shade, LV_OBJ_FLAG_HIDDEN);
+		bg = snap(home_scr, LV_COLOR_FORMAT_XRGB8888);
+		lv_obj_remove_flag(shade, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_y(shade, 0);
+		fg = snap(shade, LV_COLOR_FORMAT_ARGB8888);
 		lv_obj_set_y(shade, open ? 0 : -SHADE_H);
-		shade_hidden_cb(NULL);
-		return;
+		if (tr_start(bg, fg, 2, home_scr, NULL, open ? -SHADE_H : 0, open ? 0 : -SHADE_H)) {
+			if (!open)
+				tr.done = shade_closed;
+			return;
+		}
 	}
-	lv_anim_init(&a);
-	lv_anim_set_var(&a, shade);
-	lv_anim_set_exec_cb(&a, shade_y_cb);
-	lv_anim_set_values(&a, lv_obj_get_y(shade), open ? 0 : -SHADE_H);
-	lv_anim_set_duration(&a, 220);
-	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-	lv_anim_set_completed_cb(&a, shade_hidden_cb);
-	lv_anim_start(&a);
+	lv_obj_set_y(shade, open ? 0 : -SHADE_H);
+	if (!open)
+		shade_closed();
 }
 
 /* Swipe down anywhere on home opens the shade, swipe up closes it. */

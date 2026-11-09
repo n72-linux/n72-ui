@@ -5,8 +5,9 @@
 #include "lvgl/lvgl.h"
 
 struct mbx_gpu_stats {
-	unsigned long submits, fills, blends, layers, flushes, pool_misses;
+	unsigned long submits, fills, blends, layers, images, flushes, pool_misses;
 	unsigned long fill_radius, fill_grad, fill_small;	/* fills left to the CPU */
+	unsigned long fill_corners;	/* rounded fills split GPU body + CPU corners */
 	double sync_us, submit_us, blit3d_us;	/* time spent in each ioctl */
 	unsigned long async_done;	/* tasks finished asynchronously */
 	unsigned long long sync_bytes;
@@ -20,5 +21,8 @@ extern struct mbx_gpu_stats mbx_gpu_stats;
  * call it after lv_init() and before creating any other display.
  */
 lv_display_t *mbx_gpu_display_create(void);
+
+/* A GPU copy of the screen as shown now, or NULL. */
+lv_draw_buf_t *mbx_gpu_grab_screen(void);
 
 #endif
