@@ -776,8 +776,22 @@ static bool usb_powered(void)
 }
 
 /* Battery icon and percentage from the PMU's power supply. */
+/*
+ * Set a label's text only when it changes: lv_label_set_text() always
+ * invalidates the label, and with a 1 s clock timer that was a redraw and
+ * a GPU flush every second for a clock that only shows minutes.
+ */
+static void label_set_if_changed(lv_obj_t *lbl, const char *text)
+{
+	const char *cur = lv_label_get_text(lbl);
+
+	if (!cur || strcmp(cur, text))
+		lv_label_set_text(lbl, text);
+}
+
 static void battery_update(void)
 {
+	char buf[48];
 	char st[16] = "";
 	const char *icon;
 	FILE *f;
@@ -787,7 +801,7 @@ static void battery_update(void)
 		return;
 	cap = read_sysfs_int("/sys/class/power_supply/battery/capacity", -1);
 	if (cap < 0) {
-		lv_label_set_text(batt_lbl, "");
+		label_set_if_changed(batt_lbl, "");
 		return;
 	}
 	f = fopen("/sys/class/power_supply/battery/status", "r");
@@ -799,8 +813,9 @@ static void battery_update(void)
 	icon = cap > 87 ? LV_SYMBOL_BATTERY_FULL : cap > 62 ? LV_SYMBOL_BATTERY_3 :
 	       cap > 37 ? LV_SYMBOL_BATTERY_2 : cap > 12 ? LV_SYMBOL_BATTERY_1 :
 	       LV_SYMBOL_BATTERY_EMPTY;
-	lv_label_set_text_fmt(batt_lbl, "%s%d%% %s", strncmp(st, "Charging", 8) ? "" :
-			      LV_SYMBOL_CHARGE " ", cap, icon);
+	snprintf(buf, sizeof(buf), "%s%d%% %s", strncmp(st, "Charging", 8) ? "" :
+		 LV_SYMBOL_CHARGE " ", cap, icon);
+	label_set_if_changed(batt_lbl, buf);
 }
 
 static void clock_update(lv_timer_t *t)
@@ -819,12 +834,18 @@ static void clock_update(lv_timer_t *t)
 	if (ticks++ % 10 == 0)
 		battery_update();
 	localtime_r(&now, &tm);
-	lv_label_set_text_fmt(clock_lbl, "%02d:%02d", tm.tm_hour, tm.tm_min);
-	if (tm.tm_year + 1900 < 2024)
-		lv_label_set_text(date_lbl, "Clock not set");
-	else
-		lv_label_set_text_fmt(date_lbl, "%s, %d %s", days[tm.tm_wday],
-				      tm.tm_mday, months[tm.tm_mon]);
+	{
+		char buf[48];
+
+		snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
+		label_set_if_changed(clock_lbl, buf);
+		if (tm.tm_year + 1900 < 2024)
+			snprintf(buf, sizeof(buf), "Clock not set");
+		else
+			snprintf(buf, sizeof(buf), "%s, %d %s", days[tm.tm_wday],
+				 tm.tm_mday, months[tm.tm_mon]);
+		label_set_if_changed(date_lbl, buf);
+	}
 }
 
 struct app {
