@@ -473,6 +473,101 @@ static void back_cb(lv_event_t *e)
 }
 
 /*
+ * Scrolling from snapshots: when a page body starts to scroll, each of its
+ * children (cards, rows) is rendered once into GPU memory and shown as a
+ * picture in its place; the live child is skipped while drawing (layered
+ * opacity 0). Scroll frames are then a few GPU copies instead of CPU text
+ * and shapes. When scrolling ends the live children come back.
+ */
+#define SC_MAX		16
+#define SC_BUDGET	(3 * 1024 * 1024)	/* bytes of snapshots at most */
+
+static struct {
+	lv_obj_t *owner;
+	lv_obj_t *live[SC_MAX], *pic[SC_MAX];
+	lv_draw_buf_t *buf[SC_MAX];
+	int n;
+} sc;
+
+static void sc_restore(bool delete_pics)
+{
+	int i;
+
+	for (i = 0; i < sc.n; i++) {
+		if (delete_pics && lv_obj_is_valid(sc.pic[i]))
+			lv_obj_delete(sc.pic[i]);
+		if (lv_obj_is_valid(sc.live[i]))
+			lv_obj_set_style_opa_layered(sc.live[i], LV_OPA_COVER, 0);
+		lv_image_cache_drop(sc.buf[i]);
+		lv_draw_buf_destroy(sc.buf[i]);
+	}
+	sc.n = 0;
+	sc.owner = NULL;
+}
+
+static void sc_begin(lv_obj_t *body)
+{
+	uint32_t i, cnt = lv_obj_get_child_count(body);
+	long budget = SC_BUDGET;
+
+	if (sc.owner)
+		sc_restore(true);
+	for (i = 0; i < cnt && sc.n < SC_MAX; i++) {
+		lv_obj_t *c = lv_obj_get_child(body, i), *p;
+		lv_draw_buf_t *b;
+		long sz = (long)lv_obj_get_width(c) * lv_obj_get_height(c) * 4;
+
+		if (lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) || sz <= 0 || sz > budget)
+			continue;
+		b = lv_snapshot_take(c, LV_COLOR_FORMAT_ARGB8888);
+		if (!b)
+			break;
+		lv_draw_buf_flush_cache(b, NULL);	/* the GPU reads it */
+		budget -= sz;
+		p = lv_image_create(body);
+		lv_image_set_src(p, b);
+		lv_obj_add_flag(p, LV_OBJ_FLAG_IGNORE_LAYOUT);
+		lv_obj_remove_flag(p, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+		lv_obj_set_pos(p, lv_obj_get_x(c), lv_obj_get_y(c));
+		lv_obj_set_style_opa_layered(c, LV_OPA_TRANSP, 0);
+		sc.live[sc.n] = c;
+		sc.pic[sc.n] = p;
+		sc.buf[sc.n] = b;
+		sc.n++;
+	}
+	sc.owner = body;
+}
+
+static void sc_event(lv_event_t *e)
+{
+	lv_obj_t *body = lv_event_get_current_target(e);
+
+	switch (lv_event_get_code(e)) {
+	case LV_EVENT_SCROLL_BEGIN:
+		if (sc.owner != body)
+			sc_begin(body);
+		break;
+	case LV_EVENT_SCROLL_END:
+		if (sc.owner == body)
+			sc_restore(true);
+		break;
+	case LV_EVENT_DELETE:	/* the pictures go with the page */
+		if (sc.owner == body)
+			sc_restore(false);
+		break;
+	default:
+		break;
+	}
+}
+
+static void scroll_cached(lv_obj_t *body)
+{
+	lv_obj_add_event_cb(body, sc_event, LV_EVENT_SCROLL_BEGIN, NULL);
+	lv_obj_add_event_cb(body, sc_event, LV_EVENT_SCROLL_END, NULL);
+	lv_obj_add_event_cb(body, sc_event, LV_EVENT_DELETE, NULL);
+}
+
+/*
  * A page with a top app bar (back arrow and title) and a scrolling column
  * body with 12 px margins. Returns the body.
  */
@@ -513,6 +608,7 @@ static lv_obj_t *m3_page(const char *title, lv_obj_t **scr_out)
 	lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_scroll_dir(body, LV_DIR_VER);
 	lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_ACTIVE);
+	scroll_cached(body);
 	*scr_out = scr;
 	return body;
 }
