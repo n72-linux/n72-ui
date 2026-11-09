@@ -9,7 +9,7 @@ OUT="$ROOT/n72-ui-build"
 CC=arm-linux-gnueabi-gcc
 CFLAGS="-O2 -idirafter $ROOT/linux-s5l87xx/include/uapi -mcpu=arm1176jzf-s -mfpu=vfp -mfloat-abi=softfp -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src"
 mkdir -p "$OUT/obj"
-SRCS=$(find "$LVGL/src" "$LVGL/demos/widgets" "$LVGL/demos/music" -name '*.c'; echo "$LVGL/demos/lv_demos.c")
+SRCS=$(find "$LVGL/src" -name '*.c')
 obj() { echo "$OUT/obj/$(echo "${1#$LVGL/}" | tr '/' '_' | sed 's/\.c$/.o/')"; }
 OBJS=$(for f in $SRCS; do obj "$f"; done)
 for f in $SRCS; do
