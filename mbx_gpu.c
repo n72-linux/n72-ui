@@ -97,14 +97,38 @@ static void pool_free(void *p)
 	}
 }
 
+/*
+ * GPU-visible memory the CPU also maps: the pool, and with page flipping
+ * the two scan-out buffers. Each region is one buffer object.
+ */
+static struct region {
+	uint8_t *cpu;
+	uint32_t size, gpu, handle;
+} regions[3];
+static int nregions;
+
+static const struct region *region_of(const void *p)
+{
+	int i;
+
+	for (i = 0; p && i < nregions; i++)
+		if ((const uint8_t *)p >= regions[i].cpu &&
+		    (const uint8_t *)p < regions[i].cpu + regions[i].size)
+			return &regions[i];
+	return NULL;
+}
+
+/* (the name stays: "memory the GPU can reach") */
 static bool in_pool(const void *p)
 {
-	return p && (const uint8_t *)p >= pool && (const uint8_t *)p < pool + POOL_SIZE;
+	return region_of(p) != NULL;
 }
 
 static uint32_t gpu_addr(const void *p)
 {
-	return pool_gpu + ((const uint8_t *)p - pool);
+	const struct region *r = region_of(p);
+
+	return r->gpu + ((const uint8_t *)p - r->cpu);
 }
 
 /* ---------------------------------------------------------- the GPU */
@@ -120,9 +144,10 @@ static double gpu_now_us(void)
 static void sync_range(const void *p, uint32_t size, uint32_t op)
 {
 	double t0 = gpu_now_us();
+	const struct region *r = region_of(p);
 	struct mbx_sync s = {
-		.handle = pool_handle, .op = op,
-		.offset = (const uint8_t *)p - pool, .size = size,
+		.handle = r->handle, .op = op,
+		.offset = (const uint8_t *)p - r->cpu, .size = size,
 	};
 
 	ioctl(mbx, MBX_IOC_SYNC, &s);
@@ -259,7 +284,7 @@ static uint32_t buf_width_to_stride(uint32_t w, lv_color_format_t cf)
 
 static void buf_free(void *p)
 {
-	if (in_pool(p))
+	if (p && (uint8_t *)p >= pool && (uint8_t *)p < pool + POOL_SIZE)
 		pool_free(p);
 	else
 		lv_free(p);
@@ -316,7 +341,7 @@ static bool image_ok(const lv_draw_task_t *t)
 	const lv_image_dsc_t *img = d->src;
 
 	if (lv_image_src_get_type(d->src) != LV_IMAGE_SRC_VARIABLE || !img->data ||
-	    !in_pool(img->data) || ((uintptr_t)img->data - (uintptr_t)pool) & 127 ||
+	    !in_pool(img->data) || (gpu_addr(img->data) & 127) ||
 	    (img->header.stride & 31) || d->tile || !cf_ok(img->header.cf))
 		return false;
 	if (lv_area_get_width(&d->image_area) != img->header.w ||
@@ -495,7 +520,7 @@ static bool gpu_copy(lv_draw_unit_t *u, lv_draw_task_t *t, lv_draw_buf_t *sb,
 	if (!lv_area_intersect(&a, &t->area, u->clip_area))
 		return true;
 	if (!in_pool(b->data) || !in_pool(sb->data) || (b->header.stride & 31) ||
-	    (sb->header.stride & 31) || ((uintptr_t)sb->data - (uintptr_t)pool) & 127)
+	    (sb->header.stride & 31) || (gpu_addr(sb->data) & 127))
 		return false;
 	sa = a;
 	lv_area_move(&sa, -sx, -sy);
@@ -638,10 +663,79 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 
 /* -------------------------------------------------------- display */
 
-static uint8_t *disp_buf;
+/*
+ * Two ways to the screen:
+ *  - page flipping (kernel MBX_IOC_FLIP): LVGL draws straight into two
+ *    scan-out buffers in turn; each frame is shown by switching the display
+ *    controller to it at the next vertical blank. No copy, no tearing, and
+ *    frames are paced by the display's 60 Hz.
+ *  - otherwise one draw buffer in the pool, copied to the boot framebuffer
+ *    by the GPU after each frame.
+ */
+static uint8_t *disp_buf;		/* copy mode: the draw buffer */
+static uint8_t *scan[2];		/* flip mode: the scan-out buffers */
+static uint32_t scan_handle[2];
+static uint8_t *front;			/* the buffer on screen (flip mode) */
 static uint32_t flush_seq;		/* the last display copy */
 static uint32_t flush_words[16 * 64];
 static int flush_n;
+static bool flipping;
+
+/* Areas flushed in the previous frame: LVGL copies them into the new buffer. */
+#define PREV_MAX 32
+static lv_area_t prev_areas[PREV_MAX], cur_areas[PREV_MAX];
+static int prev_n, cur_n;
+static bool prev_all, cur_all;
+
+static void clean_rows(uint8_t *buf, const lv_area_t *a)
+{
+	sync_range(buf + a->y1 * fb.stride, lv_area_get_height(a) * fb.stride, MBX_SYNC_CLEAN);
+}
+
+static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
+{
+	int i;
+
+	/* what the CPU drew in this area goes out to memory for the display */
+	clean_rows(px_map, area);
+	if (cur_n < PREV_MAX)
+		cur_areas[cur_n++] = *area;
+	else
+		cur_all = true;
+	if (lv_display_flush_is_last(disp)) {
+		struct mbx_flip f = { .flags = MBX_FLIP_VSYNC };
+		lv_area_t all = { 0, 0, fb.width - 1, fb.height - 1 };
+
+		/*
+		 * LVGL copied last frame's areas into this buffer with the CPU
+		 * (the parts not redrawn): clean those rows too.
+		 */
+		if (prev_all)
+			clean_rows(px_map, &all);
+		else
+			for (i = 0; i < prev_n; i++)
+				clean_rows(px_map, &prev_areas[i]);
+		memcpy(prev_areas, cur_areas, sizeof(cur_areas));
+		prev_n = cur_n;
+		prev_all = cur_all;
+		cur_n = 0;
+		cur_all = false;
+
+		f.handle = px_map == scan[0] ? scan_handle[0] : scan_handle[1];
+		gpu_wait(last_seq);		/* the GPU's part of the frame is done */
+		last_seq = 0;
+		{
+			double t0 = gpu_now_us();
+
+			ioctl(mbx, MBX_IOC_FLIP, &f);	/* waits for the vertical blank */
+			mbx_gpu_stats.flip_us += gpu_now_us() - t0;
+		}
+		front = px_map;
+		n72_frame_shown();
+	}
+	mbx_gpu_stats.flushes++;
+	lv_display_flush_ready(disp);
+}
 
 static int flush3d = -1;
 
@@ -649,7 +743,10 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
 	uint32_t stride = fb.stride;
 
-	LV_UNUSED(px_map);
+	if (flipping) {
+		flush_flip(disp, area, px_map);
+		return;
+	}
 	if (flush3d < 0)
 		flush3d = getenv("N72_FLUSH3D") != NULL;	/* no faster: memory bound */
 	sync_range(disp_buf + area->y1 * stride, lv_area_get_height(area) * stride,
@@ -661,10 +758,6 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 		flush_n = 0;
 	}
 	if (flush3d) {
-		/*
-		 * The 3D core copies a full screen in ~3 ms, the 2D engine in
-		 * ~8: large areas go through it (one job per area).
-		 */
 		uint32_t cw[48];
 		int n = mbx_cmd_copy(cw, 0, fb.stride, stride, area->x1, area->y1, area->x1,
 				     area->y1, lv_area_get_width(area),
@@ -711,6 +804,56 @@ static void refr_start_cb(lv_event_t *e)
 	n72_refr_start();
 }
 
+/* Map one more buffer object as a region. */
+static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
+{
+	struct mbx_alloc a = { .size = size, .flags = flags };
+	uint8_t *p;
+
+	if (nregions == 3 || ioctl(mbx, MBX_IOC_ALLOC, &a))
+		return NULL;
+	p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, mbx, a.mmap_offset);
+	if (p == MAP_FAILED) {
+		struct mbx_free fr = { .handle = a.handle };
+
+		ioctl(mbx, MBX_IOC_FREE, &fr);
+		return NULL;
+	}
+	regions[nregions++] = (struct region){ p, size, a.gpu_addr, a.handle };
+	if (handle)
+		*handle = a.handle;
+	return p;
+}
+
+/* Page flipping: two contiguous scan-out buffers, if the kernel can flip. */
+static bool flip_setup(uint32_t size)
+{
+	struct mbx_flip f = { .handle = MBX_FLIP_NONE };
+	int i;
+
+	if (getenv("N72_NOFLIP") || ioctl(mbx, MBX_IOC_FLIP, &f))
+		return false;
+	for (i = 0; i < 2; i++) {
+		scan[i] = region_add(size, MBX_ALLOC_CACHED | MBX_ALLOC_CONTIG, &scan_handle[i]);
+		if (!scan[i])
+			return false;	/* (the regions stay mapped; unused) */
+	}
+	/* start from what is on the screen, then show buffer 0 */
+	{
+		uint32_t w[16];
+
+		submit(w, put_copy(w, gpu_addr(scan[0]), fb.stride, fb.gpu_addr, fb.stride,
+				   0, 0, 0, 0, fb.width, fb.height));
+		gpu_wait(last_seq);
+		last_seq = 0;
+	}
+	f.handle = scan_handle[0];
+	f.flags = MBX_FLIP_VSYNC;
+	ioctl(mbx, MBX_IOC_FLIP, &f);
+	front = scan[0];
+	return true;
+}
+
 lv_display_t *mbx_gpu_display_create(void)
 {
 	struct mbx_alloc a = { .size = POOL_SIZE, .flags = MBX_ALLOC_CACHED };
@@ -743,6 +886,7 @@ lv_display_t *mbx_gpu_display_create(void)
 		goto fail;
 	pool_handle = a.handle;
 	pool_gpu = a.gpu_addr;
+	regions[nregions++] = (struct region){ pool, POOL_SIZE, a.gpu_addr, a.handle };
 	blocks[0].off = 0;
 	blocks[0].size = POOL_SIZE;
 	nblocks = 1;
@@ -759,16 +903,22 @@ lv_display_t *mbx_gpu_display_create(void)
 	u->dispatch_cb = mbx_dispatch;
 
 	size = fb.stride * fb.height;
-	disp_buf = pool_alloc(size);
-	if (!disp_buf)
-		goto fail;
 	disp = lv_display_create(fb.width, fb.height);
 	lv_display_set_color_format(disp, LV_COLOR_FORMAT_XRGB8888);
-	lv_display_set_buffers(disp, disp_buf, NULL, size, LV_DISPLAY_RENDER_MODE_DIRECT);
+	flipping = flip_setup(size);
+	if (flipping) {
+		lv_display_set_buffers(disp, scan[1], scan[0], size, LV_DISPLAY_RENDER_MODE_DIRECT);
+	} else {
+		disp_buf = pool_alloc(size);
+		if (!disp_buf)
+			goto fail;
+		lv_display_set_buffers(disp, disp_buf, NULL, size, LV_DISPLAY_RENDER_MODE_DIRECT);
+	}
 	lv_display_set_flush_cb(disp, flush_cb);
 	lv_display_add_event_cb(disp, refr_start_cb, LV_EVENT_REFR_START, NULL);
-	printf("n72-ui: MBX GPU: framebuffer at GPU %08x, %u KiB draw pool at %08x, %s jobs\n",
-	       fb.gpu_addr, POOL_SIZE / 1024, pool_gpu, gpu_async ? "async" : "sync");
+	fprintf(stderr, "n72-ui: MBX GPU: framebuffer at GPU %08x, %u KiB draw pool at %08x, %s jobs, %s\n",
+	       fb.gpu_addr, POOL_SIZE / 1024, pool_gpu, gpu_async ? "async" : "sync",
+	       flipping ? "page flipping at vblank" : "copy to the framebuffer");
 	return disp;
 
 fail:
@@ -793,8 +943,7 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void)
 	b = lv_draw_buf_create(fb.width, fb.height, LV_COLOR_FORMAT_XRGB8888, 0);
 	if (!b)
 		return NULL;
-	if (!in_pool(b->data) || (b->header.stride & 31) ||
-	    ((uintptr_t)b->data - (uintptr_t)pool) & 127) {
+	if (!in_pool(b->data) || (b->header.stride & 31) || (gpu_addr(b->data) & 127)) {
 		lv_draw_buf_destroy(b);
 		return NULL;
 	}
@@ -802,9 +951,56 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void)
 	gpu_wait(flush_seq);		/* the last frame is complete */
 	flush_seq = 0;
 	buf_invalidate(b, &all);
-	submit(w, put_copy(w, gpu_addr(b->data), b->header.stride, gpu_addr(disp_buf),
+	submit(w, put_copy(w, gpu_addr(b->data), b->header.stride,
+			   gpu_addr(flipping ? front : disp_buf),
 			   fb.stride, 0, 0, 0, 0, fb.width, fb.height));
 	gpu_wait(last_seq);
 	last_seq = 0;
 	return b;
+}
+
+/*
+ * An opaque copy of an ARGB8888 picture over a plain colour, made by the
+ * GPU: fill, then a blended 3D copy. NULL if it cannot be done.
+ */
+lv_draw_buf_t *mbx_gpu_flatten(const lv_draw_buf_t *src, lv_color_t bg)
+{
+	uint32_t w[48];
+	lv_draw_buf_t *b;
+	lv_area_t all;
+	int n;
+
+	if (mbx < 0 || !in_pool(src->data) || (src->header.stride & 31) ||
+	    (gpu_addr(src->data) & 127))
+		return NULL;
+	b = lv_draw_buf_create(src->header.w, src->header.h, LV_COLOR_FORMAT_XRGB8888, 0);
+	if (!b)
+		return NULL;
+	if (!in_pool(b->data) || (b->header.stride & 31) || (gpu_addr(b->data) & 127)) {
+		lv_draw_buf_destroy(b);
+		return NULL;
+	}
+	lv_area_set(&all, 0, 0, b->header.w - 1, b->header.h - 1);
+	buf_invalidate(b, &all);
+	submit(w, put_fill(w, gpu_addr(b->data), b->header.stride,
+			   0xff000000 | lv_color_to_u32(bg), 0, 0, b->header.w, b->header.h));
+	gpu_wait(last_seq);
+	last_seq = 0;
+	n = mbx_cmd_copy(w, 1, b->header.stride, src->header.stride, 0, 0, 0, 0,
+			 b->header.w, b->header.h, LV_OPA_COVER);
+	mbx_cmd_copy_blend(w, MBX_COPY_ALPHA);
+	if (blit3d(9, gpu_addr(b->data), gpu_addr(src->data), w, n)) {
+		lv_draw_buf_destroy(b);
+		return NULL;
+	}
+	gpu_wait(last_seq);
+	last_seq = 0;
+	return b;
+}
+
+/* The pixels on screen now (stride fb.stride), for screenshots. */
+const uint8_t *mbx_gpu_front(uint32_t *stride)
+{
+	*stride = fb.stride;
+	return flipping ? front : disp_buf;
 }

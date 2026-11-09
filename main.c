@@ -121,9 +121,16 @@ static uint64_t fps_last_us, fps_first_us, fps_refr_us, fps_int_max, fps_rend_su
 static unsigned int fps_n, fps_slow;
 static struct mbx_gpu_stats fps_g0;
 
+/*
+ * At the start of every refresh: step the animations to now. They have
+ * their own timer, which drifts against the refresh timer, so a frame
+ * sometimes showed the previous step and the next one two steps (frames
+ * landing 33 ms apart though each took 10 ms to draw).
+ */
 void n72_refr_start(void)
 {
 	fps_refr_us = mono_us();
+	lv_anim_refr_now();
 }
 
 static void fps_frame(void)
@@ -143,7 +150,7 @@ static void fps_frame(void)
 			int i;
 
 			fprintf(stderr, "  per frame: GPU fills %.1f (rounded %.1f) blends %.1f layers %.1f; "
-				"CPU fills radius %.1f small %.1f; GPU ioctl ms: sync %.1f submit %.1f 3d %.1f; tasks",
+				"CPU fills radius %.1f small %.1f; GPU ioctl ms: sync %.1f submit %.1f 3d %.1f, vblank wait %.1f; tasks",
 				(g->fills - fps_g0.fills) / (double)fps_n,
 				(g->fill_corners - fps_g0.fill_corners) / (double)fps_n,
 				(g->blends - fps_g0.blends) / (double)fps_n,
@@ -152,7 +159,8 @@ static void fps_frame(void)
 				(g->fill_small - fps_g0.fill_small) / (double)fps_n,
 				(g->sync_us - fps_g0.sync_us) / 1000 / fps_n,
 				(g->submit_us - fps_g0.submit_us) / 1000 / fps_n,
-				(g->blit3d_us - fps_g0.blit3d_us) / 1000 / fps_n);
+				(g->blit3d_us - fps_g0.blit3d_us) / 1000 / fps_n,
+				(g->flip_us - fps_g0.flip_us) / 1000 / fps_n);
 			for (i = 0; i < 16; i++)
 				if (g->seen[i] != fps_g0.seen[i])
 					fprintf(stderr, " %d:%.1f", i, (g->seen[i] - fps_g0.seen[i]) / (double)fps_n);
@@ -173,6 +181,72 @@ static void fps_frame(void)
 	fps_rend_max = LV_MAX(fps_rend_max, rend);
 	fps_n++;
 	fps_last_us = now;
+}
+
+/*
+ * N72_DRAGS="wait:x0,y0,x1,y1,ms wait:..." replays drags through a virtual
+ * pointer, for measuring scrolling without a finger: after @wait ms, press
+ * at x0,y0, move to x1,y1 over @ms, release.
+ */
+static struct drag { uint32_t wait, ms; int32_t x0, y0, x1, y1; } drags[16];
+static int ndrags, drag_i;
+static uint32_t drag_t0;
+
+static void drag_read(lv_indev_t *indev, lv_indev_data_t *data)
+{
+	struct drag *d;
+	uint32_t t;
+
+	LV_UNUSED(indev);
+	data->state = LV_INDEV_STATE_RELEASED;
+	if (drag_i >= ndrags)
+		return;
+	d = &drags[drag_i];
+	t = tick_ms() - drag_t0;
+	if (t < d->wait) {
+		data->point.x = d->x0;
+		data->point.y = d->y0;
+		return;
+	}
+	t -= d->wait;
+	if (t > d->ms) {
+		data->point.x = d->x1;
+		data->point.y = d->y1;
+		if (t > d->ms + 20) {		/* released: next drag */
+			drag_i++;
+			drag_t0 = tick_ms();
+			fprintf(stderr, "drag %d done\n", drag_i);
+		} else {
+			data->state = LV_INDEV_STATE_PRESSED;
+		}
+		return;
+	}
+	data->point.x = d->x0 + (d->x1 - d->x0) * (int32_t)t / (int32_t)d->ms;
+	data->point.y = d->y0 + (d->y1 - d->y0) * (int32_t)t / (int32_t)d->ms;
+	data->state = LV_INDEV_STATE_PRESSED;
+}
+
+static void drags_init(void)
+{
+	const char *p = getenv("N72_DRAGS");
+	lv_indev_t *in;
+
+	if (!p)
+		return;
+	while (ndrags < 16) {
+		struct drag *d = &drags[ndrags];
+		int n = 0;
+
+		if (sscanf(p, "%u:%d,%d,%d,%d,%u%n", &d->wait, &d->x0, &d->y0, &d->x1, &d->y1,
+			   &d->ms, &n) != 6)
+			break;
+		ndrags++;
+		p += n;
+	}
+	in = lv_indev_create();
+	lv_indev_set_type(in, LV_INDEV_TYPE_POINTER);
+	lv_indev_set_read_cb(in, drag_read);
+	drag_t0 = tick_ms();
 }
 
 /* Called when a frame has been flushed to the screen. */
@@ -597,6 +671,36 @@ static int bench(void)
 
 /* ----------------------------------------------------------------- main */
 
+/* SIGUSR1: write what is on screen to /tmp/n72-shot.raw (XRGB8888, 320x480). */
+static volatile sig_atomic_t shot_wanted;
+
+static void on_usr1(int sig)
+{
+	LV_UNUSED(sig);
+	shot_wanted = 1;
+}
+
+static void shot_poll(lv_timer_t *t)
+{
+	uint32_t stride;
+	const uint8_t *p;
+	FILE *f;
+	int y;
+
+	LV_UNUSED(t);
+	if (!shot_wanted)
+		return;
+	shot_wanted = 0;
+	p = mbx_gpu_front(&stride);
+	f = p ? fopen("/tmp/n72-shot.raw.tmp", "w") : NULL;
+	if (!f)
+		return;
+	for (y = 0; y < H; y++)
+		fwrite(p + y * stride, 4, W, f);
+	fclose(f);
+	rename("/tmp/n72-shot.raw.tmp", "/tmp/n72-shot.raw");
+}
+
 static void restore_tty(void)
 {
 	if (tty_fd >= 0)
@@ -682,6 +786,9 @@ int main(int argc, char **argv)
 	lv_timer_create(idle_check, 1000, NULL);
 
 	build_home();
+	drags_init();
+	signal(SIGUSR1, on_usr1);
+	lv_timer_create(shot_poll, 100, NULL);
 	if (argc > 1 && !strcmp(argv[1], "--bench"))
 		return bench();
 

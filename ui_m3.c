@@ -487,6 +487,8 @@ static struct {
 	lv_obj_t *live[SC_MAX], *pic[SC_MAX];
 	lv_draw_buf_t *buf[SC_MAX];
 	int n;
+	lv_timer_t *timer;
+	uint32_t last_move;
 } sc;
 
 static void sc_restore(bool delete_pics)
@@ -505,6 +507,18 @@ static void sc_restore(bool delete_pics)
 	sc.owner = NULL;
 }
 
+static void sc_settle(lv_timer_t *t)
+{
+	lv_obj_t *body = lv_timer_get_user_data(t);
+
+	if (sc.owner == body && lv_tick_elaps(sc.last_move) < 150)
+		return;			/* still moving: look again */
+	lv_timer_delete(t);
+	sc.timer = NULL;
+	if (sc.owner == body)
+		sc_restore(true);
+}
+
 static void sc_begin(lv_obj_t *body)
 {
 	uint32_t i, cnt = lv_obj_get_child_count(body);
@@ -512,6 +526,10 @@ static void sc_begin(lv_obj_t *body)
 
 	if (sc.owner)
 		sc_restore(true);
+	if (sc.timer) {
+		lv_timer_delete(sc.timer);
+		sc.timer = NULL;
+	}
 	for (i = 0; i < cnt && sc.n < SC_MAX; i++) {
 		lv_obj_t *c = lv_obj_get_child(body, i), *p;
 		lv_draw_buf_t *b;
@@ -523,6 +541,19 @@ static void sc_begin(lv_obj_t *body)
 		if (!b)
 			break;
 		lv_draw_buf_flush_cache(b, NULL);	/* the GPU reads it */
+		/*
+		 * Flatten it onto the page colour once: frames then copy opaque
+		 * pictures instead of blending them (a third of the memory
+		 * traffic, and the GPU is memory bound).
+		 */
+		{
+			lv_draw_buf_t *flat = mbx_gpu_flatten(b, M.surface);
+
+			if (flat) {
+				lv_draw_buf_destroy(b);
+				b = flat;
+			}
+		}
 		budget -= sz;
 		p = lv_image_create(body);
 		lv_image_set_src(p, b);
@@ -536,6 +567,8 @@ static void sc_begin(lv_obj_t *body)
 		sc.n++;
 	}
 	sc.owner = body;
+	if (getenv("N72_FPS"))
+		fprintf(stderr, "scroll cache: %d pictures\n", sc.n);
 }
 
 static void sc_event(lv_event_t *e)
@@ -543,17 +576,35 @@ static void sc_event(lv_event_t *e)
 	lv_obj_t *body = lv_event_get_current_target(e);
 
 	switch (lv_event_get_code(e)) {
+	case LV_EVENT_SCROLL:
+		sc.last_move = lv_tick_get();
+		break;
 	case LV_EVENT_SCROLL_BEGIN:
+		sc.last_move = lv_tick_get();
 		if (sc.owner != body)
 			sc_begin(body);
+		else if (sc.timer)		/* moving again before it settled */
+			lv_timer_reset(sc.timer);
 		break;
 	case LV_EVENT_SCROLL_END:
-		if (sc.owner == body)
-			sc_restore(true);
+		/*
+		 * Sent when the finger lifts too, but the throw and the elastic
+		 * bounce still move it: restore once it is really still.
+		 */
+		if (sc.owner == body) {
+			if (!sc.timer)
+				sc.timer = lv_timer_create(sc_settle, 100, body);
+			else
+				lv_timer_reset(sc.timer);
+		}
 		break;
 	case LV_EVENT_DELETE:	/* the pictures go with the page */
 		if (sc.owner == body)
 			sc_restore(false);
+		if (sc.timer) {
+			lv_timer_delete(sc.timer);
+			sc.timer = NULL;
+		}
 		break;
 	default:
 		break;
@@ -564,6 +615,7 @@ static void scroll_cached(lv_obj_t *body)
 {
 	lv_obj_add_event_cb(body, sc_event, LV_EVENT_SCROLL_BEGIN, NULL);
 	lv_obj_add_event_cb(body, sc_event, LV_EVENT_SCROLL_END, NULL);
+	lv_obj_add_event_cb(body, sc_event, LV_EVENT_SCROLL, NULL);
 	lv_obj_add_event_cb(body, sc_event, LV_EVENT_DELETE, NULL);
 }
 

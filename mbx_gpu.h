@@ -9,6 +9,7 @@ struct mbx_gpu_stats {
 	unsigned long fill_radius, fill_grad, fill_small;	/* fills left to the CPU */
 	unsigned long fill_corners;	/* rounded fills split GPU body + CPU corners */
 	double sync_us, submit_us, blit3d_us;	/* time spent in each ioctl */
+	double flip_us;		/* waiting for the vertical blank */
 	unsigned long async_done;	/* tasks finished asynchronously */
 	unsigned long long sync_bytes;
 	unsigned long seen[16];	/* draw tasks evaluated, by type */
@@ -24,5 +25,11 @@ lv_display_t *mbx_gpu_display_create(void);
 
 /* A GPU copy of the screen as shown now, or NULL. */
 lv_draw_buf_t *mbx_gpu_grab_screen(void);
+
+/* The pixels on screen now, for screenshots (SIGUSR1 -> /tmp/n72-shot.raw). */
+const uint8_t *mbx_gpu_front(uint32_t *stride);
+
+/* An opaque (XRGB8888) copy of an ARGB8888 picture over @bg, or NULL. */
+lv_draw_buf_t *mbx_gpu_flatten(const lv_draw_buf_t *src, lv_color_t bg);
 
 #endif
