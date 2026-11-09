@@ -6,6 +6,7 @@
 
 struct mbx_gpu_stats {
 	unsigned long submits, fills, blends, layers, flushes, pool_misses;
+	unsigned long fill_radius, fill_grad, fill_small;	/* fills left to the CPU */
 	unsigned long seen[16];	/* draw tasks evaluated, by type */
 };
 extern struct mbx_gpu_stats mbx_gpu_stats;

@@ -265,6 +265,12 @@ static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 	if (t->type == LV_DRAW_TASK_TYPE_FILL) {
 		const lv_draw_fill_dsc_t *d = t->draw_dsc;
 
+		if (d->radius != 0)
+			mbx_gpu_stats.fill_radius++;
+		else if (d->grad.dir != LV_GRAD_DIR_NONE)
+			mbx_gpu_stats.fill_grad++;
+		else if (size < 8192)
+			mbx_gpu_stats.fill_small++;
 		if (d->radius != 0 || d->grad.dir != LV_GRAD_DIR_NONE || d->opa <= LV_OPA_MIN)
 			return 0;
 		/*

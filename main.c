@@ -1174,6 +1174,8 @@ static int bench(void)
 	printf("  GPU submits %lu: fills %lu, blended fills %lu, layers %lu, flushes %lu; pool misses %lu\n",
 	       mbx_gpu_stats.submits, mbx_gpu_stats.fills, mbx_gpu_stats.blends,
 	       mbx_gpu_stats.layers, mbx_gpu_stats.flushes, mbx_gpu_stats.pool_misses);
+	printf("  fills left to the CPU: radius %lu, gradient %lu, small %lu\n",
+	       mbx_gpu_stats.fill_radius, mbx_gpu_stats.fill_grad, mbx_gpu_stats.fill_small);
 	printf("  tasks seen by type:");
 	for (i = 0; i < 16; i++)
 		if (mbx_gpu_stats.seen[i])
