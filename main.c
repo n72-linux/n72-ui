@@ -82,6 +82,7 @@ static bool lat_input_frame;
 static void render_now(void)
 {
 	uint64_t t0 = mono_us(), d;
+	struct mbx_gpu_stats g0 = mbx_gpu_stats;
 
 	lat_input_frame = true;
 	lv_refr_now(NULL);
@@ -89,6 +90,25 @@ static void render_now(void)
 	lat_event_us = 0;	/* nothing to show for this input: don't count it */
 	d = mono_us() - t0;
 	lat_render_max_us = LV_MAX(lat_render_max_us, d);
+	/* N72_LATENCY: say what a slow frame was made of */
+	if (lat_on && d > 50000) {
+		struct mbx_gpu_stats *g = &mbx_gpu_stats;
+		int i;
+
+		fprintf(stderr, "slow frame %.1f ms: submits %lu fills %lu blends %lu layers %lu; "
+			"CPU fills radius %lu grad %lu small %lu; sync %.1f ms (%llu KiB) submit %.1f ms "
+			"blit3d %.1f ms; tasks",
+			d / 1000.0, g->submits - g0.submits, g->fills - g0.fills,
+			g->blends - g0.blends, g->layers - g0.layers,
+			g->fill_radius - g0.fill_radius, g->fill_grad - g0.fill_grad,
+			g->fill_small - g0.fill_small, (g->sync_us - g0.sync_us) / 1000,
+			(g->sync_bytes - g0.sync_bytes) / 1024, (g->submit_us - g0.submit_us) / 1000,
+			(g->blit3d_us - g0.blit3d_us) / 1000);
+		for (i = 0; i < 16; i++)
+			if (g->seen[i] != g0.seen[i])
+				fprintf(stderr, " %d:%lu", i, g->seen[i] - g0.seen[i]);
+		fprintf(stderr, "\n");
+	}
 }
 
 /* Called when a frame has been flushed to the screen. */
