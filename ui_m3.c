@@ -294,8 +294,11 @@ static void show(lv_obj_t *scr)
 static lv_obj_t *nav[NAV_MAX];
 static int nav_n;
 
+static void shade_set(bool open, bool anim);
+
 static void go_home(void)
 {
+	shade_set(false, false);
 	while (nav_n > 0) {
 		lv_obj_t *s = nav[--nav_n];
 
@@ -581,7 +584,7 @@ static void status_refresh(bool with_bt)
 
 /* ------------------------------------------------------------- home */
 
-static lv_obj_t *clock_lbl, *date_lbl, *batt_lbl, *status_icons;
+static lv_obj_t *clock_lbl, *date_lbl, *batt_lbl, *status_icons, *status_time;
 static lv_obj_t *qs_wifi_sub, *qs_bt_sub, *qs_wifi, *qs_bt;
 static lv_obj_t *set_wifi_sub, *set_bt_sub;	/* on the Settings page */
 
@@ -644,6 +647,7 @@ static void home_update(lv_timer_t *t)
 				    (60 - tm.tm_sec) * 1000 + 50);
 	snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
 	label_set_if_changed(clock_lbl, buf);
+	label_set_if_changed(status_time, buf);
 	if (tm.tm_year + 1900 < 2024)
 		snprintf(buf, sizeof(buf), "Clock not set");
 	else
@@ -668,7 +672,6 @@ static void home_update(lv_timer_t *t)
 }
 
 static void open_settings(lv_event_t *e);
-static void open_about(lv_event_t *e);
 static void open_logs(lv_event_t *e);
 static void open_wifi(lv_event_t *e);
 static void open_bt(lv_event_t *e);
@@ -713,22 +716,23 @@ static void app_tile(lv_obj_t *parent, const char *icon, const char *name,
 	lv_obj_t *t = lv_obj_create(parent);
 
 	plain(t);
-	lv_obj_set_size(t, 84, 100);
+	lv_obj_set_size(t, 76, 96);
 	lv_obj_set_style_bg_opa(t, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_pad_all(t, 0, 0);
 	lv_obj_remove_flag(t, LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_set_flex_flow(t, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(t, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_row(t, 8, 0);
-	lv_obj_t *b = m3_badge(t, icon, bg, fg, 64);
+	lv_obj_t *b = m3_badge(t, icon, bg, fg, 60);
 
-	lv_obj_set_style_radius(b, 22, 0);	/* squircle-ish */
+	lv_obj_set_style_radius(b, 20, 0);	/* squircle-ish */
 	lv_obj_set_style_transform_scale(t, 240, LV_STATE_PRESSED);
 	m3_label(t, name, &lv_font_montserrat_14, M.on_surface);
 	lv_obj_add_event_cb(t, cb, LV_EVENT_CLICKED, NULL);
 }
 
-static lv_obj_t *home_bright;
+static lv_obj_t *home_bright, *shade, *scrim;
+static bool shade_open;
 
 /* Screen back on: bring the clock up to date now, not at the next run. */
 static void home_wake(void)
@@ -742,49 +746,133 @@ static void home_bright_cb(lv_event_t *e)
 	backlight_set(lv_slider_get_value(lv_event_get_target(e)));
 }
 
-static void build_home(void)
+/* ------------------------------------------------- quick settings shade */
+
+#define SHADE_H 312
+
+static void shade_y_cb(void *obj, int32_t v)
 {
-	lv_obj_t *row, *apps;
+	lv_obj_set_y(obj, v);
+}
 
-	conf_load();
-	m3_apply_theme();
-	home_scr = lv_obj_create(NULL);
-	m3_screen(home_scr);
+static void shade_hidden_cb(lv_anim_t *a)
+{
+	LV_UNUSED(a);
+	if (!shade_open)
+		lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+}
 
-	/* status bar */
-	lv_obj_align(m3_label(home_scr, "iPod touch", &lv_font_montserrat_14, M.on_surface_v),
-		     LV_ALIGN_TOP_LEFT, 16, 10);
-	batt_lbl = m3_label(home_scr, "", &lv_font_montserrat_14, M.on_surface_v);
-	lv_obj_align(batt_lbl, LV_ALIGN_TOP_RIGHT, -16, 10);
-	status_icons = m3_label(home_scr, "", &lv_font_montserrat_14, M.on_surface_v);
-	lv_obj_align_to(status_icons, batt_lbl, LV_ALIGN_OUT_LEFT_MID, -60, 0);
-	lv_obj_align(status_icons, LV_ALIGN_TOP_RIGHT, -90, 10);
+static void shade_set(bool open, bool anim)
+{
+	lv_anim_t a;
 
-	/* clock */
-	clock_lbl = m3_label(home_scr, "", &lv_font_montserrat_48, M.on_surface);
-	lv_obj_align(clock_lbl, LV_ALIGN_TOP_LEFT, 20, 52);
-	date_lbl = m3_label(home_scr, "", &lv_font_montserrat_16, M.primary);
-	lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, 22, 112);
+	if (!shade || open == shade_open)
+		return;
+	shade_open = open;
+	lv_anim_delete(shade, shade_y_cb);
+	if (open) {
+		lv_slider_set_value(home_bright, backlight_get(), LV_ANIM_OFF);
+		lv_obj_remove_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+		home_wake();
+	}
+	if (!anim) {
+		lv_obj_set_y(shade, open ? 0 : -SHADE_H);
+		shade_hidden_cb(NULL);
+		return;
+	}
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, shade);
+	lv_anim_set_exec_cb(&a, shade_y_cb);
+	lv_anim_set_values(&a, lv_obj_get_y(shade), open ? 0 : -SHADE_H);
+	lv_anim_set_duration(&a, 220);
+	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+	lv_anim_set_completed_cb(&a, shade_hidden_cb);
+	lv_anim_start(&a);
+}
 
-	/* quick settings */
-	row = lv_obj_create(home_scr);
+/* Swipe down anywhere on home opens the shade, swipe up closes it. */
+static void home_gesture_cb(lv_event_t *e)
+{
+	lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+
+	LV_UNUSED(e);
+	if (d == LV_DIR_BOTTOM)
+		shade_set(true, true);
+	else if (d == LV_DIR_TOP)
+		shade_set(false, true);
+}
+
+static void shade_tap_cb(lv_event_t *e)
+{
+	shade_set(lv_event_get_user_data(e) != NULL, true);
+}
+
+/* Tiles in the shade open their page, closing the shade behind them. */
+static void qs_open_wifi(lv_event_t *e)
+{
+	shade_set(false, false);
+	open_wifi(e);
+}
+
+static void qs_open_bt(lv_event_t *e)
+{
+	shade_set(false, false);
+	open_bt(e);
+}
+
+static void build_shade(void)
+{
+	lv_obj_t *row, *h;
+
+	scrim = lv_obj_create(home_scr);
+	plain(scrim);
+	lv_obj_set_size(scrim, W, H);
+	lv_obj_set_style_radius(scrim, 0, 0);
+	lv_obj_set_style_bg_color(scrim, lv_color_black(), 0);
+	lv_obj_set_style_bg_opa(scrim, LV_OPA_50, 0);
+	lv_obj_remove_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_add_event_cb(scrim, shade_tap_cb, LV_EVENT_CLICKED, NULL);
+
+	shade = lv_obj_create(home_scr);
+	plain(shade);
+	lv_obj_set_size(shade, W, SHADE_H);
+	lv_obj_set_pos(shade, 0, -SHADE_H);
+	lv_obj_set_style_bg_color(shade, M.surface_c, 0);
+	lv_obj_set_style_bg_opa(shade, LV_OPA_COVER, 0);
+	lv_obj_set_style_radius(shade, 28, 0);
+	lv_obj_set_style_pad_all(shade, 0, 0);
+	lv_obj_remove_flag(shade, LV_OBJ_FLAG_SCROLLABLE);
+	/* square top corners: a strip over the rounded ones */
+	h = lv_obj_create(shade);
+	plain(h);
+	lv_obj_set_size(h, W, 30);
+	lv_obj_set_style_radius(h, 0, 0);
+	lv_obj_set_style_bg_color(h, M.surface_c, 0);
+	lv_obj_remove_flag(h, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+	clock_lbl = m3_label(shade, "", &lv_font_montserrat_48, M.on_surface);
+	lv_obj_align(clock_lbl, LV_ALIGN_TOP_LEFT, 20, 24);
+	date_lbl = m3_label(shade, "", &lv_font_montserrat_16, M.primary);
+	lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, 22, 84);
+
+	row = lv_obj_create(shade);
 	plain(row);
 	lv_obj_set_size(row, W - 24, 64);
-	lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 160);
+	lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 128);
 	lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_pad_all(row, 0, 0);
 	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-	qs_wifi = qs_tile(row, LV_SYMBOL_WIFI, "Wi-Fi", &qs_wifi_sub, open_wifi);
-	qs_bt = qs_tile(row, LV_SYMBOL_BLUETOOTH, "Bluetooth", &qs_bt_sub, open_bt);
+	qs_wifi = qs_tile(row, LV_SYMBOL_WIFI, "Wi-Fi", &qs_wifi_sub, qs_open_wifi);
+	qs_bt = qs_tile(row, LV_SYMBOL_BLUETOOTH, "Bluetooth", &qs_bt_sub, qs_open_bt);
 
-	/* brightness, as in Android's quick settings */
-	row = lv_obj_create(home_scr);
+	row = lv_obj_create(shade);
 	plain(row);
 	lv_obj_set_size(row, W - 24, 56);
-	lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 236);
-	lv_obj_set_style_bg_color(row, M.surface_c_high, 0);
+	lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 204);
+	lv_obj_set_style_bg_color(row, M.surface_c_highest, 0);
 	lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
 	lv_obj_set_style_radius(row, LV_RADIUS_CIRCLE, 0);
 	lv_obj_set_style_pad_hor(row, 18, 0);
@@ -798,22 +886,62 @@ static void build_home(void)
 	lv_slider_set_range(home_bright, 5, 100);
 	lv_slider_set_value(home_bright, backlight_get(), LV_ANIM_OFF);
 	lv_obj_add_event_cb(home_bright, home_bright_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	/* a drag on the slider is not a swipe */
+	lv_obj_remove_flag(home_bright, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
-	/* apps */
+	/* drag handle */
+	h = lv_obj_create(shade);
+	plain(h);
+	lv_obj_set_size(h, 36, 4);
+	lv_obj_set_style_radius(h, 2, 0);
+	lv_obj_set_style_bg_color(h, M.outline, 0);
+	lv_obj_align(h, LV_ALIGN_BOTTOM_MID, 0, -14);
+	lv_obj_remove_flag(h, LV_OBJ_FLAG_CLICKABLE);
+}
+
+static void open_paint(lv_event_t *e);
+
+static void build_home(void)
+{
+	lv_obj_t *bar, *apps;
+
+	conf_load();
+	m3_apply_theme();
+	home_scr = lv_obj_create(NULL);
+	m3_screen(home_scr);
+	lv_obj_add_event_cb(home_scr, home_gesture_cb, LV_EVENT_GESTURE, NULL);
+
+	/* status bar: time, Wi-Fi and Bluetooth, battery; a tap opens the shade */
+	bar = lv_obj_create(home_scr);
+	plain(bar);
+	lv_obj_set_size(bar, W, 40);
+	lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_radius(bar, 0, 0);
+	lv_obj_set_style_pad_hor(bar, 16, 0);
+	lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_add_event_cb(bar, shade_tap_cb, LV_EVENT_CLICKED, (void *)1);
+	status_time = m3_label(bar, "", &lv_font_montserrat_14, M.on_surface);
+	lv_obj_align(status_time, LV_ALIGN_LEFT_MID, 0, 0);
+	batt_lbl = m3_label(bar, "", &lv_font_montserrat_14, M.on_surface_v);
+	lv_obj_align(batt_lbl, LV_ALIGN_RIGHT_MID, 0, 0);
+	status_icons = m3_label(bar, "", &lv_font_montserrat_14, M.on_surface_v);
+	lv_obj_align(status_icons, LV_ALIGN_RIGHT_MID, -74, 0);
+
+	/* apps: a launcher grid, four to a row */
 	apps = lv_obj_create(home_scr);
 	plain(apps);
-	lv_obj_set_size(apps, W - 24, 128);
-	lv_obj_align(apps, LV_ALIGN_TOP_MID, 0, 306);
-	lv_obj_set_style_bg_color(apps, M.surface_c, 0);
-	lv_obj_set_style_bg_opa(apps, LV_OPA_COVER, 0);
-	lv_obj_set_style_radius(apps, 28, 0);
-	lv_obj_set_style_pad_all(apps, 12, 0);
+	lv_obj_set_size(apps, W - 16, H - 56);
+	lv_obj_set_pos(apps, 8, 52);
+	lv_obj_set_style_bg_opa(apps, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_pad_all(apps, 0, 0);
+	lv_obj_set_style_pad_row(apps, 12, 0);
 	lv_obj_remove_flag(apps, LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_set_flex_flow(apps, LV_FLEX_FLOW_ROW_WRAP);
-	lv_obj_set_flex_align(apps, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+	lv_obj_set_flex_align(apps, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 	app_tile(apps, LV_SYMBOL_SETTINGS, "Settings", M.primary_c, M.on_primary_c, open_settings);
-	app_tile(apps, LV_SYMBOL_EYE_OPEN, "About", M.secondary_c, M.on_secondary_c, open_about);
-	app_tile(apps, LV_SYMBOL_FILE, "Logs", M.tertiary_c, M.on_tertiary_c, open_logs);
+	app_tile(apps, LV_SYMBOL_EDIT, "Paint", M.tertiary_c, M.on_tertiary_c, open_paint);
+
+	build_shade();
 
 	status_refresh(true);
 	home_timer = lv_timer_create(home_update, 2000, NULL);
@@ -1671,7 +1799,11 @@ static void ui_reopen(void)
 	if (!p)
 		return;
 	/* "display" after a theme change; the others for screenshots */
-	if (strcmp(p, "logs") && strcmp(p, "about"))
+	if (!strcmp(p, "shade"))
+		shade_set(true, false);
+	else if (!strcmp(p, "paint"))
+		open_paint(NULL);
+	else if (strcmp(p, "logs") && strcmp(p, "about"))
 		open_settings(NULL);
 	if (!strcmp(p, "display"))
 		open_display(NULL);
@@ -1686,4 +1818,106 @@ static void ui_reopen(void)
 	else if (!strcmp(p, "logs"))
 		open_logs(NULL);
 	unsetenv("N72_UI_OPEN");
+}
+
+/* -------------------------------------------------------------- paint */
+
+/* A finger-painting toy: each stroke gets the next colour round the wheel. */
+static lv_obj_t *paint_canvas;
+static void *paint_buf;
+static lv_point_t paint_last;
+static bool paint_down;
+static uint32_t paint_hue;
+
+#define PAINT_W (W - 24)
+#define PAINT_H (H - 56 - 16)
+
+static void paint_clear(void)
+{
+	lv_canvas_fill_bg(paint_canvas, M.surface_c, LV_OPA_COVER);
+}
+
+static void paint_event(lv_event_t *e)
+{
+	lv_event_code_t code = lv_event_get_code(e);
+	lv_indev_t *indev = lv_indev_active();
+	lv_draw_line_dsc_t d;
+	lv_layer_t layer;
+	lv_area_t a;
+	lv_point_t p;
+
+	if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+		paint_down = false;
+		return;
+	}
+	if (!indev || (code != LV_EVENT_PRESSED && code != LV_EVENT_PRESSING))
+		return;
+	lv_indev_get_point(indev, &p);
+	lv_obj_get_coords(paint_canvas, &a);
+	p.x -= a.x1;
+	p.y -= a.y1;
+	if (code == LV_EVENT_PRESSED || !paint_down) {
+		paint_last = p;
+		paint_down = true;
+		paint_hue = (paint_hue + 47) % 360;
+	}
+	lv_canvas_init_layer(paint_canvas, &layer);
+	lv_draw_line_dsc_init(&d);
+	d.color = tone(paint_hue, 75, conf.dark ? 70 : 50);
+	d.width = 10;
+	d.round_start = 1;
+	d.round_end = 1;
+	d.p1.x = paint_last.x;
+	d.p1.y = paint_last.y;
+	d.p2.x = p.x;
+	d.p2.y = p.y;
+	lv_draw_line(&layer, &d);
+	lv_canvas_finish_layer(paint_canvas, &layer);
+	paint_last = p;
+}
+
+static void paint_clear_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	if (paint_buf)
+		paint_clear();
+}
+
+static void paint_delete_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	free(paint_buf);
+	paint_buf = NULL;
+}
+
+static void open_paint(lv_event_t *e)
+{
+	lv_obj_t *scr, *body, *btn;
+
+	LV_UNUSED(e);
+	body = m3_page("Paint", &scr);
+	lv_obj_remove_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+	paint_buf = malloc(LV_CANVAS_BUF_SIZE(PAINT_W, PAINT_H, 32, LV_DRAW_BUF_STRIDE_ALIGN));
+	if (!paint_buf) {
+		lv_obj_delete(scr);
+		return;
+	}
+	paint_canvas = lv_canvas_create(body);
+	lv_canvas_set_buffer(paint_canvas, paint_buf, PAINT_W, PAINT_H, LV_COLOR_FORMAT_XRGB8888);
+	lv_obj_add_flag(paint_canvas, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_remove_flag(paint_canvas, LV_OBJ_FLAG_GESTURE_BUBBLE);
+	lv_obj_add_event_cb(paint_canvas, paint_event, LV_EVENT_ALL, NULL);
+	lv_obj_add_event_cb(scr, paint_delete_cb, LV_EVENT_DELETE, NULL);
+	paint_clear();
+
+	/* clear: a tonal icon button at the right of the top bar */
+	btn = lv_button_create(lv_obj_get_child(scr, 0));
+	plain(btn);
+	lv_obj_set_size(btn, 48, 40);
+	lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_bg_color(btn, M.secondary_c, 0);
+	lv_obj_align(btn, LV_ALIGN_RIGHT_MID, -8, 0);
+	lv_obj_add_event_cb(btn, paint_clear_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_center(m3_label(btn, LV_SYMBOL_TRASH, &lv_font_montserrat_16, M.on_secondary_c));
+	push(scr);
 }
