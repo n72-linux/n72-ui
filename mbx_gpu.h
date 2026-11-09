@@ -7,6 +7,9 @@
 struct mbx_gpu_stats {
 	unsigned long submits, fills, blends, layers, flushes, pool_misses;
 	unsigned long fill_radius, fill_grad, fill_small;	/* fills left to the CPU */
+	double sync_us, submit_us, blit3d_us;	/* time spent in each ioctl */
+	unsigned long async_done;	/* tasks finished asynchronously */
+	unsigned long long sync_bytes;
 	unsigned long seen[16];	/* draw tasks evaluated, by type */
 };
 extern struct mbx_gpu_stats mbx_gpu_stats;

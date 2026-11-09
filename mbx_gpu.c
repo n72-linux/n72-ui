@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -107,22 +108,71 @@ static uint32_t gpu_addr(const void *p)
 
 /* ---------------------------------------------------------- the GPU */
 
+static double gpu_now_us(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1e6 + t.tv_nsec / 1e3;
+}
+
 static void sync_range(const void *p, uint32_t size, uint32_t op)
 {
+	double t0 = gpu_now_us();
 	struct mbx_sync s = {
 		.handle = pool_handle, .op = op,
 		.offset = (const uint8_t *)p - pool, .size = size,
 	};
 
 	ioctl(mbx, MBX_IOC_SYNC, &s);
+	mbx_gpu_stats.sync_us += gpu_now_us() - t0;
+	mbx_gpu_stats.sync_bytes += size;
+}
+
+/*
+ * Asynchronous jobs (kernel MBX_IOC_SET_ASYNC): an async submit returns its
+ * sequence number; the job's completion is polled with MBX_IOC_WAIT.
+ */
+static int gpu_async;
+static uint32_t last_seq;		/* of the last job started */
+
+static int gpu_ret(int ret)
+{
+	if (ret > 0) {
+		last_seq = ret;
+		return 0;
+	}
+	return ret;
+}
+
+static void gpu_wait(uint32_t seq)
+{
+	struct mbx_wait w = { .wait_seq = seq };
+
+	if (gpu_async && seq)
+		ioctl(mbx, MBX_IOC_WAIT, &w);
+}
+
+static int gpu_done(uint32_t seq)
+{
+	struct mbx_wait w = { 0 };
+
+	if (ioctl(mbx, MBX_IOC_WAIT, &w))
+		return 1;
+	return (int32_t)(w.seq_done - seq) >= 0;
 }
 
 static int submit(const uint32_t *w, int n)
 {
 	struct mbx_submit s = { .words = (uintptr_t)w, .count = n };
 
+	double t0 = gpu_now_us();
+	int ret;
+
 	mbx_gpu_stats.submits++;
-	return ioctl(mbx, MBX_IOC_SUBMIT, &s);
+	ret = gpu_ret(ioctl(mbx, MBX_IOC_SUBMIT, &s));
+	mbx_gpu_stats.submit_us += gpu_now_us() - t0;
+	return ret;
 }
 
 static int put_tail(uint32_t *w, int n)
@@ -175,9 +225,14 @@ static int blit3d(int type, uint32_t dst, uint32_t src, const uint32_t *w, int n
 {
 	struct mbx_blit3d b = { .type = type, .dst_gpu = dst, .src_gpu = src, .count = n };
 
+	double t0 = gpu_now_us();
+	int ret;
+
 	memcpy(b.words, w, n * 4);
 	mbx_gpu_stats.submits++;
-	return ioctl(mbx, MBX_IOC_BLIT3D, &b);
+	ret = gpu_ret(ioctl(mbx, MBX_IOC_BLIT3D, &b));
+	mbx_gpu_stats.blit3d_us += gpu_now_us() - t0;
+	return ret;
 }
 
 /* ------------------------------------------------- LVGL draw buffers */
@@ -392,10 +447,56 @@ static void mbx_layer(lv_draw_unit_t *u, lv_draw_task_t *t)
 	mbx_gpu_stats.layers++;
 }
 
+/*
+ * A task may finish asynchronously only if the CPU cannot share a cache line
+ * with its target area while the GPU writes it: the area's left and right
+ * edges on 32-byte boundaries (8 pixels at 32 bpp).
+ */
+static bool async_ok(const lv_draw_task_t *t)
+{
+	return gpu_async && !(t->area.x1 & 7) && !((t->area.x2 + 1) & 7);
+}
+
+static int async_dbg = -1;
+#define ADBG(...) do { if (async_dbg) fprintf(stderr, __VA_ARGS__); } while (0)
+static lv_draw_task_t *inflight;
+static uint32_t inflight_seq;
+
 static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 {
-	lv_draw_task_t *t = lv_draw_get_next_available_task(layer, NULL, DRAW_UNIT_ID_MBX);
+	lv_draw_task_t *t;
 
+	if (async_dbg < 0)
+		async_dbg = getenv("N72_GPU_ADBG") != NULL;
+	if (inflight) {
+		static unsigned long spins;
+
+		if (!gpu_done(inflight_seq)) {
+			if (spins < 3)
+				ADBG("mbx: poll %lu, seq %u still running\n", spins, inflight_seq);
+			if (++spins % 200000 == 0) {
+				struct mbx_wait w = { 0 };
+
+				ioctl(mbx, MBX_IOC_WAIT, &w);
+				fprintf(stderr, "mbx: waiting on seq %u: submitted %u done %u (task type %d state %d)\n",
+					inflight_seq, w.seq_submitted, w.seq_done,
+					inflight->type, inflight->state);
+			}
+			/*
+			 * Still running; the CPU draws on. Ask for another
+			 * dispatch: without an OS, LVGL waits for one to poll again.
+			 */
+			lv_draw_dispatch_request();
+			return 0;
+		}
+		spins = 0;
+		ADBG("mbx: seq %u done, task %p ready\n", inflight_seq, (void *)inflight);
+		inflight->state = LV_DRAW_TASK_STATE_READY;
+		inflight = NULL;
+		mbx_gpu_stats.async_done++;
+		lv_draw_dispatch_request();
+	}
+	t = lv_draw_get_next_available_task(layer, NULL, DRAW_UNIT_ID_MBX);
 	if (!t || t->preferred_draw_unit_id != DRAW_UNIT_ID_MBX)
 		return LV_DRAW_UNIT_IDLE;
 	if (!lv_draw_layer_alloc_buf(layer))
@@ -410,6 +511,19 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 		mbx_fill(u, t);
 	else
 		mbx_fill_blend(u, t);
+	ADBG("mbx: dispatch on layer %p\n", (void *)layer);
+	ADBG("mbx: task %p type %d area %d,%d-%d,%d seq %u %s\n", (void *)t, t->type,
+	     (int)t->area.x1, (int)t->area.y1, (int)t->area.x2, (int)t->area.y2, last_seq,
+	     last_seq && async_ok(t) ? "async" : "sync");
+	if (last_seq && async_ok(t)) {
+		inflight = t;			/* finished in a later dispatch */
+		inflight_seq = last_seq;
+		last_seq = 0;
+		lv_draw_dispatch_request();	/* so LVGL comes back to poll it */
+		return 1;
+	}
+	gpu_wait(last_seq);			/* synchronous after all */
+	last_seq = 0;
 	t->state = LV_DRAW_TASK_STATE_READY;
 	lv_draw_dispatch_request();
 	return 1;
@@ -418,6 +532,7 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 /* -------------------------------------------------------- display */
 
 static uint8_t *disp_buf;
+static uint32_t flush_seq;		/* the last display copy */
 static uint32_t flush_words[16 * 64];
 static int flush_n;
 
@@ -430,6 +545,8 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 		   MBX_SYNC_CLEAN);
 	if (flush_n > (int)(sizeof(flush_words) / 4) - 16) {
 		submit(flush_words, flush_n);
+		gpu_wait(last_seq);
+		last_seq = 0;
 		flush_n = 0;
 	}
 	flush_n += put_copy(flush_words + flush_n, fb.gpu_addr, fb.stride,
@@ -439,10 +556,22 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 	mbx_gpu_stats.flushes++;
 	if (lv_display_flush_is_last(disp) && flush_n) {
 		submit(flush_words, flush_n);
+		/* the next frame waits for it before drawing (refr_start_cb) */
+		flush_seq = last_seq;
+		last_seq = 0;
 		flush_n = 0;
 		n72_frame_shown();
 	}
 	lv_display_flush_ready(disp);
+}
+
+/* Before the CPU draws the next frame into disp_buf: the copy must be done. */
+static void refr_start_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	ADBG("mbx: refresh start, waiting for flush seq %u\n", flush_seq);
+	gpu_wait(flush_seq);
+	flush_seq = 0;
 }
 
 lv_display_t *mbx_gpu_display_create(void)
@@ -456,6 +585,19 @@ lv_display_t *mbx_gpu_display_create(void)
 	mbx = open("/dev/mbx", O_RDWR | O_CLOEXEC);
 	if (mbx < 0)
 		return NULL;
+	{
+		const char *e = getenv("N72_GPU_ASYNC");
+		uint32_t on = 1;
+
+		/*
+		 * Opt-in (N72_GPU_ASYNC=1): correct (the home screen renders
+		 * pixel-identical) but not faster yet, since most UI tasks
+		 * overlap and the CPU has little to draw meanwhile. Older
+		 * kernels have no MBX_IOC_SET_ASYNC: stay synchronous.
+		 */
+		if (e && !strcmp(e, "1") && !ioctl(mbx, MBX_IOC_SET_ASYNC, &on))
+			gpu_async = 1;
+	}
 	if (ioctl(mbx, MBX_IOC_FB_INFO, &fb) || ioctl(mbx, MBX_IOC_ALLOC, &a))
 		goto fail;
 	pool = mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, mbx,
@@ -487,8 +629,9 @@ lv_display_t *mbx_gpu_display_create(void)
 	lv_display_set_color_format(disp, LV_COLOR_FORMAT_XRGB8888);
 	lv_display_set_buffers(disp, disp_buf, NULL, size, LV_DISPLAY_RENDER_MODE_DIRECT);
 	lv_display_set_flush_cb(disp, flush_cb);
-	printf("n72-ui: MBX GPU: framebuffer at GPU %08x, %u KiB draw pool at %08x\n",
-	       fb.gpu_addr, POOL_SIZE / 1024, pool_gpu);
+	lv_display_add_event_cb(disp, refr_start_cb, LV_EVENT_REFR_START, NULL);
+	printf("n72-ui: MBX GPU: framebuffer at GPU %08x, %u KiB draw pool at %08x, %s jobs\n",
+	       fb.gpu_addr, POOL_SIZE / 1024, pool_gpu, gpu_async ? "async" : "sync");
 	return disp;
 
 fail:
