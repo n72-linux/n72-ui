@@ -20,6 +20,6 @@ for f in $SRCS; do
 done | xargs -P "$(nproc)" -I{} sh -c '{}'
 $CC $CFLAGS -c "$UI/main.c" -o "$OUT/obj/main.o"
 $CC $CFLAGS -c "$UI/mbx_gpu.c" -o "$OUT/obj/mbx_gpu.o"
-$CC -static -Wl,--gc-sections -o "$OUT/n72-ui" "$OUT/obj/main.o" "$OUT/obj/mbx_gpu.o" $OBJS -lm
+$CC -static -Wl,--gc-sections -o "$OUT/n72-ui" "$OUT/obj/main.o" "$OUT/obj/mbx_gpu.o" $OBJS -lm -lpthread
 arm-linux-gnueabi-strip "$OUT/n72-ui"
 ls -l "$OUT/n72-ui"

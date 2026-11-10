@@ -25,6 +25,7 @@
 #include "lvgl/lvgl.h"
 #include "lvgl/src/lvgl_private.h"
 #include "mbx_gpu.h"
+#include <pthread.h>
 #include "mbx_cmd.h"
 
 void n72_frame_shown(void);
@@ -692,6 +693,57 @@ static void clean_rows(uint8_t *buf, const lv_area_t *a)
 	sync_range(buf + a->y1 * fb.stride, lv_area_get_height(a) * fb.stride, MBX_SYNC_CLEAN);
 }
 
+/*
+ * The flip runs in a helper thread: it waits for the vertical blank and
+ * switches the display, while the main loop goes on reading input and
+ * preparing the next frame. LVGL calls flip_wait_cb() before it draws into
+ * the buffer that is still on screen, so only that waits.
+ */
+static pthread_t flip_thread;
+static pthread_mutex_t flip_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t flip_cv = PTHREAD_COND_INITIALIZER;
+static uint32_t flip_handle;		/* pending flip, 0 = none */
+static uint8_t *flip_buf;
+
+static void *flip_main(void *arg)
+{
+	(void)arg;
+	pthread_mutex_lock(&flip_mx);
+	for (;;) {
+		struct mbx_flip f = { .flags = MBX_FLIP_VSYNC };
+		uint8_t *buf;
+		double t0;
+
+		while (!flip_handle)
+			pthread_cond_wait(&flip_cv, &flip_mx);
+		f.handle = flip_handle;
+		buf = flip_buf;
+		pthread_mutex_unlock(&flip_mx);
+		t0 = gpu_now_us();
+		ioctl(mbx, MBX_IOC_FLIP, &f);	/* waits for the vertical blank */
+		pthread_mutex_lock(&flip_mx);
+		mbx_gpu_stats.flip_us += gpu_now_us() - t0;
+		front = buf;
+		flip_handle = 0;
+		pthread_cond_broadcast(&flip_cv);
+	}
+	return NULL;
+}
+
+static void flip_wait(void)
+{
+	pthread_mutex_lock(&flip_mx);
+	while (flip_handle)
+		pthread_cond_wait(&flip_cv, &flip_mx);
+	pthread_mutex_unlock(&flip_mx);
+}
+
+static void flip_wait_cb(lv_display_t *disp)
+{
+	LV_UNUSED(disp);
+	flip_wait();
+}
+
 static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
 	int i;
@@ -721,17 +773,17 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 		cur_n = 0;
 		cur_all = false;
 
-		f.handle = px_map == scan[0] ? scan_handle[0] : scan_handle[1];
 		gpu_wait(last_seq);		/* the GPU's part of the frame is done */
 		last_seq = 0;
-		{
-			double t0 = gpu_now_us();
-
-			ioctl(mbx, MBX_IOC_FLIP, &f);	/* waits for the vertical blank */
-			mbx_gpu_stats.flip_us += gpu_now_us() - t0;
-		}
-		front = px_map;
-		n72_frame_shown();
+		(void)f;
+		pthread_mutex_lock(&flip_mx);
+		flip_buf = px_map;
+		flip_handle = px_map == scan[0] ? scan_handle[0] : scan_handle[1];
+		pthread_cond_signal(&flip_cv);
+		pthread_mutex_unlock(&flip_mx);
+		n72_frame_shown();		/* (queued: on screen at the next vblank) */
+		mbx_gpu_stats.flushes++;
+		return;				/* LVGL waits in flip_wait_cb() */
 	}
 	mbx_gpu_stats.flushes++;
 	lv_display_flush_ready(disp);
@@ -906,8 +958,11 @@ lv_display_t *mbx_gpu_display_create(void)
 	disp = lv_display_create(fb.width, fb.height);
 	lv_display_set_color_format(disp, LV_COLOR_FORMAT_XRGB8888);
 	flipping = flip_setup(size);
+	if (flipping && pthread_create(&flip_thread, NULL, flip_main, NULL))
+		flipping = false;
 	if (flipping) {
 		lv_display_set_buffers(disp, scan[1], scan[0], size, LV_DISPLAY_RENDER_MODE_DIRECT);
+		lv_display_set_flush_wait_cb(disp, flip_wait_cb);
 	} else {
 		disp_buf = pool_alloc(size);
 		if (!disp_buf)
@@ -948,6 +1003,8 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void)
 		return NULL;
 	}
 	lv_area_set(&all, 0, 0, fb.width - 1, fb.height - 1);
+	if (flipping)
+		flip_wait();		/* the last frame is on screen */
 	gpu_wait(flush_seq);		/* the last frame is complete */
 	flush_seq = 0;
 	buf_invalidate(b, &all);
@@ -1002,5 +1059,7 @@ lv_draw_buf_t *mbx_gpu_flatten(const lv_draw_buf_t *src, lv_color_t bg)
 const uint8_t *mbx_gpu_front(uint32_t *stride)
 {
 	*stride = fb.stride;
+	if (flipping)
+		flip_wait();
 	return flipping ? front : disp_buf;
 }
