@@ -2079,7 +2079,7 @@ static bool logs_follow = true;
  * a frame while scrolling. Chunks off screen are skipped whole, and an
  * update only touches the chunks whose text changed.
  */
-#define LOGS_CHUNK	8	/* ~260 px: a new scroll picture costs ~15 ms, not ~30 */
+#define LOGS_CHUNK	8	/* small labels: LVGL walks each one from its start */
 #define LOGS_MAXCH	96
 static lv_obj_t *logs_chunk[LOGS_MAXCH];
 static int logs_nchunks;
@@ -2223,7 +2223,11 @@ static void open_logs(lv_event_t *e)
 	lv_obj_set_flex_flow(logs_box, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_style_pad_row(logs_box, 0, 0);
 	logs_nchunks = 0;
-	scroll_cached(logs_box);	/* scroll the chunks as pictures */
+	/*
+	 * No scroll cache here: pictures of text chunks cost as much to take
+	 * as they save (measured: 16.6 vs 15.8 ms a frame, same hitches), while
+	 * the card pages draw ~30% faster with it.
+	 */
 	logs_update(NULL);
 	logs_timer = lv_timer_create(logs_update, 2000, NULL);
 	lv_obj_add_event_cb(scr, logs_delete_cb, LV_EVENT_DELETE, NULL);
