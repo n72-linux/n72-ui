@@ -27,6 +27,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <linux/input.h>
 #include <linux/kd.h>
 #include <poll.h>
@@ -404,6 +405,35 @@ static void backlight_power(bool on)
 	write_int(p, on ? 0 : 4);
 }
 
+/*
+ * The screen off and on. The display driver (lcd-n72) powers the panel
+ * down and gates the display controller's clocks, as iOS does, so the
+ * system can idle at its slowest clock; it switches the backlight with
+ * it. Without that driver only the backlight goes. Touch is ignored while
+ * the screen is off.
+ */
+#define PANEL_POWER	"/sys/devices/platform/soc/38900000.lcd/panel_power"
+
+static void drain(int fd);
+static void home_wake(void);
+static void screen_off_or_sleep(void);
+
+static void screen_set(bool on)
+{
+	screen_off = !on;
+	if (access(PANEL_POWER, W_OK) == 0)
+		write_int(PANEL_POWER, on);
+	else
+		backlight_power(on);
+	if (touch_indev)
+		lv_indev_enable(touch_indev, on);
+	drain(touch_wait_fd);
+	if (on) {
+		home_wake();
+		lv_obj_invalidate(lv_screen_active());
+	}
+}
+
 #include "audio.c"
 #include "ui_m3.c"
 
@@ -532,12 +562,70 @@ static bool system_sleep(void)
 
 	/* the wake press and anything touched meanwhile are not input */
 	drain(keys_fd);
-	drain(touch_wait_fd);
-	screen_off = false;
-	backlight_power(true);
-	home_wake();
-	lv_obj_invalidate(lv_screen_active());
+	screen_set(true);
 	return ok;
+}
+
+/* Is sound playing? (any ALSA playback stream running) */
+static bool audio_playing(void)
+{
+	glob_t g;
+	bool on = false;
+
+	if (glob("/proc/asound/card*/pcm*p/sub*/status", 0, NULL, &g))
+		return false;
+	for (size_t i = 0; i < g.gl_pathc && !on; i++) {
+		char buf[64] = "";
+		FILE *f = fopen(g.gl_pathv[i], "r");
+
+		if (!f)
+			continue;
+		on = fgets(buf, sizeof(buf), f) && strstr(buf, "RUNNING");
+		fclose(f);
+	}
+	globfree(&g);
+	return on;
+}
+
+/*
+ * Power, the idle timeout and Settings > Power > Sleep: sleep, or with
+ * sound playing only turn the screen off, and sleep once it stops
+ * (playback_check). Screen off with the cable out lets the kernel gate
+ * the display and USB and idle at the system clock's slowest divider.
+ */
+static bool screen_off_for_sound;
+
+static void screen_off_or_sleep(void)
+{
+	if (audio_playing()) {
+		screen_off_for_sound = true;
+		screen_set(false);
+		return;
+	}
+	if (!system_sleep())
+		screen_set(false);
+}
+
+static void playback_check(lv_timer_t *t)
+{
+	static int quiet;
+
+	LV_UNUSED(t);
+	if (!screen_off || !screen_off_for_sound) {
+		quiet = 0;
+		return;
+	}
+	if (audio_playing()) {
+		quiet = 0;
+		return;
+	}
+	/* a gap between tracks is not the end: two checks in a row */
+	if (++quiet < 2)
+		return;
+	quiet = 0;
+	screen_off_for_sound = false;
+	if (!system_sleep())
+		screen_set(false);
 }
 
 /* Sleep after a while without input, unless running from USB power. */
@@ -550,10 +638,7 @@ static void idle_check(lv_timer_t *t)
 		return;
 	if (usb_powered())
 		return;
-	if (!system_sleep()) {
-		screen_off = true;
-		backlight_power(false);
-	}
+	screen_off_or_sleep();
 	lv_display_trigger_activity(NULL);
 }
 
@@ -587,9 +672,8 @@ static void keys_poll(lv_timer_t *t)
 		switch (ev.code) {
 		case KEY_HOMEPAGE:
 			if (screen_off) {
-				screen_off = false;
-				backlight_power(true);
-				home_wake();
+				screen_off_for_sound = false;
+				screen_set(true);
 			} else if (home_down_us && mono_us() - home_down_us >= 1000000) {
 				go_home();
 				open_logs(NULL);
@@ -602,19 +686,20 @@ static void keys_poll(lv_timer_t *t)
 			/* a late report of the press that woke us */
 			if (mono_us() - woke_us < 500000)
 				break;
-			if (!screen_off && system_sleep())
-				break;
-			screen_off = !screen_off;
-			backlight_power(!screen_off);
-			if (!screen_off)
-				home_wake();
+			if (screen_off) {
+				screen_off_for_sound = false;
+				screen_set(true);
+			} else {
+				screen_off_or_sleep();
+			}
 			break;
+		/* the volume works with the screen off too (sound playing) */
 		case KEY_VOLUMEUP:
-			if (!screen_off && !logs_scroll(1))
+			if (screen_off || !logs_scroll(1))
 				volume_step(1);
 			break;
 		case KEY_VOLUMEDOWN:
-			if (!screen_off && !logs_scroll(-1))
+			if (screen_off || !logs_scroll(-1))
 				volume_step(-1);
 			break;
 		}
@@ -975,6 +1060,7 @@ int main(int argc, char **argv)
 		keys_fd = open(keys, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 	lv_timer_create(keys_poll, 30, NULL);
 	lv_timer_create(idle_check, 1000, NULL);
+	lv_timer_create(playback_check, 2000, NULL);
 
 	build_home();
 	sound_ui_init();

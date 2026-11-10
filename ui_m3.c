@@ -1917,10 +1917,7 @@ static void power_do(lv_event_t *e)
 
 	if (what == 3) {
 		go_home();
-		if (!system_sleep()) {
-			screen_off = true;
-			backlight_power(false);
-		}
+		screen_off_or_sleep();
 		return;
 	}
 	sync();
