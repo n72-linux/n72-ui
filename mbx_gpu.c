@@ -361,6 +361,11 @@ static bool image_ok(const lv_draw_task_t *t)
 	       d->clip_radius == 0 && !d->bitmap_mask_src;
 }
 
+/* GPU text (below) */
+static int gtext = -1;
+static bool gt_init(void);
+static bool gt_worth_it(const lv_draw_task_t *t);
+
 static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 {
 	const lv_draw_dsc_base_t *base = t->draw_dsc;
@@ -406,6 +411,11 @@ static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 			return 0;
 	} else if (t->type == LV_DRAW_TASK_TYPE_IMAGE) {
 		if (dcf != LV_COLOR_FORMAT_XRGB8888 || size < 4096 || !image_ok(t))
+			return 0;
+	} else if (t->type == LV_DRAW_TASK_TYPE_LABEL) {
+		if (gtext < 0)
+			gtext = gt_init();
+		if (!gtext || dcf != LV_COLOR_FORMAT_XRGB8888 || !gt_worth_it(t))
 			return 0;
 	} else {
 		return 0;
@@ -600,6 +610,265 @@ static int async_dbg = -1;
 static lv_draw_task_t *inflight;
 static uint32_t inflight_seq;
 
+
+/* ------------------------------------------------------------ GPU text */
+
+/*
+ * Labels through OpenGL ES 1.1 (n72-gles) on the MBX: the glyphs LVGL
+ * hands over (A8 bitmaps) are cached in a 512x512 A8 atlas texture, and a
+ * label becomes one batch of textured quads modulated by its colour and
+ * alpha-blended into the target (a pixmap surface over the label's
+ * rectangle: the existing pixels are the background). One TA frame per
+ * label, so only labels with enough glyphs are worth it; the rest stay on
+ * the CPU. N72_GPU_TEXT=1 enables it.
+ */
+#include <EGL/egl.h>
+#include <GLES/gl.h>
+#include "n72egl.h"
+
+#define ATL		512
+#define GT_MIN_GLYPHS	40		/* fewer: the CPU is cheaper than a TA frame */
+#define GT_MAX_QUADS	2048
+#define GT_CACHE	2048		/* glyph cache slots (power of two) */
+
+static EGLDisplay gt_dpy;
+static EGLSurface gt_surf;
+static EGLContext gt_ctx;
+static GLuint gt_tex;
+static uint8_t *gt_atlas_cpu;
+static int gt_shelf_y, gt_shelf_h, gt_x;
+static struct gt_glyph {
+	const void *font;
+	uint32_t gid;
+	uint16_t x, y, w, h;
+} gt_cache[GT_CACHE];
+static GLfloat *gt_pos, *gt_uv;
+static int gt_n;			/* quads collected */
+static int gt_ox, gt_oy;		/* target rectangle origin (screen) */
+unsigned long mbx_gpu_text_labels, mbx_gpu_text_glyphs;
+
+static void gt_reset_atlas(void)
+{
+	memset(gt_cache, 0, sizeof(gt_cache));
+	memset(gt_atlas_cpu, 0, ATL * ATL);
+	/* a 2x2 opaque texel block at (0,0) for solid fills (underline etc.) */
+	gt_atlas_cpu[0] = gt_atlas_cpu[1] = gt_atlas_cpu[ATL] = gt_atlas_cpu[ATL + 1] = 0xff;
+	gt_shelf_y = 0;
+	gt_shelf_h = 2;
+	gt_x = 4;
+	glBindTexture(GL_TEXTURE_2D, gt_tex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, ATL, ATL, 0, GL_ALPHA, GL_UNSIGNED_BYTE, gt_atlas_cpu);
+}
+
+static bool gt_init(void)
+{
+	static const EGLint attr[] = {
+		EGL_SURFACE_TYPE, EGL_PIXMAP_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES_BIT,
+		EGL_RED_SIZE, 8, EGL_DEPTH_SIZE, 0, EGL_NONE,
+	};
+	struct n72_native_pixmap pm = {
+		.gpu_addr = pool_gpu, .cpu = pool,
+		.width = 64, .height = 16, .stride = fb.stride, .format = N72_PIXMAP_XRGB8888,
+	};
+	EGLConfig cfg;
+	EGLint n;
+
+	if (!getenv("N72_GPU_TEXT") || (fb.stride & 63))
+		return false;
+	n72_egl_set_mbx_fd(mbx);
+	gt_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+	if (!eglInitialize(gt_dpy, NULL, NULL) || !eglChooseConfig(gt_dpy, attr, &cfg, 1, &n) || !n) {
+		fprintf(stderr, "n72-ui: GPU text: no EGL display/config (%#x)\n", eglGetError());
+		return false;
+	}
+	gt_ctx = eglCreateContext(gt_dpy, cfg, EGL_NO_CONTEXT, NULL);
+	gt_surf = eglCreatePixmapSurface(gt_dpy, cfg, (EGLNativePixmapType)&pm, NULL);
+	if (gt_ctx == EGL_NO_CONTEXT || gt_surf == EGL_NO_SURFACE ||
+	    !eglMakeCurrent(gt_dpy, gt_surf, gt_surf, gt_ctx)) {
+		fprintf(stderr, "n72-ui: GPU text: no EGL context/surface (%#x)\n", eglGetError());
+		return false;
+	}
+	gt_atlas_cpu = malloc(ATL * ATL);
+	gt_pos = malloc(GT_MAX_QUADS * 12 * sizeof(GLfloat));
+	gt_uv = malloc(GT_MAX_QUADS * 12 * sizeof(GLfloat));
+	if (!gt_atlas_cpu || !gt_pos || !gt_uv)
+		return false;
+	glGenTextures(1, &gt_tex);
+	glBindTexture(GL_TEXTURE_2D, gt_tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	gt_reset_atlas();
+	glEnable(GL_TEXTURE_2D);
+	glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glDisable(GL_DEPTH_TEST);
+	glEnableClientState(GL_VERTEX_ARRAY);
+	glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+	glVertexPointer(2, GL_FLOAT, 0, gt_pos);
+	glTexCoordPointer(2, GL_FLOAT, 0, gt_uv);
+	fprintf(stderr, "n72-ui: GPU text (OpenGL ES: %s)\n", (const char *)glGetString(GL_RENDERER));
+	return true;
+}
+
+/* The glyph's atlas rectangle, uploading it on a miss; NULL if it cannot be placed. */
+static struct gt_glyph *gt_glyph(const lv_font_glyph_dsc_t *g, const lv_draw_buf_t *bm)
+{
+	uint32_t key = (uint32_t)(uintptr_t)g->resolved_font * 31 + g->gid.index, k;
+	struct gt_glyph *e;
+	int w = g->box_w, h = g->box_h, y;
+
+	for (k = 0; k < 8; k++) {
+		e = &gt_cache[(key + k) & (GT_CACHE - 1)];
+		if (e->font == g->resolved_font && e->gid == g->gid.index)
+			return e;
+		if (!e->font)
+			break;
+	}
+	if (k == 8 || w > 64 || h > 64)
+		return NULL;
+	if (gt_x + w + 1 > ATL) {		/* next shelf */
+		gt_shelf_y += gt_shelf_h + 1;
+		gt_shelf_h = 0;
+		gt_x = 0;
+	}
+	if (gt_shelf_y + h > ATL)
+		return NULL;			/* full: caller resets at a safe point */
+	{
+		uint8_t tmp[64 * 64];
+
+		for (y = 0; y < h; y++) {
+			memcpy(gt_atlas_cpu + (gt_shelf_y + y) * ATL + gt_x,
+			       bm->data + y * bm->header.stride, w);
+			memcpy(tmp + y * w, bm->data + y * bm->header.stride, w);
+		}
+		glBindTexture(GL_TEXTURE_2D, gt_tex);
+		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, gt_x, gt_shelf_y, w, h, GL_ALPHA,
+				GL_UNSIGNED_BYTE, tmp);
+	}
+	e->font = g->resolved_font;
+	e->gid = g->gid.index;
+	e->x = gt_x;
+	e->y = gt_shelf_y;
+	e->w = w;
+	e->h = h;
+	gt_x += w + 1;
+	if (h > gt_shelf_h)
+		gt_shelf_h = h;
+	return e;
+}
+
+static void gt_quad(const lv_area_t *a, float u0, float v0, float u1, float v1)
+{
+	GLfloat x0 = a->x1 - gt_ox, y0 = a->y1 - gt_oy, x1 = a->x2 + 1 - gt_ox, y1 = a->y2 + 1 - gt_oy;
+	GLfloat *p = gt_pos + gt_n * 12, *t = gt_uv + gt_n * 12;
+	const GLfloat q[12] = { x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1 };
+	const GLfloat uv[12] = { u0, v0, u1, v0, u1, v1, u0, v0, u1, v1, u0, v1 };
+
+	if (gt_n >= GT_MAX_QUADS)
+		return;
+	memcpy(p, q, sizeof(q));
+	memcpy(t, uv, sizeof(uv));
+	gt_n++;
+}
+
+static bool gt_failed;
+
+static void gt_glyph_cb(lv_draw_unit_t *u, lv_draw_glyph_dsc_t *gd, lv_draw_fill_dsc_t *fd,
+			const lv_area_t *fill_area)
+{
+	LV_UNUSED(u);
+	if (fd && fill_area)			/* underline, strike-through, selection bg */
+		gt_quad(fill_area, 0.5f / ATL, 0.5f / ATL, 1.5f / ATL, 1.5f / ATL);
+	if (!gd || gd->format < LV_FONT_GLYPH_FORMAT_A1 || gd->format > LV_FONT_GLYPH_FORMAT_A8 ||
+	    !gd->glyph_data)
+		return;
+	{
+		struct gt_glyph *e = gt_glyph(gd->g, gd->glyph_data);
+
+		if (!e) {
+			gt_failed = true;
+			return;
+		}
+		gt_quad(gd->letter_coords, (float)e->x / ATL, (float)e->y / ATL,
+			(float)(e->x + e->w) / ATL, (float)(e->y + e->h) / ATL);
+		mbx_gpu_text_glyphs++;
+	}
+}
+
+static bool gt_worth_it(const lv_draw_task_t *t)
+{
+	const lv_draw_label_dsc_t *d = t->draw_dsc;
+	size_t n;
+
+	if (!d->text || d->sel_start != LV_DRAW_LABEL_NO_TXT_SEL || d->opa < LV_OPA_MIN)
+		return false;
+	n = strnlen(d->text, GT_MIN_GLYPHS * 2);
+	return n >= GT_MIN_GLYPHS;
+}
+
+
+/* Draw one label task with GL; false: draw it in software instead. */
+static bool mbx_label(lv_draw_unit_t *u, lv_draw_task_t *t)
+{
+	lv_layer_t *layer = u->target_layer;
+	lv_draw_buf_t *b = layer->draw_buf;
+	lv_draw_label_dsc_t *d = t->draw_dsc;
+	lv_area_t a, coords = t->area;
+	struct n72_native_pixmap pm;
+	int ax, aw, h;
+
+	if (!lv_area_intersect(&a, &t->area, u->clip_area))
+		return true;
+	/* the target: the clipped rectangle, x aligned down to 32 px (128 bytes) */
+	ax = (a.x1 - layer->buf_area.x1) & ~31;
+	aw = ((a.x2 - layer->buf_area.x1 + 1 - ax) + 31) & ~31;
+	if (ax + aw > (int)(b->header.stride / 4))
+		aw = b->header.stride / 4 - ax;
+	h = lv_area_get_height(&a);
+	gt_ox = layer->buf_area.x1 + ax;
+	gt_oy = a.y1;
+	pm.gpu_addr = gpu_addr(b->data) + (a.y1 - layer->buf_area.y1) * b->header.stride + ax * 4;
+	pm.cpu = b->data + (a.y1 - layer->buf_area.y1) * b->header.stride + ax * 4;
+	pm.handle = 0;
+	pm.width = aw;
+	pm.height = h;
+	pm.stride = b->header.stride;
+	pm.format = N72_PIXMAP_XRGB8888;
+	if (n72_egl_pixmap_retarget(gt_surf, &pm))
+		return false;
+
+	gt_n = 0;
+	gt_failed = false;
+	lv_draw_label_iterate_characters(u, d, &coords, gt_glyph_cb);
+	if (gt_failed) {			/* atlas full: start over next time */
+		gt_reset_atlas();
+		return false;
+	}
+	{
+		lv_area_t ba = a;
+
+		lv_area_move(&ba, -layer->buf_area.x1, -layer->buf_area.y1);
+		buf_invalidate(b, &ba);		/* CPU lines over the rectangle out */
+	}
+	glViewport(0, 0, aw, h);
+	glMatrixMode(GL_PROJECTION);
+	glLoadIdentity();
+	glOrthof(0, aw, h, 0, -1, 1);		/* screen-like: y down */
+	glMatrixMode(GL_MODELVIEW);
+	glLoadIdentity();
+	glEnable(GL_SCISSOR_TEST);
+	glScissor(a.x1 - gt_ox, 0, lv_area_get_width(&a), h);
+	glColor4ub(d->color.red, d->color.green, d->color.blue, d->opa);
+	glDrawArrays(GL_TRIANGLES, 0, gt_n * 6);
+	glFinish();
+	mbx_gpu_text_labels++;
+	return true;
+}
+
 static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 {
 	lv_draw_task_t *t;
@@ -647,6 +916,10 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 		mbx_layer(u, t);
 	else if (t->type == LV_DRAW_TASK_TYPE_IMAGE)
 		mbx_image(u, t);
+	else if (t->type == LV_DRAW_TASK_TYPE_LABEL) {
+		if (!mbx_label(u, t))
+			lv_draw_sw_label(u, t->draw_dsc, &t->area);
+	}
 	else if (((lv_draw_fill_dsc_t *)t->draw_dsc)->opa >= LV_OPA_MAX)
 		mbx_fill(u, t);
 	else

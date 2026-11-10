@@ -631,6 +631,12 @@ static void sc_begin(lv_obj_t *body)
 static void sc_event(lv_event_t *e)
 {
 	lv_obj_t *body = lv_event_get_current_target(e);
+	static int off = -1;
+
+	if (off < 0)
+		off = getenv("N72_NO_SCROLL_CACHE") != NULL;	/* (for measurements) */
+	if (off)
+		return;
 
 	switch (lv_event_get_code(e)) {
 	case LV_EVENT_SCROLL:
