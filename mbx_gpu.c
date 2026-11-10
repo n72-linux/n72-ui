@@ -363,6 +363,8 @@ static bool image_ok(const lv_draw_task_t *t)
 
 /* GPU text (below) */
 static int gtext = -1;
+static bool gt_cpu_only;
+
 static bool gt_init(void);
 static bool gt_worth_it(const lv_draw_task_t *t);
 
@@ -675,6 +677,7 @@ static bool gt_init(void)
 
 	if (!getenv("N72_GPU_TEXT") || (fb.stride & 63))
 		return false;
+	gt_cpu_only = !strcmp(getenv("N72_GPU_TEXT"), "cpu");
 	n72_egl_set_mbx_fd(mbx);
 	gt_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
 	if (!eglInitialize(gt_dpy, NULL, NULL) || !eglChooseConfig(gt_dpy, attr, &cfg, 1, &n) || !n) {
@@ -776,6 +779,16 @@ static void gt_quad(const lv_area_t *a, float u0, float v0, float u1, float v1)
 }
 
 static bool gt_failed;
+static int gt_stats = -1;
+
+
+static uint64_t gt_now_us(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
 
 static void gt_glyph_cb(lv_draw_unit_t *u, lv_draw_glyph_dsc_t *gd, lv_draw_fill_dsc_t *fd,
 			const lv_area_t *fill_area)
@@ -819,6 +832,7 @@ static bool mbx_label(lv_draw_unit_t *u, lv_draw_task_t *t)
 	lv_draw_label_dsc_t *d = t->draw_dsc;
 	lv_area_t a, coords = t->area;
 	struct n72_native_pixmap pm;
+	uint64_t ts0 = 0, ts1 = 0, ts2 = 0;
 	int ax, aw, h;
 
 	if (!lv_area_intersect(&a, &t->area, u->clip_area))
@@ -843,7 +857,13 @@ static bool mbx_label(lv_draw_unit_t *u, lv_draw_task_t *t)
 
 	gt_n = 0;
 	gt_failed = false;
+	if (gt_stats < 0)
+		gt_stats = getenv("N72_GPU_TEXT_STATS") != NULL;
+	if (gt_stats)
+		ts0 = gt_now_us();
 	lv_draw_label_iterate_characters(u, d, &coords, gt_glyph_cb);
+	if (gt_stats)
+		ts1 = gt_now_us();
 	if (gt_failed) {			/* atlas full: start over next time */
 		gt_reset_atlas();
 		return false;
@@ -864,7 +884,12 @@ static bool mbx_label(lv_draw_unit_t *u, lv_draw_task_t *t)
 	glScissor(a.x1 - gt_ox, 0, lv_area_get_width(&a), h);
 	glColor4ub(d->color.red, d->color.green, d->color.blue, d->opa);
 	glDrawArrays(GL_TRIANGLES, 0, gt_n * 6);
+	if (gt_stats)
+		ts2 = gt_now_us();
 	glFinish();
+	if (gt_stats)
+		fprintf(stderr, "gtext: %d quads %dx%d: glyphs %u us, GL %u us, finish %u us\n", gt_n, aw, h,
+			(unsigned)(ts1 - ts0), (unsigned)(ts2 - ts1), (unsigned)(gt_now_us() - ts2));
 	mbx_gpu_text_labels++;
 	return true;
 }
@@ -917,8 +942,15 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 	else if (t->type == LV_DRAW_TASK_TYPE_IMAGE)
 		mbx_image(u, t);
 	else if (t->type == LV_DRAW_TASK_TYPE_LABEL) {
-		if (!mbx_label(u, t))
+		if (gt_cpu_only) {	/* N72_GPU_TEXT=cpu: time the software path on the same labels */
+			uint64_t t0 = gt_now_us();
+
 			lv_draw_sw_label(u, t->draw_dsc, &t->area);
+			fprintf(stderr, "ctext: %d rows: cpu %u us\n", lv_area_get_height(&t->area),
+				(unsigned)(gt_now_us() - t0));
+		} else if (!mbx_label(u, t)) {
+			lv_draw_sw_label(u, t->draw_dsc, &t->area);
+		}
 	}
 	else if (((lv_draw_fill_dsc_t *)t->draw_dsc)->opa >= LV_OPA_MAX)
 		mbx_fill(u, t);
