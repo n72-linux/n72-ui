@@ -744,6 +744,65 @@ static void flip_wait_cb(lv_display_t *disp)
 	flip_wait();
 }
 
+/*
+ * N72_FLIPCHECK=1 (debugging): before a flip, the new frame must equal the
+ * frame on screen everywhere except the areas redrawn this frame (cur_areas,
+ * here already moved to prev_areas). Report any other differing pixels.
+ */
+static int flipcheck = -1;
+static unsigned long flipcheck_frames, flipcheck_bad;
+
+static bool in_areas(int x, int y)
+{
+	int i;
+
+	if (prev_all)
+		return true;
+	for (i = 0; i < prev_n; i++)
+		if (x >= prev_areas[i].x1 && x <= prev_areas[i].x2 &&
+		    y >= prev_areas[i].y1 && y <= prev_areas[i].y2)
+			return true;
+	return false;
+}
+
+static void flip_check(const uint8_t *nw)
+{
+	const uint8_t *old;
+	lv_area_t all = { 0, 0, fb.width - 1, fb.height - 1 };
+	int x, y, n = 0, x0 = 9999, y0 = 9999, x1 = -1, y1 = -1;
+
+	flip_wait();
+	old = front;
+	if (!old || old == nw)
+		return;
+	/* read what the display reads: write back and drop both buffers */
+	sync_range(old, fb.stride * fb.height, MBX_SYNC_FLUSH);
+	sync_range(nw, fb.stride * fb.height, MBX_SYNC_FLUSH);
+	(void)all;
+	for (y = 0; y < (int)fb.height; y++) {
+		const uint32_t *a = (const uint32_t *)(old + y * fb.stride);
+		const uint32_t *b = (const uint32_t *)(nw + y * fb.stride);
+
+		if (!memcmp(a, b, fb.width * 4))
+			continue;
+		for (x = 0; x < (int)fb.width; x++)
+			if (((a[x] ^ b[x]) & 0xffffff) && !in_areas(x, y)) {
+				n++;
+				x0 = LV_MIN(x0, x); x1 = LV_MAX(x1, x);
+				y0 = LV_MIN(y0, y); y1 = LV_MAX(y1, y);
+			}
+	}
+	flipcheck_frames++;
+	if (flipcheck_frames % 50 == 0)
+		fprintf(stderr, "flipcheck: %lu frames, %lu with stale pixels\n",
+			flipcheck_frames, flipcheck_bad);
+	if (n) {
+		flipcheck_bad++;
+		fprintf(stderr, "flipcheck: frame %lu: %d stale px outside the redrawn areas, box %d,%d-%d,%d (%d areas this frame%s)\n",
+			flipcheck_frames, n, x0, y0, x1, y1, prev_n, prev_all ? ", all" : "");
+	}
+}
+
 static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
 	int i;
@@ -776,6 +835,10 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 		gpu_wait(last_seq);		/* the GPU's part of the frame is done */
 		last_seq = 0;
 		(void)f;
+		if (flipcheck < 0)
+			flipcheck = getenv("N72_FLIPCHECK") != NULL;
+		if (flipcheck)
+			flip_check(px_map);
 		pthread_mutex_lock(&flip_mx);
 		flip_buf = px_map;
 		flip_handle = px_map == scan[0] ? scan_handle[0] : scan_handle[1];
@@ -1062,4 +1125,14 @@ const uint8_t *mbx_gpu_front(uint32_t *stride)
 	if (flipping)
 		flip_wait();
 	return flipping ? front : disp_buf;
+}
+
+/* Debugging the flip buffers: both scan-out buffers (NULL if not flipping). */
+const uint8_t *mbx_gpu_scan(int i, int *is_front)
+{
+	if (!flipping || i < 0 || i > 1)
+		return NULL;
+	flip_wait();
+	*is_front = scan[i] == front;
+	return scan[i];
 }

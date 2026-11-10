@@ -28,6 +28,7 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void);
 
 /* The pixels on screen now, for screenshots (SIGUSR1 -> /tmp/n72-shot.raw). */
 const uint8_t *mbx_gpu_front(uint32_t *stride);
+const uint8_t *mbx_gpu_scan(int i, int *is_front);
 
 /* An opaque (XRGB8888) copy of an ARGB8888 picture over @bg, or NULL. */
 lv_draw_buf_t *mbx_gpu_flatten(const lv_draw_buf_t *src, lv_color_t bg);

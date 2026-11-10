@@ -680,8 +680,33 @@ static void on_usr1(int sig)
 	shot_wanted = 1;
 }
 
+static volatile sig_atomic_t scans_wanted;
+
+static void on_usr2(int sig)
+{
+	LV_UNUSED(sig);
+	scans_wanted = 1;
+}
+
 static void shot_poll(lv_timer_t *t)
 {
+	if (scans_wanted) {		/* SIGUSR2: both flip buffers */
+		int i, fr;
+
+		scans_wanted = 0;
+		for (i = 0; i < 2; i++) {
+			const uint8_t *p = mbx_gpu_scan(i, &fr);
+			char name[40];
+			FILE *f;
+
+			snprintf(name, sizeof(name), "/tmp/n72-scan%d%s.raw", i, fr ? "-front" : "");
+			f = p ? fopen(name, "w") : NULL;
+			if (f) {
+				fwrite(p, 4 * W, H, f);
+				fclose(f);
+			}
+		}
+	}
 	uint32_t stride;
 	const uint8_t *p;
 	FILE *f;
@@ -788,6 +813,7 @@ int main(int argc, char **argv)
 	build_home();
 	drags_init();
 	signal(SIGUSR1, on_usr1);
+	signal(SIGUSR2, on_usr2);
 	lv_timer_create(shot_poll, 100, NULL);
 	if (argc > 1 && !strcmp(argv[1], "--bench"))
 		return bench();
