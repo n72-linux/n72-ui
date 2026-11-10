@@ -278,6 +278,8 @@ void n72_frame_shown(void)
 	}
 }
 static int tty_fd = -1;
+static int notify_fd = -1;		/* flip thread: a frame went to the display */
+static bool render_pending;
 
 /* ---------------------------------------------------------------- utils */
 
@@ -694,7 +696,7 @@ static void shot_poll(lv_timer_t *t)
 		int i, fr;
 
 		scans_wanted = 0;
-		for (i = 0; i < 2; i++) {
+		for (i = 0; i < 3; i++) {
 			const uint8_t *p = mbx_gpu_scan(i, &fr);
 			char name[40];
 			FILE *f;
@@ -823,14 +825,16 @@ int main(int argc, char **argv)
 	 * has something, and hand touch input to LVGL straight away instead of
 	 * waiting for its read timer.
 	 */
+	notify_fd = mbx_gpu_notify_fd();
 	for (;;) {
-		struct pollfd pf[2] = {
+		struct pollfd pf[3] = {
 			{ .fd = touch_wait_fd, .events = POLLIN },
 			{ .fd = keys_fd, .events = POLLIN },
+			{ .fd = notify_fd, .events = POLLIN },
 		};
 		uint32_t idle = lv_timer_handler();
 
-		if (poll(pf, 2, LV_MIN(idle, LV_DEF_REFR_PERIOD)) > 0) {
+		if (poll(pf, 3, LV_MIN(idle, LV_DEF_REFR_PERIOD)) > 0) {
 			if (pf[0].revents & POLLIN) {
 				struct input_event ev[16];
 				ssize_t r;
@@ -845,8 +849,24 @@ int main(int argc, char **argv)
 				}
 				lat_read_us = mono_us();
 				lv_indev_read(touch_indev);
-				/* draw the result now, not at the next refresh tick */
-				render_now();
+				/*
+				 * Draw the result now, unless a finished frame is
+				 * still waiting for the display: then drawing again
+				 * would only be replaced. Draw when the flip thread
+				 * hands that frame over (notify_fd), with the
+				 * newest input by then.
+				 */
+				if (mbx_gpu_frame_waiting())
+					render_pending = true;
+				else
+					render_now();
+			}
+			if (pf[2].revents & POLLIN) {
+				mbx_gpu_notify_fd();	/* drain */
+				if (render_pending) {
+					render_pending = false;
+					render_now();
+				}
 			}
 			if (pf[1].revents & POLLIN)
 				keys_poll(NULL);

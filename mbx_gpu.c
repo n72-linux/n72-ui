@@ -1,3 +1,4 @@
+#define _GNU_SOURCE	/* pipe2 */
 // SPDX-License-Identifier: MIT
 /*
  * LVGL on the iPod touch 2G's PowerVR MBX Lite (2D engine, /dev/mbx).
@@ -26,6 +27,8 @@
 #include "lvgl/src/lvgl_private.h"
 #include "mbx_gpu.h"
 #include <pthread.h>
+#include <sched.h>
+#include "lvgl/src/display/lv_display_private.h"
 #include "mbx_cmd.h"
 
 void n72_frame_shown(void);
@@ -105,7 +108,7 @@ static void pool_free(void *p)
 static struct region {
 	uint8_t *cpu;
 	uint32_t size, gpu, handle;
-} regions[3];
+} regions[4];
 static int nregions;
 
 static const struct region *region_of(const void *p)
@@ -674,19 +677,13 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
  *    by the GPU after each frame.
  */
 static uint8_t *disp_buf;		/* copy mode: the draw buffer */
-static uint8_t *scan[2];		/* flip mode: the scan-out buffers */
-static uint32_t scan_handle[2];
-static uint8_t *front;			/* the buffer on screen (flip mode) */
+#define NSCAN 3
+static uint8_t *scan[NSCAN];		/* flip mode: the scan-out buffers */
+static uint32_t scan_handle[NSCAN];
 static uint32_t flush_seq;		/* the last display copy */
 static uint32_t flush_words[16 * 64];
 static int flush_n;
 static bool flipping;
-
-/* Areas flushed in the previous frame: LVGL copies them into the new buffer. */
-#define PREV_MAX 32
-static lv_area_t prev_areas[PREV_MAX], cur_areas[PREV_MAX];
-static int prev_n, cur_n;
-static bool prev_all, cur_all;
 
 static void clean_rows(uint8_t *buf, const lv_area_t *a)
 {
@@ -694,159 +691,231 @@ static void clean_rows(uint8_t *buf, const lv_area_t *a)
 }
 
 /*
- * The flip runs in a helper thread: it waits for the vertical blank and
- * switches the display, while the main loop goes on reading input and
- * preparing the next frame. LVGL calls flip_wait_cb() before it draws into
- * the buffer that is still on screen, so only that waits.
+ * Triple buffering. Three scan-out buffers: one on screen (front), one
+ * whose address has been written and is latched by the display controller
+ * at the next frame start (latching), and the one LVGL draws into
+ * (drawing). A finished frame waits as "ready" until the flip thread hands
+ * it to the controller; a newer finished frame replaces it. So drawing
+ * never waits for the display, and each vblank shows the newest frame.
+ *
+ * LVGL is set up single-buffered: at the start of each rendered frame
+ * (LV_EVENT_RENDER_START) we point its buffer at a free scan-out buffer and
+ * bring that up to date by GPU-copying, from the newest frame, whatever
+ * changed since the buffer was last drawn (minus what this frame redraws
+ * anyway). The flip thread runs at real-time priority: it writes a ready
+ * frame's address at once and then waits for the blank in which the
+ * controller takes it (kernel MBX_IOC_FLIP); only then is the old front
+ * buffer free.
  */
 static pthread_t flip_thread;
 static pthread_mutex_t flip_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t flip_cv = PTHREAD_COND_INITIALIZER;
-static uint32_t flip_handle;		/* pending flip, 0 = none */
-static uint8_t *flip_buf;
+static int st_front = -1, st_latching = -1, st_ready = -1, st_drawing = -1;
+static int st_latest = -1;		/* buffer with the newest finished frame */
+static long buf_frame[NSCAN] = { -1, -1, -1 };	/* frame number each holds */
+static long frame_no;			/* frames finished so far */
+
+/* areas drawn in each of the last HIST frames */
+#define HIST 4
+#define HIST_AREAS 32
+static struct {
+	lv_area_t a[HIST_AREAS];
+	int n;
+	bool all;
+	long frame;
+} hist[HIST];
+static lv_area_t cur_areas[HIST_AREAS];
+static int cur_n;
+static bool cur_all;
+
+static int notify_pipe[2] = { -1, -1 };
+
+/* a finished frame is waiting for the display (drawing another is wasted) */
+bool mbx_gpu_frame_waiting(void)
+{
+	bool w;
+
+	if (!flipping)
+		return false;
+	pthread_mutex_lock(&flip_mx);
+	w = st_ready >= 0;
+	pthread_mutex_unlock(&flip_mx);
+	return w;
+}
+
+/* readable when the flip thread hands a frame to the display */
+int mbx_gpu_notify_fd(void)
+{
+	char buf[16];
+
+	if (notify_pipe[0] >= 0)
+		while (read(notify_pipe[0], buf, sizeof(buf)) > 0)
+			;
+	return notify_pipe[0];
+}
 
 static void *flip_main(void *arg)
 {
+	struct sched_param sp = { .sched_priority = 20 };
+
 	(void)arg;
+	/* the switch must not be pushed past the frame by a busy main loop */
+	pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
 	pthread_mutex_lock(&flip_mx);
 	for (;;) {
-		struct mbx_flip f = { .flags = MBX_FLIP_VSYNC };
-		uint8_t *buf;
+		struct mbx_flip f = { 0 }, w = { .handle = MBX_FLIP_NONE, .flags = MBX_FLIP_VSYNC };
 		double t0;
+		int r;
 
-		while (!flip_handle)
+		while (st_ready < 0)
 			pthread_cond_wait(&flip_cv, &flip_mx);
-		f.handle = flip_handle;
-		buf = flip_buf;
+		r = st_ready;
+		st_ready = -1;
+		st_latching = r;
 		pthread_mutex_unlock(&flip_mx);
+		if (notify_pipe[1] >= 0) {	/* the main loop may draw again */
+			char c = 1;
+
+			if (write(notify_pipe[1], &c, 1) < 0)
+				;
+		}
+		f.handle = scan_handle[r];
+		ioctl(mbx, MBX_IOC_FLIP, &f);	/* address now ... */
 		t0 = gpu_now_us();
-		ioctl(mbx, MBX_IOC_FLIP, &f);	/* waits for the vertical blank */
+		ioctl(mbx, MBX_IOC_FLIP, &w);	/* ... taken at this blank */
 		pthread_mutex_lock(&flip_mx);
 		mbx_gpu_stats.flip_us += gpu_now_us() - t0;
-		front = buf;
-		flip_handle = 0;
+		st_front = r;
+		st_latching = -1;
 		pthread_cond_broadcast(&flip_cv);
 	}
 	return NULL;
 }
 
+/* all flips done (for tests and screenshots) */
 static void flip_wait(void)
 {
 	pthread_mutex_lock(&flip_mx);
-	while (flip_handle)
+	while (st_ready >= 0 || st_latching >= 0)
 		pthread_cond_wait(&flip_cv, &flip_mx);
 	pthread_mutex_unlock(&flip_mx);
 }
 
-static void flip_wait_cb(lv_display_t *disp)
+static bool covered(const lv_area_t *a, lv_display_t *d)
 {
-	LV_UNUSED(disp);
-	flip_wait();
-}
+	uint32_t i;
 
-/*
- * N72_FLIPCHECK=1 (debugging): before a flip, the new frame must equal the
- * frame on screen everywhere except the areas redrawn this frame (cur_areas,
- * here already moved to prev_areas). Report any other differing pixels.
- */
-static int flipcheck = -1;
-static unsigned long flipcheck_frames, flipcheck_bad;
-
-static bool in_areas(int x, int y)
-{
-	int i;
-
-	if (prev_all)
-		return true;
-	for (i = 0; i < prev_n; i++)
-		if (x >= prev_areas[i].x1 && x <= prev_areas[i].x2 &&
-		    y >= prev_areas[i].y1 && y <= prev_areas[i].y2)
+	for (i = 0; i < d->inv_p; i++)
+		if (!d->inv_area_joined[i] && lv_area_is_in(a, &d->inv_areas[i], 0))
 			return true;
 	return false;
 }
 
-static void flip_check(const uint8_t *nw)
+/* GPU-copy @a from buffer @src into @dst (batched; flushed by sync_flush()) */
+static void sync_rect(int dst, int src, const lv_area_t *a)
 {
-	const uint8_t *old;
+	lv_area_t c;
 	lv_area_t all = { 0, 0, fb.width - 1, fb.height - 1 };
-	int x, y, n = 0, x0 = 9999, y0 = 9999, x1 = -1, y1 = -1;
 
-	flip_wait();
-	old = front;
-	if (!old || old == nw)
+	if (!lv_area_intersect(&c, a, &all))
 		return;
-	/* read what the display reads: write back and drop both buffers */
-	sync_range(old, fb.stride * fb.height, MBX_SYNC_FLUSH);
-	sync_range(nw, fb.stride * fb.height, MBX_SYNC_FLUSH);
-	(void)all;
-	for (y = 0; y < (int)fb.height; y++) {
-		const uint32_t *a = (const uint32_t *)(old + y * fb.stride);
-		const uint32_t *b = (const uint32_t *)(nw + y * fb.stride);
+	sync_range(scan[dst] + c.y1 * fb.stride, lv_area_get_height(&c) * fb.stride,
+		   MBX_SYNC_FLUSH);
+	if (flush_n > (int)(sizeof(flush_words) / 4) - 16) {
+		submit(flush_words, flush_n);
+		gpu_wait(last_seq);
+		last_seq = 0;
+		flush_n = 0;
+	}
+	flush_n += put_copy(flush_words + flush_n, gpu_addr(scan[dst]), fb.stride,
+			    gpu_addr(scan[src]), fb.stride, c.x1, c.y1, c.x1, c.y1,
+			    lv_area_get_width(&c), lv_area_get_height(&c));
+}
 
-		if (!memcmp(a, b, fb.width * 4))
-			continue;
-		for (x = 0; x < (int)fb.width; x++)
-			if (((a[x] ^ b[x]) & 0xffffff) && !in_areas(x, y)) {
-				n++;
-				x0 = LV_MIN(x0, x); x1 = LV_MAX(x1, x);
-				y0 = LV_MIN(y0, y); y1 = LV_MAX(y1, y);
+static void render_start_cb(lv_event_t *e)
+{
+	lv_display_t *d = lv_event_get_target(e);
+	lv_area_t all = { 0, 0, fb.width - 1, fb.height - 1 };
+	int i, k, dr = -1, src;
+	long have, f;
+
+	pthread_mutex_lock(&flip_mx);
+	for (i = 0; i < NSCAN; i++)
+		if (i != st_front && i != st_latching && i != st_ready)
+			break;
+	if (i < NSCAN) {
+		dr = i;
+	} else {
+		/*
+		 * Drawing faster than 60 Hz: the finished frame still waiting
+		 * has not been handed to the display; draw the newer one over
+		 * it (it holds the newest content, so nothing to bring over).
+		 */
+		dr = st_ready;
+		st_ready = -1;
+	}
+	st_drawing = dr;
+	src = st_latest;
+	pthread_mutex_unlock(&flip_mx);
+
+	/* bring the buffer up to date: frames buf_frame[dr]+1 .. frame_no */
+	have = buf_frame[dr];
+	if (src >= 0 && src != dr && have < frame_no) {
+		if (have < 0 || frame_no - have > HIST - 1) {
+			if (!covered(&all, d))
+				sync_rect(dr, src, &all);
+		} else {
+			for (f = have + 1; f <= frame_no; f++) {
+				k = f % HIST;
+				if (hist[k].frame != f || hist[k].all) {
+					if (!covered(&all, d))
+						sync_rect(dr, src, &all);
+					break;
+				}
+				for (i = 0; i < hist[k].n; i++)
+					if (!covered(&hist[k].a[i], d))
+						sync_rect(dr, src, &hist[k].a[i]);
 			}
+		}
+		if (flush_n) {
+			submit(flush_words, flush_n);
+			gpu_wait(last_seq);
+			last_seq = 0;
+			flush_n = 0;
+		}
 	}
-	flipcheck_frames++;
-	if (flipcheck_frames % 50 == 0)
-		fprintf(stderr, "flipcheck: %lu frames, %lu with stale pixels\n",
-			flipcheck_frames, flipcheck_bad);
-	if (n) {
-		flipcheck_bad++;
-		fprintf(stderr, "flipcheck: frame %lu: %d stale px outside the redrawn areas, box %d,%d-%d,%d (%d areas this frame%s)\n",
-			flipcheck_frames, n, x0, y0, x1, y1, prev_n, prev_all ? ", all" : "");
-	}
+	d->buf_1->data = scan[dr];
+	cur_n = 0;
+	cur_all = false;
 }
 
 static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-	int i;
-
 	/* what the CPU drew in this area goes out to memory for the display */
 	clean_rows(px_map, area);
-	if (cur_n < PREV_MAX)
+	if (cur_n < HIST_AREAS)
 		cur_areas[cur_n++] = *area;
 	else
 		cur_all = true;
 	if (lv_display_flush_is_last(disp)) {
-		struct mbx_flip f = { .flags = MBX_FLIP_VSYNC };
-		lv_area_t all = { 0, 0, fb.width - 1, fb.height - 1 };
-
-		/*
-		 * LVGL copied last frame's areas into this buffer with the CPU
-		 * (the parts not redrawn): clean those rows too.
-		 */
-		if (prev_all)
-			clean_rows(px_map, &all);
-		else
-			for (i = 0; i < prev_n; i++)
-				clean_rows(px_map, &prev_areas[i]);
-		memcpy(prev_areas, cur_areas, sizeof(cur_areas));
-		prev_n = cur_n;
-		prev_all = cur_all;
-		cur_n = 0;
-		cur_all = false;
+		long n = frame_no + 1;
+		int k = n % HIST;
 
 		gpu_wait(last_seq);		/* the GPU's part of the frame is done */
 		last_seq = 0;
-		(void)f;
-		if (flipcheck < 0)
-			flipcheck = getenv("N72_FLIPCHECK") != NULL;
-		if (flipcheck)
-			flip_check(px_map);
+		memcpy(hist[k].a, cur_areas, sizeof(cur_areas));
+		hist[k].n = cur_n;
+		hist[k].all = cur_all;
+		hist[k].frame = n;
 		pthread_mutex_lock(&flip_mx);
-		flip_buf = px_map;
-		flip_handle = px_map == scan[0] ? scan_handle[0] : scan_handle[1];
+		frame_no = n;
+		buf_frame[st_drawing] = n;
+		st_latest = st_drawing;
+		st_ready = st_drawing;		/* (replaces an older ready frame) */
+		st_drawing = -1;
 		pthread_cond_signal(&flip_cv);
 		pthread_mutex_unlock(&flip_mx);
 		n72_frame_shown();		/* (queued: on screen at the next vblank) */
-		mbx_gpu_stats.flushes++;
-		return;				/* LVGL waits in flip_wait_cb() */
 	}
 	mbx_gpu_stats.flushes++;
 	lv_display_flush_ready(disp);
@@ -925,7 +994,7 @@ static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
 	struct mbx_alloc a = { .size = size, .flags = flags };
 	uint8_t *p;
 
-	if (nregions == 3 || ioctl(mbx, MBX_IOC_ALLOC, &a))
+	if (nregions == 4 || ioctl(mbx, MBX_IOC_ALLOC, &a))
 		return NULL;
 	p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, mbx, a.mmap_offset);
 	if (p == MAP_FAILED) {
@@ -948,7 +1017,7 @@ static bool flip_setup(uint32_t size)
 
 	if (getenv("N72_NOFLIP") || ioctl(mbx, MBX_IOC_FLIP, &f))
 		return false;
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < NSCAN; i++) {
 		scan[i] = region_add(size, MBX_ALLOC_CACHED | MBX_ALLOC_CONTIG, &scan_handle[i]);
 		if (!scan[i])
 			return false;	/* (the regions stay mapped; unused) */
@@ -965,7 +1034,8 @@ static bool flip_setup(uint32_t size)
 	f.handle = scan_handle[0];
 	f.flags = MBX_FLIP_VSYNC;
 	ioctl(mbx, MBX_IOC_FLIP, &f);
-	front = scan[0];
+	st_front = st_latest = 0;		/* frame 0: what was on the screen */
+	buf_frame[0] = 0;
 	return true;
 }
 
@@ -1021,11 +1091,12 @@ lv_display_t *mbx_gpu_display_create(void)
 	disp = lv_display_create(fb.width, fb.height);
 	lv_display_set_color_format(disp, LV_COLOR_FORMAT_XRGB8888);
 	flipping = flip_setup(size);
-	if (flipping && pthread_create(&flip_thread, NULL, flip_main, NULL))
+	if (flipping && (pipe2(notify_pipe, O_NONBLOCK | O_CLOEXEC) ||
+			 pthread_create(&flip_thread, NULL, flip_main, NULL)))
 		flipping = false;
 	if (flipping) {
-		lv_display_set_buffers(disp, scan[1], scan[0], size, LV_DISPLAY_RENDER_MODE_DIRECT);
-		lv_display_set_flush_wait_cb(disp, flip_wait_cb);
+		lv_display_set_buffers(disp, scan[1], NULL, size, LV_DISPLAY_RENDER_MODE_DIRECT);
+		lv_display_add_event_cb(disp, render_start_cb, LV_EVENT_RENDER_START, NULL);
 	} else {
 		disp_buf = pool_alloc(size);
 		if (!disp_buf)
@@ -1072,7 +1143,7 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void)
 	flush_seq = 0;
 	buf_invalidate(b, &all);
 	submit(w, put_copy(w, gpu_addr(b->data), b->header.stride,
-			   gpu_addr(flipping ? front : disp_buf),
+			   gpu_addr(flipping ? scan[st_latest] : disp_buf),
 			   fb.stride, 0, 0, 0, 0, fb.width, fb.height));
 	gpu_wait(last_seq);
 	last_seq = 0;
@@ -1124,15 +1195,15 @@ const uint8_t *mbx_gpu_front(uint32_t *stride)
 	*stride = fb.stride;
 	if (flipping)
 		flip_wait();
-	return flipping ? front : disp_buf;
+	return flipping ? scan[st_latest] : disp_buf;
 }
 
 /* Debugging the flip buffers: both scan-out buffers (NULL if not flipping). */
 const uint8_t *mbx_gpu_scan(int i, int *is_front)
 {
-	if (!flipping || i < 0 || i > 1)
+	if (!flipping || i < 0 || i >= NSCAN)
 		return NULL;
 	flip_wait();
-	*is_front = scan[i] == front;
+	*is_front = i == st_front;
 	return scan[i];
 }

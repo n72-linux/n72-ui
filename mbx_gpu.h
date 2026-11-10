@@ -30,6 +30,11 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void);
 const uint8_t *mbx_gpu_front(uint32_t *stride);
 const uint8_t *mbx_gpu_scan(int i, int *is_front);
 
+/* Triple buffering: a finished frame is still waiting for the display. */
+bool mbx_gpu_frame_waiting(void);
+/* Readable (then drained by the next call) when a frame goes to the display; -1 if none. */
+int mbx_gpu_notify_fd(void);
+
 /* An opaque (XRGB8888) copy of an ARGB8888 picture over @bg, or NULL. */
 lv_draw_buf_t *mbx_gpu_flatten(const lv_draw_buf_t *src, lv_color_t bg);
 
