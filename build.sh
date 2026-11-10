@@ -1,6 +1,7 @@
 #!/bin/sh
 # Cross-build n72-ui statically for the iPod touch 2G (ARM1176, armel).
 # Run in the n72-build container: sh n72-ui/build.sh  (from the workspace root)
+# Kernel uapi headers: linux-build-n72/usr/include (`make O=../linux-build-n72 ARCH=arm headers`).
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 UI="$ROOT/n72-ui"
@@ -10,7 +11,7 @@ CC=arm-linux-gnueabi-gcc
 PG=
 # PROFILE=1: gprof build (n72-ui-build-prof/, not stripped; gmon.out on a clean exit, e.g. --bench)
 [ "$PROFILE" = 1 ] && { OUT="$ROOT/n72-ui-build-prof"; PG=-pg; }
-CFLAGS="$PG -O2 -idirafter $ROOT/linux-s5l87xx/include/uapi -mcpu=arm1176jzf-s -mfpu=vfp -mfloat-abi=softfp -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src -I$ROOT/n72-gles/include"
+CFLAGS="$PG -O2 -idirafter $ROOT/linux-build-n72/usr/include -idirafter $ROOT/linux-s5l87xx/include/uapi -mcpu=arm1176jzf-s -mfpu=vfp -mfloat-abi=softfp -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src -I$ROOT/n72-gles/include"
 mkdir -p "$OUT/obj"
 SRCS=$(find "$LVGL/src" -name '*.c')
 obj() { echo "$OUT/obj/$(echo "${1#$LVGL/}" | tr '/' '_' | sed 's/\.c$/.o/')"; }

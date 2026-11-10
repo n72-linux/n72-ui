@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include <linux/apple-mbx.h>
+#include "../n72-gles/src/mbxmem.h"	/* the MBX device: render node or /dev/mbx */
 
 #include "lvgl/lvgl.h"
 #include "lvgl/src/lvgl_private.h"
@@ -153,12 +154,13 @@ static void sync_range(const void *p, uint32_t size, uint32_t op)
 {
 	double t0 = gpu_now_us();
 	const struct region *r = region_of(p);
-	struct mbx_sync s = {
-		.handle = r->handle, .op = op,
-		.offset = (const uint8_t *)p - r->cpu, .size = size,
-	};
+	struct mbx_buf b = { .cpu = r->cpu, .handle = r->handle, .size = r->size, .cached = 1 };
+	uint32_t off = (const uint8_t *)p - r->cpu;
 
-	ioctl(mbx, MBX_IOC_SYNC, &s);
+	if (op == MBX_SYNC_FLUSH)
+		mbx_flush(mbx, &b, off, size);
+	else
+		mbx_clean(mbx, &b, off, size);
 	mbx_gpu_stats.sync_us += gpu_now_us() - t0;
 	mbx_gpu_stats.sync_bytes += size;
 }
@@ -184,27 +186,25 @@ static void gpu_wait(uint32_t seq)
 	struct mbx_wait w = { .wait_seq = seq };
 
 	if (gpu_async && seq)
-		ioctl(mbx, MBX_IOC_WAIT, &w);
+		mbx_wait_jobs(mbx, &w);
 }
 
 static int gpu_done(uint32_t seq)
 {
 	struct mbx_wait w = { 0 };
 
-	if (ioctl(mbx, MBX_IOC_WAIT, &w))
+	if (mbx_wait_jobs(mbx, &w))
 		return 1;
 	return (int32_t)(w.seq_done - seq) >= 0;
 }
 
 static int submit(const uint32_t *w, int n)
 {
-	struct mbx_submit s = { .words = (uintptr_t)w, .count = n };
-
 	double t0 = gpu_now_us();
 	int ret;
 
 	mbx_gpu_stats.submits++;
-	ret = gpu_ret(ioctl(mbx, MBX_IOC_SUBMIT, &s));
+	ret = gpu_ret(mbx_submit_2d(mbx, w, n, 0));
 	mbx_gpu_stats.submit_us += gpu_now_us() - t0;
 	return ret;
 }
@@ -264,7 +264,7 @@ static int blit3d(int type, uint32_t dst, uint32_t src, const uint32_t *w, int n
 
 	memcpy(b.words, w, n * 4);
 	mbx_gpu_stats.submits++;
-	ret = gpu_ret(ioctl(mbx, MBX_IOC_BLIT3D, &b));
+	ret = gpu_ret(mbx_blit_3d(mbx, &b));
 	mbx_gpu_stats.blit3d_us += gpu_now_us() - t0;
 	return ret;
 }
@@ -909,7 +909,7 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 			if (++spins % 200000 == 0) {
 				struct mbx_wait w = { 0 };
 
-				ioctl(mbx, MBX_IOC_WAIT, &w);
+				mbx_wait_jobs(mbx, &w);
 				fprintf(stderr, "mbx: waiting on seq %u: submitted %u done %u (task type %d state %d)\n",
 					inflight_seq, w.seq_submitted, w.seq_done,
 					inflight->type, inflight->state);
@@ -1095,8 +1095,8 @@ static void *flip_main(void *arg)
 			kms_flip(r);		/* waits for the flip's event */
 		} else {
 			f.handle = scan_handle[r];
-			ioctl(mbx, MBX_IOC_FLIP, &f);	/* address now ... */
-			ioctl(mbx, MBX_IOC_FLIP, &w);	/* ... taken at this blank */
+			mbx_flip(mbx, &f);	/* address now ... */
+			mbx_flip(mbx, &w);	/* ... taken at this blank */
 		}
 		pthread_mutex_lock(&flip_mx);
 		mbx_gpu_stats.flip_us += gpu_now_us() - t0;
@@ -1306,22 +1306,14 @@ static void refr_start_cb(lv_event_t *e)
 /* Map one more buffer object as a region. */
 static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
 {
-	struct mbx_alloc a = { .size = size, .flags = flags };
-	uint8_t *p;
+	struct mbx_buf b;
 
-	if (nregions == 4 || ioctl(mbx, MBX_IOC_ALLOC, &a))
+	if (nregions == 4 || mbx_alloc(mbx, size, flags, &b))
 		return NULL;
-	p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, mbx, a.mmap_offset);
-	if (p == MAP_FAILED) {
-		struct mbx_free fr = { .handle = a.handle };
-
-		ioctl(mbx, MBX_IOC_FREE, &fr);
-		return NULL;
-	}
-	regions[nregions++] = (struct region){ p, size, a.gpu_addr, a.handle };
+	regions[nregions++] = (struct region){ b.cpu, size, b.gpu, b.handle };
 	if (handle)
-		*handle = a.handle;
-	return p;
+		*handle = b.handle;
+	return b.cpu;
 }
 
 /* Page flipping: two contiguous scan-out buffers, if the kernel can flip. */
@@ -1379,18 +1371,18 @@ static bool kms_setup(void)
 	if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) || !conn.count_modes)
 		goto fail;
 	for (i = 0; i < NSCAN; i++) {
-		struct mbx_export ex = { .handle = scan_handle[i], .flags = MBX_EXPORT_CLOEXEC };
 		struct drm_prime_handle ph = { 0 };
 		struct drm_mode_fb_cmd2 f = { 0 };
+		int dfd = mbx_export(mbx, scan_handle[i], 1);	/* PRIME from the render node */
 
-		if (ioctl(mbx, MBX_IOC_EXPORT, &ex))
+		if (dfd < 0)
 			goto fail;
-		ph.fd = ex.fd;
+		ph.fd = dfd;
 		if (ioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph)) {
-			close(ex.fd);
+			close(dfd);
 			goto fail;
 		}
-		close(ex.fd);
+		close(dfd);
 		f.width = fb.width;
 		f.height = fb.height;
 		f.pixel_format = 0x34325258;	/* XR24 */
@@ -1420,9 +1412,11 @@ fail:
 static bool flip_setup(uint32_t size)
 {
 	struct mbx_flip f = { .handle = MBX_FLIP_NONE };
+	bool kms;
 	int i;
 
-	if (getenv("N72_NOFLIP") || ioctl(mbx, MBX_IOC_FLIP, &f))
+	/* the render node flips through KMS only; /dev/mbx can also flip itself */
+	if (getenv("N72_NOFLIP") || (!mbx_is_drm(mbx) && mbx_flip(mbx, &f)))
 		return false;
 	for (i = 0; i < NSCAN; i++) {
 		scan[i] = region_add(size, MBX_ALLOC_CACHED | MBX_ALLOC_CONTIG, &scan_handle[i]);
@@ -1438,10 +1432,15 @@ static bool flip_setup(uint32_t size)
 		gpu_wait(last_seq);
 		last_seq = 0;
 	}
-	if (!kms_setup()) {
+	kms = kms_setup();
+	if (!kms && mbx_is_drm(mbx)) {
+		fprintf(stderr, "n72-ui: no KMS for the render node: copying to the framebuffer\n");
+		return false;
+	}
+	if (!kms) {
 		f.handle = scan_handle[0];
 		f.flags = MBX_FLIP_VSYNC;
-		ioctl(mbx, MBX_IOC_FLIP, &f);
+		mbx_flip(mbx, &f);
 	}
 	st_front = st_latest = 0;		/* frame 0: what was on the screen */
 	buf_frame[0] = 0;
@@ -1450,18 +1449,17 @@ static bool flip_setup(uint32_t size)
 
 lv_display_t *mbx_gpu_display_create(void)
 {
-	struct mbx_alloc a = { .size = POOL_SIZE, .flags = MBX_ALLOC_CACHED };
+	struct mbx_buf a;
 	lv_draw_buf_handlers_t *h;
 	lv_draw_unit_t *u;
 	lv_display_t *disp;
 	uint32_t size;
 
-	mbx = open("/dev/mbx", O_RDWR | O_CLOEXEC);
+	mbx = mbx_open();		/* the render node, else /dev/mbx */
 	if (mbx < 0)
 		return NULL;
 	{
 		const char *e = getenv("N72_GPU_ASYNC");
-		uint32_t on = 1;
 
 		/*
 		 * Opt-in (N72_GPU_ASYNC=1): correct (the home screen renders
@@ -1469,18 +1467,15 @@ lv_display_t *mbx_gpu_display_create(void)
 		 * overlap and the CPU has little to draw meanwhile. Older
 		 * kernels have no MBX_IOC_SET_ASYNC: stay synchronous.
 		 */
-		if (e && !strcmp(e, "1") && !ioctl(mbx, MBX_IOC_SET_ASYNC, &on))
+		if (e && !strcmp(e, "1") && !mbx_set_async(mbx, 1))
 			gpu_async = 1;
 	}
-	if (ioctl(mbx, MBX_IOC_FB_INFO, &fb) || ioctl(mbx, MBX_IOC_ALLOC, &a))
+	if (mbx_fb_info(mbx, &fb) || mbx_alloc(mbx, POOL_SIZE, MBX_ALLOC_CACHED, &a))
 		goto fail;
-	pool = mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, mbx,
-		    a.mmap_offset);
-	if (pool == MAP_FAILED)
-		goto fail;
+	pool = a.cpu;
 	pool_handle = a.handle;
-	pool_gpu = a.gpu_addr;
-	regions[nregions++] = (struct region){ pool, POOL_SIZE, a.gpu_addr, a.handle };
+	pool_gpu = a.gpu;
+	regions[nregions++] = (struct region){ pool, POOL_SIZE, a.gpu, a.handle };
 	blocks[0].off = 0;
 	blocks[0].size = POOL_SIZE;
 	nblocks = 1;
@@ -1514,14 +1509,15 @@ lv_display_t *mbx_gpu_display_create(void)
 	}
 	lv_display_set_flush_cb(disp, flush_cb);
 	lv_display_add_event_cb(disp, refr_start_cb, LV_EVENT_REFR_START, NULL);
-	fprintf(stderr, "n72-ui: %s; MBX GPU:", kms_fd >= 0 ? "KMS (n72-clcd)" : "no KMS");
+	fprintf(stderr, "n72-ui: %s; MBX GPU (%s):", kms_fd >= 0 ? "KMS (n72-clcd)" : "no KMS",
+		mbx_is_drm(mbx) ? "DRM render node" : "/dev/mbx");
 	fprintf(stderr, "  framebuffer at GPU %08x, %u KiB draw pool at %08x, %s jobs, %s\n",
 	       fb.gpu_addr, POOL_SIZE / 1024, pool_gpu, gpu_async ? "async" : "sync",
 	       flipping ? "page flipping at vblank" : "copy to the framebuffer");
 	return disp;
 
 fail:
-	perror("n72-ui: /dev/mbx");
+	perror("n72-ui: MBX GPU");
 	close(mbx);
 	mbx = -1;
 	return NULL;
