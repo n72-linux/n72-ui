@@ -27,6 +27,10 @@
 #include "lvgl/src/lvgl_private.h"
 #include "mbx_gpu.h"
 #include <pthread.h>
+#include <poll.h>
+#include <errno.h>
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
 #include <sched.h>
 #include "lvgl/src/display/lv_display_private.h"
 #include "mbx_cmd.h"
@@ -729,6 +733,8 @@ static int cur_n;
 static bool cur_all;
 
 static int notify_pipe[2] = { -1, -1 };
+static int kms_fd = -1;			/* /dev/dri/card0 when flipping through KMS */
+static void kms_flip(int r);
 
 /* a finished frame is waiting for the display (drawing another is wasted) */
 bool mbx_gpu_frame_waiting(void)
@@ -779,10 +785,14 @@ static void *flip_main(void *arg)
 			if (write(notify_pipe[1], &c, 1) < 0)
 				;
 		}
-		f.handle = scan_handle[r];
-		ioctl(mbx, MBX_IOC_FLIP, &f);	/* address now ... */
 		t0 = gpu_now_us();
-		ioctl(mbx, MBX_IOC_FLIP, &w);	/* ... taken at this blank */
+		if (kms_fd >= 0) {
+			kms_flip(r);		/* waits for the flip's event */
+		} else {
+			f.handle = scan_handle[r];
+			ioctl(mbx, MBX_IOC_FLIP, &f);	/* address now ... */
+			ioctl(mbx, MBX_IOC_FLIP, &w);	/* ... taken at this blank */
+		}
 		pthread_mutex_lock(&flip_mx);
 		mbx_gpu_stats.flip_us += gpu_now_us() - t0;
 		st_front = r;
@@ -1010,6 +1020,98 @@ static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
 }
 
 /* Page flipping: two contiguous scan-out buffers, if the kernel can flip. */
+/*
+ * KMS (/dev/dri/card0, n72-clcd): the scan-out buffers are exported from
+ * the MBX driver as dma-bufs, imported as DRM framebuffers, and flipped
+ * with DRM_IOCTL_MODE_PAGE_FLIP; the flip's event comes at the vblank that
+ * shows it. When n72-ui exits, DRM gives the screen back to the console.
+ * Without KMS (or N72_MBXFLIP=1) the MBX driver's own flip is used.
+ */
+static uint32_t kms_fb[NSCAN], kms_crtc;
+
+static void kms_flip(int r)
+{
+	struct drm_mode_crtc_page_flip pf = {
+		.crtc_id = kms_crtc, .fb_id = kms_fb[r], .flags = DRM_MODE_PAGE_FLIP_EVENT,
+	};
+	struct pollfd p = { .fd = kms_fd, .events = POLLIN };
+	char buf[256];
+	int tries;
+
+	for (tries = 0; tries < 50; tries++) {
+		if (!ioctl(kms_fd, DRM_IOCTL_MODE_PAGE_FLIP, &pf))
+			break;
+		if (errno != EBUSY)
+			return;
+		usleep(2000);		/* a flip still pending (not expected) */
+	}
+	if (poll(&p, 1, 200) > 0 && read(kms_fd, buf, sizeof(buf)) < 0)
+		;
+}
+
+static bool kms_setup(void)
+{
+	struct drm_mode_card_res res = { 0 };
+	uint32_t crtcs[2], conns[2], encs[2];
+	struct drm_mode_get_connector conn = { 0 };
+	struct drm_mode_modeinfo modes[4];
+	struct drm_mode_crtc set = { 0 };
+	int i, fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+
+	if (fd < 0 || getenv("N72_MBXFLIP"))
+		goto fail;
+	ioctl(fd, DRM_IOCTL_SET_MASTER, 0);
+	res.crtc_id_ptr = (uintptr_t)crtcs;
+	res.connector_id_ptr = (uintptr_t)conns;
+	res.encoder_id_ptr = (uintptr_t)encs;
+	res.count_crtcs = res.count_connectors = res.count_encoders = 2;
+	if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) || !res.count_crtcs ||
+	    !res.count_connectors)
+		goto fail;
+	conn.connector_id = conns[0];
+	conn.modes_ptr = (uintptr_t)modes;
+	conn.count_modes = 4;
+	if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) || !conn.count_modes)
+		goto fail;
+	for (i = 0; i < NSCAN; i++) {
+		struct mbx_export ex = { .handle = scan_handle[i], .flags = MBX_EXPORT_CLOEXEC };
+		struct drm_prime_handle ph = { 0 };
+		struct drm_mode_fb_cmd2 f = { 0 };
+
+		if (ioctl(mbx, MBX_IOC_EXPORT, &ex))
+			goto fail;
+		ph.fd = ex.fd;
+		if (ioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph)) {
+			close(ex.fd);
+			goto fail;
+		}
+		close(ex.fd);
+		f.width = fb.width;
+		f.height = fb.height;
+		f.pixel_format = 0x34325258;	/* XR24 */
+		f.handles[0] = ph.handle;
+		f.pitches[0] = fb.stride;
+		if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &f))
+			goto fail;
+		kms_fb[i] = f.fb_id;
+	}
+	kms_crtc = crtcs[0];
+	set.crtc_id = kms_crtc;
+	set.fb_id = kms_fb[0];
+	set.mode = modes[0];
+	set.mode_valid = 1;
+	set.set_connectors_ptr = (uintptr_t)conns;
+	set.count_connectors = 1;
+	if (ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &set))
+		goto fail;
+	kms_fd = fd;
+	return true;
+fail:
+	if (fd >= 0)
+		close(fd);
+	return false;
+}
+
 static bool flip_setup(uint32_t size)
 {
 	struct mbx_flip f = { .handle = MBX_FLIP_NONE };
@@ -1031,9 +1133,11 @@ static bool flip_setup(uint32_t size)
 		gpu_wait(last_seq);
 		last_seq = 0;
 	}
-	f.handle = scan_handle[0];
-	f.flags = MBX_FLIP_VSYNC;
-	ioctl(mbx, MBX_IOC_FLIP, &f);
+	if (!kms_setup()) {
+		f.handle = scan_handle[0];
+		f.flags = MBX_FLIP_VSYNC;
+		ioctl(mbx, MBX_IOC_FLIP, &f);
+	}
 	st_front = st_latest = 0;		/* frame 0: what was on the screen */
 	buf_frame[0] = 0;
 	return true;
@@ -1105,7 +1209,8 @@ lv_display_t *mbx_gpu_display_create(void)
 	}
 	lv_display_set_flush_cb(disp, flush_cb);
 	lv_display_add_event_cb(disp, refr_start_cb, LV_EVENT_REFR_START, NULL);
-	fprintf(stderr, "n72-ui: MBX GPU: framebuffer at GPU %08x, %u KiB draw pool at %08x, %s jobs, %s\n",
+	fprintf(stderr, "n72-ui: %s; MBX GPU:", kms_fd >= 0 ? "KMS (n72-clcd)" : "no KMS");
+	fprintf(stderr, "  framebuffer at GPU %08x, %u KiB draw pool at %08x, %s jobs, %s\n",
 	       fb.gpu_addr, POOL_SIZE / 1024, pool_gpu, gpu_async ? "async" : "sync",
 	       flipping ? "page flipping at vblank" : "copy to the framebuffer");
 	return disp;
