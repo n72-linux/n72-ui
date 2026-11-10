@@ -5,7 +5,7 @@
  * Display: /dev/fb0 (simplefb, 320x480 XRGB8888). Touch: the Zephyr2
  * evdev device. Buttons: gpio-keys (Home returns to the launcher, Power
  * puts the system to sleep (s2idle) and Power or Home wakes it, the volume
- * keys change the brightness).
+ * keys change the sound volume; audio.c).
  *
  * Environment:
  *   N72_FB         framebuffer device (default /dev/fb0)
@@ -404,6 +404,7 @@ static void backlight_power(bool on)
 	write_int(p, on ? 0 : 4);
 }
 
+#include "audio.c"
 #include "ui_m3.c"
 
 /*
@@ -609,14 +610,12 @@ static void keys_poll(lv_timer_t *t)
 				home_wake();
 			break;
 		case KEY_VOLUMEUP:
-			if (!logs_scroll(1))
-				backlight_set(backlight_get() + 10);
-			lv_slider_set_value(home_bright, backlight_get(), LV_ANIM_OFF);
+			if (!screen_off && !logs_scroll(1))
+				volume_step(1);
 			break;
 		case KEY_VOLUMEDOWN:
-			if (!logs_scroll(-1))
-				backlight_set(backlight_get() - 10);
-			lv_slider_set_value(home_bright, backlight_get(), LV_ANIM_OFF);
+			if (!screen_off && !logs_scroll(-1))
+				volume_step(-1);
 			break;
 		}
 	}
@@ -978,6 +977,7 @@ int main(int argc, char **argv)
 	lv_timer_create(idle_check, 1000, NULL);
 
 	build_home();
+	sound_ui_init();
 	drags_init();
 	crash_handlers();
 	signal(SIGUSR1, on_usr1);

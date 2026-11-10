@@ -25,7 +25,9 @@ static struct {
 	bool dark;
 	int accent;		/* index into accents[] */
 	int idle_s;		/* screen idle timeout, 0 = never */
-} conf = { true, 0, 120 };
+	int vol;		/* sound volume, 0..100 % (0 = mute) */
+	bool spk;		/* speaker when no earphones are plugged */
+} conf = { true, 0, 120, 60, true };
 
 static const struct { const char *name; uint16_t hue; uint8_t sat; } accents[] = {
 	{ "Violet", 265, 48 }, { "Blue", 215, 60 }, { "Teal", 178, 55 },
@@ -52,6 +54,10 @@ static void conf_load(void)
 			conf.accent = v;
 		else if (sscanf(line, "idle=%d", &v) == 1 && v >= 0)
 			conf.idle_s = v;
+		else if (sscanf(line, "vol=%d", &v) == 1 && v >= 0 && v <= 100)
+			conf.vol = v;
+		else if (sscanf(line, "spk=%d", &v) == 1)
+			conf.spk = v;
 	}
 	fclose(f);
 }
@@ -62,7 +68,8 @@ static void conf_save(void)
 
 	if (!f)
 		return;
-	fprintf(f, "dark=%d\naccent=%d\nidle=%d\n", conf.dark, conf.accent, conf.idle_s);
+	fprintf(f, "dark=%d\naccent=%d\nidle=%d\nvol=%d\nspk=%d\n", conf.dark, conf.accent,
+		conf.idle_s, conf.vol, conf.spk);
 	fclose(f);
 }
 
@@ -2025,6 +2032,207 @@ static void open_about(lv_event_t *e)
 
 /* ----------------------------------------------------------- Settings */
 
+/* -------------------------------------------------------------- sound */
+
+/*
+ * Volume keys change the sound volume and show a pop-up on the top layer;
+ * the jack decides between earphones and speaker (audio.c).
+ */
+static lv_obj_t *vol_hud, *vol_hud_bar, *vol_hud_icon, *vol_hud_txt;
+static lv_timer_t *vol_hud_timer;
+static lv_obj_t *snd_page, *snd_slider, *snd_val, *snd_out_lbl, *set_snd_sub;
+
+static const char *snd_output_name(void)
+{
+	if (!snd_present)
+		return "No sound card";
+	if (jack_in)
+		return "Earphones";
+	return conf.spk ? "Speaker" : "Earphones (speaker off)";
+}
+
+static void snd_summary(char *buf, size_t len)
+{
+	if (!snd_present)
+		snprintf(buf, len, "No sound card");
+	else if (!conf.vol)
+		snprintf(buf, len, "Muted, %s", snd_output_name());
+	else
+		snprintf(buf, len, "%d%%, %s", conf.vol, snd_output_name());
+}
+
+static void vol_hud_hide(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	if (vol_hud)
+		lv_obj_add_flag(vol_hud, LV_OBJ_FLAG_HIDDEN);
+	vol_hud_timer = NULL;
+}
+
+static void snd_refresh_ui(void)
+{
+	char buf[64];
+
+	if (vol_hud && !lv_obj_has_flag(vol_hud, LV_OBJ_FLAG_HIDDEN)) {
+		lv_bar_set_value(vol_hud_bar, conf.vol, LV_ANIM_OFF);
+		lv_label_set_text(vol_hud_icon, !conf.vol ? LV_SYMBOL_MUTE :
+				  conf.vol < 50 ? LV_SYMBOL_VOLUME_MID : LV_SYMBOL_VOLUME_MAX);
+		lv_label_set_text(vol_hud_txt, jack_in ? "Earphones" : conf.spk ? "Speaker" : "Earphones");
+	}
+	if (snd_page && lv_obj_is_valid(snd_page)) {
+		lv_slider_set_value(snd_slider, conf.vol, LV_ANIM_OFF);
+		snprintf(buf, sizeof(buf), conf.vol ? "%d%%" : "Mute", conf.vol);
+		label_set_if_changed(snd_val, buf);
+		label_set_if_changed(snd_out_lbl, snd_output_name());
+	}
+	if (set_snd_sub && lv_obj_is_valid(set_snd_sub)) {
+		snd_summary(buf, sizeof(buf));
+		label_set_if_changed(set_snd_sub, buf);
+	}
+}
+
+static void vol_hud_show(void)
+{
+	if (!vol_hud) {
+		lv_obj_t *row;
+
+		vol_hud = lv_obj_create(lv_layer_top());
+		plain(vol_hud);
+		lv_obj_set_size(vol_hud, 260, 64);
+		lv_obj_align(vol_hud, LV_ALIGN_TOP_MID, 0, 34);
+		lv_obj_set_style_radius(vol_hud, 32, 0);
+		lv_obj_set_style_bg_color(vol_hud, M.surface_c_high, 0);
+		lv_obj_set_style_bg_opa(vol_hud, LV_OPA_COVER, 0);
+		lv_obj_set_style_shadow_width(vol_hud, 18, 0);
+		lv_obj_set_style_shadow_opa(vol_hud, LV_OPA_40, 0);
+		lv_obj_set_style_pad_hor(vol_hud, 20, 0);
+		lv_obj_set_style_pad_ver(vol_hud, 8, 0);
+		lv_obj_remove_flag(vol_hud, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_set_flex_flow(vol_hud, LV_FLEX_FLOW_COLUMN);
+		lv_obj_set_flex_align(vol_hud, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+		lv_obj_set_style_pad_row(vol_hud, 4, 0);
+		row = lv_obj_create(vol_hud);
+		plain(row);
+		lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+		lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+		lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+		lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+		lv_obj_set_style_pad_column(row, 10, 0);
+		vol_hud_icon = m3_label(row, LV_SYMBOL_VOLUME_MAX, &lv_font_montserrat_20, M.primary);
+		vol_hud_txt = m3_label(row, "", &lv_font_montserrat_14, M.on_surface_v);
+		vol_hud_bar = lv_bar_create(vol_hud);
+		lv_obj_set_size(vol_hud_bar, lv_pct(100), 8);
+		lv_bar_set_range(vol_hud_bar, 0, 100);
+		lv_obj_set_style_bg_color(vol_hud_bar, M.surface_c_highest, 0);
+		lv_obj_set_style_bg_color(vol_hud_bar, M.primary, LV_PART_INDICATOR);
+	}
+	lv_obj_remove_flag(vol_hud, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_move_foreground(vol_hud);
+	snd_refresh_ui();
+	if (vol_hud_timer)
+		lv_timer_reset(vol_hud_timer);
+	else {
+		vol_hud_timer = lv_timer_create(vol_hud_hide, 1500, NULL);
+		lv_timer_set_repeat_count(vol_hud_timer, 1);
+	}
+}
+
+static void volume_set(int pct, bool hud)
+{
+	conf.vol = pct < 0 ? 0 : pct > 100 ? 100 : pct;
+	snd_apply_volume(conf.vol);
+	conf_save();
+	if (hud)
+		vol_hud_show();
+	else
+		snd_refresh_ui();
+}
+
+/* volume keys: 16 steps of about 4 dB at the top, finer near mute */
+static void volume_step(int dir)
+{
+	int v = conf.vol;
+
+	if (!snd_present)
+		return;
+	v += dir * ((dir > 0 ? v : v - 1) >= 30 ? 6 : 3);
+	volume_set(v, true);
+}
+
+static void jack_check(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	if (!jack_poll())
+		return;
+	snd_apply_output(conf.spk);
+	vol_hud_show();
+}
+
+static void snd_slider_cb(lv_event_t *e)
+{
+	volume_set(lv_slider_get_value(lv_event_get_target(e)), false);
+}
+
+static void snd_spk_cb(lv_event_t *e)
+{
+	conf.spk = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+	snd_apply_output(conf.spk);
+	conf_save();
+	snd_refresh_ui();
+}
+
+static void snd_test_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	if (have_tool("/usr/bin/n72tone"))
+		job_run("/usr/bin/n72tone -f 660 -a -12 -t 0.6", NULL, NULL, NULL);
+}
+
+static void open_sound(lv_event_t *e)
+{
+	lv_obj_t *scr, *body, *c, *row, *sw;
+
+	LV_UNUSED(e);
+	body = m3_page("Sound", &scr);
+	snd_page = scr;
+
+	m3_section(body, "Volume");
+	c = m3_card(body, M.surface_c);
+	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(c, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_column(c, 12, 0);
+	m3_label(c, LV_SYMBOL_VOLUME_MAX, &lv_font_montserrat_20, M.on_surface_v);
+	snd_slider = lv_slider_create(c);
+	lv_obj_set_flex_grow(snd_slider, 1);
+	lv_slider_set_range(snd_slider, 0, 100);
+	lv_slider_set_value(snd_slider, conf.vol, LV_ANIM_OFF);
+	lv_obj_add_event_cb(snd_slider, snd_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	snd_val = m3_label(c, "", &lv_font_montserrat_14, M.on_surface_v);
+
+	m3_section(body, "Output");
+	c = m3_card(body, M.surface_c);
+	lv_obj_set_style_pad_all(c, 4, 0);
+	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+	m3_row(c, LV_SYMBOL_AUDIO, "Playing on", snd_output_name(), NULL, NULL, &snd_out_lbl);
+	row = m3_row(c, LV_SYMBOL_VOLUME_MAX, "Speaker", "When no earphones are plugged in",
+		     NULL, NULL, NULL);
+	sw = lv_switch_create(row);
+	if (conf.spk)
+		lv_obj_add_state(sw, LV_STATE_CHECKED);
+	lv_obj_add_event_cb(sw, snd_spk_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	m3_note(body, "The volume keys change the volume everywhere (in Logs they scroll).");
+	if (have_tool("/usr/bin/n72tone"))
+		m3_button(body, "Test sound", false, snd_test_cb, NULL);
+	snd_refresh_ui();
+	push(scr);
+}
+
+static void sound_ui_init(void)
+{
+	snd_init(conf.vol, conf.spk);
+	lv_timer_create(jack_check, 200, NULL);
+}
+
 static void open_settings(lv_event_t *e)
 {
 	lv_obj_t *scr, *body, *c;
@@ -2047,6 +2255,8 @@ static void open_settings(lv_event_t *e)
 	snprintf(sub, sizeof(sub), "%s, %s, %d%%", conf.dark ? "Dark" : "Light",
 		 accents[conf.accent].name, backlight_get());
 	m3_row(c, LV_SYMBOL_IMAGE, "Display", sub, open_display, NULL, NULL);
+	snd_summary(sub, sizeof(sub));
+	m3_row(c, LV_SYMBOL_VOLUME_MAX, "Sound", sub, open_sound, NULL, &set_snd_sub);
 	m3_row(c, LV_SYMBOL_POWER, "Power", "Sleep, restart, power off", open_power, NULL, NULL);
 
 	c = m3_card(body, M.surface_c);
