@@ -44,6 +44,7 @@
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include "lvgl/lvgl.h"
@@ -404,6 +405,44 @@ static void backlight_power(bool on)
 }
 
 #include "ui_m3.c"
+
+/*
+ * A crash report on stderr (the log): signal, fault address, PC and LR, and
+ * a few words of the stack (return addresses among them), for the
+ * unstripped n72-ui-build/n72-ui.debug and addr2line.
+ */
+static void on_crash(int sig, siginfo_t *si, void *ctx)
+{
+	const ucontext_t *uc = ctx;
+	const struct sigcontext *mc = &uc->uc_mcontext;
+	const unsigned long *sp = (const unsigned long *)mc->arm_sp;
+	char buf[512];
+	int n, i;
+
+	n = snprintf(buf, sizeof(buf), "n72-ui: signal %d at %p: pc %08lx lr %08lx sp %08lx\n  stack:",
+		     sig, si->si_addr, mc->arm_pc, mc->arm_lr, mc->arm_sp);
+	for (i = 0; i < 24 && n < (int)sizeof(buf) - 12; i++)
+		n += snprintf(buf + n, sizeof(buf) - n, " %08lx", sp[i]);
+	if (n < (int)sizeof(buf) - 1)
+		buf[n++] = '\n';
+	write(2, buf, n);
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
+static void crash_handlers(void)
+{
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = on_crash;
+	sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+	sigaction(SIGSEGV, &sa, NULL);
+	sigaction(SIGBUS, &sa, NULL);
+	sigaction(SIGILL, &sa, NULL);
+	sigaction(SIGFPE, &sa, NULL);
+	sigaction(SIGABRT, &sa, NULL);
+}
 
 /* ---------------------------------------------------------------- sleep */
 
@@ -940,6 +979,7 @@ int main(int argc, char **argv)
 
 	build_home();
 	drags_init();
+	crash_handlers();
 	signal(SIGUSR1, on_usr1);
 	signal(SIGUSR2, on_usr2);
 	lv_timer_create(shot_poll, 100, NULL);

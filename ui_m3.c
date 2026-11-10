@@ -481,6 +481,7 @@ static void back_cb(lv_event_t *e)
  */
 #define SC_MAX		64
 #define SC_BUDGET	(3 * 1024 * 1024)	/* bytes of snapshots at most */
+#define SC_KEEP_MS	1500			/* pictures stay this long after the page stops */
 
 static struct {
 	lv_obj_t *owner;
@@ -514,10 +515,18 @@ static void sc_settle(lv_timer_t *t)
 {
 	lv_obj_t *body = lv_timer_get_user_data(t);
 
-	if (sc.owner == body && lv_tick_elaps(sc.last_move) < 150)
-		return;			/* still moving: look again */
+	/*
+	 * Keep the pictures for a while after the page stops: another flick
+	 * soon after reuses them instead of taking them all again at its
+	 * start (a 60-140 ms hitch on Logs). Taps still reach the live rows,
+	 * which stay in place under the pictures.
+	 */
+	if (sc.owner == body && lv_tick_elaps(sc.last_move) < SC_KEEP_MS)
+		return;			/* still moving, or recently: look again */
 	lv_timer_delete(t);
 	sc.timer = NULL;
+	if (getenv("N72_SC_KEEP"))
+		return;			/* test: pictures stay (compare with N72_NO_SCROLL_CACHE) */
 	if (sc.owner == body)
 		sc_restore(true);
 }
@@ -525,9 +534,17 @@ static void sc_settle(lv_timer_t *t)
 /* Picture of child @c in place of the live child; false if not possible now. */
 static bool sc_cache_child(lv_obj_t *body, lv_obj_t *c)
 {
-	long sz = (long)lv_obj_get_width(c) * lv_obj_get_height(c) * 4;
+	/*
+	 * The snapshot covers the child's extra draw area too (labels: a
+	 * quarter of the line height on every side, for overhanging glyphs),
+	 * so the picture goes that much up and left of the child's position.
+	 */
+	int32_t ext = lv_obj_get_ext_draw_size(c);
+	long sz = (long)(lv_obj_get_width(c) + 2 * ext) * (lv_obj_get_height(c) + 2 * ext) * 4;
 	lv_draw_buf_t *b, *flat;
 	lv_obj_t *p;
+
+	uint32_t t0 = lv_tick_get();
 
 	if (sc.n >= SC_MAX || sz <= 0 || sc.bytes + sz > SC_BUDGET)
 		return false;
@@ -549,7 +566,7 @@ static bool sc_cache_child(lv_obj_t *body, lv_obj_t *c)
 	lv_image_set_src(p, b);
 	lv_obj_add_flag(p, LV_OBJ_FLAG_IGNORE_LAYOUT | LV_OBJ_FLAG_USER_1);
 	lv_obj_remove_flag(p, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLL_ON_FOCUS);
-	lv_obj_set_pos(p, lv_obj_get_x(c), lv_obj_get_y(c));
+	lv_obj_set_pos(p, lv_obj_get_x(c) - ext, lv_obj_get_y(c) - ext);
 	lv_obj_set_style_opa_layered(c, LV_OPA_TRANSP, 0);
 	sc.live[sc.n] = c;
 	sc.pic[sc.n] = p;
@@ -557,6 +574,9 @@ static bool sc_cache_child(lv_obj_t *body, lv_obj_t *c)
 	sc.size[sc.n] = sz;
 	sc.bytes += sz;
 	sc.n++;
+	if (lv_tick_elaps(t0) > 10 && getenv("N72_FPS"))
+		fprintf(stderr, "scroll cache: picture %dx%d took %u ms\n", (int)lv_obj_get_width(c),
+			(int)lv_obj_get_height(c), (unsigned)lv_tick_elaps(t0));
 	return true;
 }
 
@@ -583,7 +603,7 @@ static void sc_uncache(int i)
  */
 static void sc_fill(lv_obj_t *body, int max)
 {
-	uint32_t i, cnt = lv_obj_get_child_count(body);
+	uint32_t i, cnt;
 	lv_area_t bc, cc;
 	int32_t lo, hi, k;
 
@@ -591,13 +611,21 @@ static void sc_fill(lv_obj_t *body, int max)
 	lo = bc.y1 - H / 2;
 	hi = bc.y2 + H / 2;
 	for (k = sc.n - 1; k >= 0; k--) {
+		if (!lv_obj_is_valid(sc.pic[k])) {
+			sc_uncache(k);
+			continue;
+		}
 		lv_obj_get_coords(sc.pic[k], &cc);
 		if (cc.y2 < lo - H || cc.y1 > hi + H)
 			sc_uncache(k);
 	}
+	/* counted after the drops above: each picture is a child of @body too */
+	cnt = lv_obj_get_child_count(body);
 	for (i = 0; i < cnt && max > 0; i++) {
 		lv_obj_t *c = lv_obj_get_child(body, i);
 
+		if (!c)
+			break;
 		if (lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) || lv_obj_has_flag(c, LV_OBJ_FLAG_USER_1))
 			continue;
 		lv_obj_get_coords(c, &cc);
@@ -642,7 +670,7 @@ static void sc_event(lv_event_t *e)
 	case LV_EVENT_SCROLL:
 		sc.last_move = lv_tick_get();
 		if (sc.owner == body)
-			sc_fill(body, 2);	/* children coming into view */
+			sc_fill(body, 1);	/* children coming into view: one picture a frame */
 		break;
 	case LV_EVENT_SCROLL_BEGIN:
 		sc.last_move = lv_tick_get();
@@ -2051,8 +2079,8 @@ static bool logs_follow = true;
  * a frame while scrolling. Chunks off screen are skipped whole, and an
  * update only touches the chunks whose text changed.
  */
-#define LOGS_CHUNK	16
-#define LOGS_MAXCH	48
+#define LOGS_CHUNK	8	/* ~260 px: a new scroll picture costs ~15 ms, not ~30 */
+#define LOGS_MAXCH	96
 static lv_obj_t *logs_chunk[LOGS_MAXCH];
 static int logs_nchunks;
 
