@@ -479,13 +479,15 @@ static void back_cb(lv_event_t *e)
  * opacity 0). Scroll frames are then a few GPU copies instead of CPU text
  * and shapes. When scrolling ends the live children come back.
  */
-#define SC_MAX		16
+#define SC_MAX		64
 #define SC_BUDGET	(3 * 1024 * 1024)	/* bytes of snapshots at most */
 
 static struct {
 	lv_obj_t *owner;
 	lv_obj_t *live[SC_MAX], *pic[SC_MAX];
 	lv_draw_buf_t *buf[SC_MAX];
+	long size[SC_MAX];
+	long bytes;
 	int n;
 	lv_timer_t *timer;
 	uint32_t last_move;
@@ -504,6 +506,7 @@ static void sc_restore(bool delete_pics)
 		lv_draw_buf_destroy(sc.buf[i]);
 	}
 	sc.n = 0;
+	sc.bytes = 0;
 	sc.owner = NULL;
 }
 
@@ -519,54 +522,108 @@ static void sc_settle(lv_timer_t *t)
 		sc_restore(true);
 }
 
-static void sc_begin(lv_obj_t *body)
+/* Picture of child @c in place of the live child; false if not possible now. */
+static bool sc_cache_child(lv_obj_t *body, lv_obj_t *c)
+{
+	long sz = (long)lv_obj_get_width(c) * lv_obj_get_height(c) * 4;
+	lv_draw_buf_t *b, *flat;
+	lv_obj_t *p;
+
+	if (sc.n >= SC_MAX || sz <= 0 || sc.bytes + sz > SC_BUDGET)
+		return false;
+	b = lv_snapshot_take(c, LV_COLOR_FORMAT_ARGB8888);
+	if (!b)
+		return false;
+	lv_draw_buf_flush_cache(b, NULL);	/* the GPU reads it */
+	/*
+	 * Flatten it onto the page colour once: frames then copy opaque
+	 * pictures instead of blending them (a third of the memory traffic,
+	 * and the GPU is memory bound).
+	 */
+	flat = mbx_gpu_flatten(b, M.surface);
+	if (flat) {
+		lv_draw_buf_destroy(b);
+		b = flat;
+	}
+	p = lv_image_create(body);
+	lv_image_set_src(p, b);
+	lv_obj_add_flag(p, LV_OBJ_FLAG_IGNORE_LAYOUT | LV_OBJ_FLAG_USER_1);
+	lv_obj_remove_flag(p, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLL_ON_FOCUS);
+	lv_obj_set_pos(p, lv_obj_get_x(c), lv_obj_get_y(c));
+	lv_obj_set_style_opa_layered(c, LV_OPA_TRANSP, 0);
+	sc.live[sc.n] = c;
+	sc.pic[sc.n] = p;
+	sc.buf[sc.n] = b;
+	sc.size[sc.n] = sz;
+	sc.bytes += sz;
+	sc.n++;
+	return true;
+}
+
+static void sc_uncache(int i)
+{
+	if (lv_obj_is_valid(sc.pic[i]))
+		lv_obj_delete(sc.pic[i]);
+	if (lv_obj_is_valid(sc.live[i]))
+		lv_obj_set_style_opa_layered(sc.live[i], LV_OPA_COVER, 0);
+	lv_image_cache_drop(sc.buf[i]);
+	lv_draw_buf_destroy(sc.buf[i]);
+	sc.bytes -= sc.size[i];
+	sc.n--;
+	sc.live[i] = sc.live[sc.n];
+	sc.pic[i] = sc.pic[sc.n];
+	sc.buf[i] = sc.buf[sc.n];
+	sc.size[i] = sc.size[sc.n];
+}
+
+/*
+ * Keep pictures of the children on screen or within half a screen of it:
+ * drop those further away, add those coming in (at most @max new ones per
+ * call, so a fling does not stall on a burst of snapshots).
+ */
+static void sc_fill(lv_obj_t *body, int max)
 {
 	uint32_t i, cnt = lv_obj_get_child_count(body);
-	long budget = SC_BUDGET;
+	lv_area_t bc, cc;
+	int32_t lo, hi, k;
 
+	lv_obj_get_coords(body, &bc);
+	lo = bc.y1 - H / 2;
+	hi = bc.y2 + H / 2;
+	for (k = sc.n - 1; k >= 0; k--) {
+		lv_obj_get_coords(sc.pic[k], &cc);
+		if (cc.y2 < lo - H || cc.y1 > hi + H)
+			sc_uncache(k);
+	}
+	for (i = 0; i < cnt && max > 0; i++) {
+		lv_obj_t *c = lv_obj_get_child(body, i);
+
+		if (lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) || lv_obj_has_flag(c, LV_OBJ_FLAG_USER_1))
+			continue;
+		lv_obj_get_coords(c, &cc);
+		if (cc.y2 < lo || cc.y1 > hi)
+			continue;
+		for (k = 0; k < sc.n; k++)
+			if (sc.live[k] == c)
+				break;
+		if (k < sc.n)
+			continue;
+		if (!sc_cache_child(body, c))
+			break;
+		max--;
+	}
+}
+
+static void sc_begin(lv_obj_t *body)
+{
 	if (sc.owner)
 		sc_restore(true);
 	if (sc.timer) {
 		lv_timer_delete(sc.timer);
 		sc.timer = NULL;
 	}
-	for (i = 0; i < cnt && sc.n < SC_MAX; i++) {
-		lv_obj_t *c = lv_obj_get_child(body, i), *p;
-		lv_draw_buf_t *b;
-		long sz = (long)lv_obj_get_width(c) * lv_obj_get_height(c) * 4;
-
-		if (lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) || sz <= 0 || sz > budget)
-			continue;
-		b = lv_snapshot_take(c, LV_COLOR_FORMAT_ARGB8888);
-		if (!b)
-			break;
-		lv_draw_buf_flush_cache(b, NULL);	/* the GPU reads it */
-		/*
-		 * Flatten it onto the page colour once: frames then copy opaque
-		 * pictures instead of blending them (a third of the memory
-		 * traffic, and the GPU is memory bound).
-		 */
-		{
-			lv_draw_buf_t *flat = mbx_gpu_flatten(b, M.surface);
-
-			if (flat) {
-				lv_draw_buf_destroy(b);
-				b = flat;
-			}
-		}
-		budget -= sz;
-		p = lv_image_create(body);
-		lv_image_set_src(p, b);
-		lv_obj_add_flag(p, LV_OBJ_FLAG_IGNORE_LAYOUT);
-		lv_obj_remove_flag(p, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLL_ON_FOCUS);
-		lv_obj_set_pos(p, lv_obj_get_x(c), lv_obj_get_y(c));
-		lv_obj_set_style_opa_layered(c, LV_OPA_TRANSP, 0);
-		sc.live[sc.n] = c;
-		sc.pic[sc.n] = p;
-		sc.buf[sc.n] = b;
-		sc.n++;
-	}
 	sc.owner = body;
+	sc_fill(body, SC_MAX);
 	if (getenv("N72_FPS"))
 		fprintf(stderr, "scroll cache: %d pictures\n", sc.n);
 }
@@ -578,6 +635,8 @@ static void sc_event(lv_event_t *e)
 	switch (lv_event_get_code(e)) {
 	case LV_EVENT_SCROLL:
 		sc.last_move = lv_tick_get();
+		if (sc.owner == body)
+			sc_fill(body, 2);	/* children coming into view */
 		break;
 	case LV_EVENT_SCROLL_BEGIN:
 		sc.last_move = lv_tick_get();
@@ -1980,6 +2039,57 @@ static char *logs_buf;
 static int logs_len = -1;
 static bool logs_follow = true;
 
+/*
+ * The log as labels of LOGS_CHUNK lines each: LVGL lays out and draws a
+ * label by walking its text from the start, so one 6 KB label cost ~25 ms
+ * a frame while scrolling. Chunks off screen are skipped whole, and an
+ * update only touches the chunks whose text changed.
+ */
+#define LOGS_CHUNK	16
+#define LOGS_MAXCH	48
+static lv_obj_t *logs_chunk[LOGS_MAXCH];
+static int logs_nchunks;
+
+static void logs_set_chunks(const char *text)
+{
+	const char *p = text;
+	int c = 0;
+
+	while (*p && c < LOGS_MAXCH) {
+		const char *q = p;
+		int lines = 0;
+		char *part;
+		size_t len;
+
+		while (*q && lines < LOGS_CHUNK) {
+			if (*q == '\n')
+				lines++;
+			q++;
+		}
+		len = q - p;
+		if (len && p[len - 1] == '\n')
+			len--;			/* the label's own line break */
+		part = malloc(len + 1);
+		if (!part)
+			break;
+		memcpy(part, p, len);
+		part[len] = 0;
+		if (c == logs_nchunks) {
+			logs_chunk[c] = m3_label(logs_box, "", &lv_font_montserrat_12, M.on_surface);
+			lv_obj_set_width(logs_chunk[c], lv_pct(100));
+			lv_label_set_long_mode(logs_chunk[c], LV_LABEL_LONG_WRAP);
+			logs_nchunks++;
+		}
+		if (strcmp(lv_label_get_text(logs_chunk[c]), part))
+			lv_label_set_text(logs_chunk[c], part);
+		free(part);
+		p = q;
+		c++;
+	}
+	while (logs_nchunks > c)		/* the log got shorter */
+		lv_obj_delete(logs_chunk[--logs_nchunks]);
+}
+
 static void logs_update(lv_timer_t *t)
 {
 	char usb[32], wlan[32], buf[96];
@@ -2024,7 +2134,7 @@ static void logs_update(lv_timer_t *t)
 	}
 	logs_buf[o] = 0;
 	free(raw);
-	lv_label_set_text_static(logs_text, logs_buf);
+	logs_set_chunks(logs_buf);
 	lv_obj_update_layout(logs_box);
 	if (logs_follow)
 		lv_obj_scroll_to_y(logs_box, LV_COORD_MAX, LV_ANIM_OFF);
@@ -2048,6 +2158,7 @@ static void logs_delete_cb(lv_event_t *e)
 	free(logs_buf);
 	logs_buf = NULL;
 	logs_box = NULL;
+	logs_nchunks = 0;
 }
 
 static void open_logs(lv_event_t *e)
@@ -2075,9 +2186,10 @@ static void open_logs(lv_event_t *e)
 	lv_obj_set_style_radius(logs_box, 16, 0);
 	lv_obj_set_style_bg_color(logs_box, M.surface_c, 0);
 	lv_obj_set_scroll_dir(logs_box, LV_DIR_VER);
-	logs_text = m3_label(logs_box, "", &lv_font_montserrat_12, M.on_surface);
-	lv_obj_set_width(logs_text, lv_pct(100));
-	lv_label_set_long_mode(logs_text, LV_LABEL_LONG_WRAP);
+	lv_obj_set_flex_flow(logs_box, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_pad_row(logs_box, 0, 0);
+	logs_nchunks = 0;
+	scroll_cached(logs_box);	/* scroll the chunks as pictures */
 	logs_update(NULL);
 	logs_timer = lv_timer_create(logs_update, 2000, NULL);
 	lv_obj_add_event_cb(scr, logs_delete_cb, LV_EVENT_DELETE, NULL);
