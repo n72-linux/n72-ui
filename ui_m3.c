@@ -1726,12 +1726,25 @@ static void bt_page_refresh(void)
 		bt_page, bt_devs_done, NULL);
 }
 
+/*
+ * Off unbinds the controller's serial device as well: hci_bcm then holds
+ * the BCM4325's Bluetooth side in shutdown, and the UART's clock gates
+ * close (a powered-off but bound controller keeps the UART clocked). On
+ * binds it again (firmware setup, ~3 s) and powers it once BlueZ has it.
+ */
+#define BT_SERDEV	"/sys/bus/serial/drivers/hci_uart_bcm"
+#define BT_OFF_CMD	"bluetoothctl power off; [ -e " BT_SERDEV "/serial0-0 ] && " \
+			"echo -n serial0-0 > " BT_SERDEV "/unbind"
+#define BT_ON_CMD	"[ -e " BT_SERDEV "/serial0-0 ] || " \
+			"echo -n serial0-0 > " BT_SERDEV "/bind; n=0; " \
+			"until bluetoothctl show 2>/dev/null | grep -q Powered || [ $n -ge 20 ]; " \
+			"do sleep 0.5; n=$((n+1)); done; bluetoothctl power on"
+
 static void bt_switch_cb(lv_event_t *e)
 {
 	bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
 
-	job_run(on ? "bluetoothctl power on" : "bluetoothctl power off", bt_page,
-		bt_cmd_done, NULL);
+	job_run(on ? BT_ON_CMD : BT_OFF_CMD, bt_page, bt_cmd_done, NULL);
 }
 
 static void bt_scan_cb(lv_event_t *e)

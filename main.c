@@ -417,6 +417,8 @@ static void backlight_power(bool on)
 static void drain(int fd);
 static void home_wake(void);
 static void screen_off_or_sleep(void);
+/* the touch device's "inhibited" (sysfs): the driver stops the controller */
+static char touch_inhibit[96];
 
 static void screen_set(bool on)
 {
@@ -427,6 +429,8 @@ static void screen_set(bool on)
 		backlight_power(on);
 	if (touch_indev)
 		lv_indev_enable(touch_indev, on);
+	if (touch_inhibit[0])
+		write_int(touch_inhibit, !on);
 	drain(touch_wait_fd);
 	if (on) {
 		home_wake();
@@ -1042,6 +1046,12 @@ int main(int argc, char **argv)
 		if (indev && swap && *swap == '1')
 			lv_evdev_set_swap_axes(indev, true);
 		if (indev) {
+			const char *ev = strrchr(touch, '/');
+
+			snprintf(touch_inhibit, sizeof(touch_inhibit),
+				 "/sys/class/input/%s/device/inhibited", ev ? ev + 1 : touch);
+			if (access(touch_inhibit, W_OK))
+				touch_inhibit[0] = 0;
 			touch_indev = indev;
 			touch_wait_fd = open(touch, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 			if (touch_wait_fd >= 0) {
