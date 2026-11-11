@@ -30,6 +30,7 @@
 #include <glob.h>
 #include <linux/input.h>
 #include <linux/kd.h>
+#include <linux/uinput.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -426,6 +427,8 @@ static void home_wake(void);
 static void screen_off_or_sleep(void);
 /* the touch device's "inhibited" (sysfs): the driver stops the controller */
 static char touch_inhibit[96];
+static char rt_node[64];	/* the touch router's virtual device, for applications */
+static void rt_reset(void);
 
 static void screen_set(bool on)
 {
@@ -439,6 +442,7 @@ static void screen_set(bool on)
 	if (touch_inhibit[0])
 		write_int(touch_inhibit, !on);
 	drain(touch_wait_fd);
+	rt_reset();
 	if (on) {
 		home_wake();
 		lv_obj_invalidate(lv_screen_active());
@@ -447,6 +451,225 @@ static void screen_set(bool on)
 
 #include "audio.c"
 #include "ui_m3.c"
+
+/*
+ * The touch router. With an application running, the touch screen serves
+ * two programs, and each touch must reach only one. The launcher grabs the
+ * device (EVIOCGRAB) and reads it alone; at the moment a finger comes down
+ * it asks the UI (ui_wants_touch) whose touch it is. The launcher's go to
+ * LVGL through rt_read_cb, the application's, every event of every frame
+ * until the finger lifts, to a uinput device with the same axes, which the
+ * application opens (N72_TOUCH). Without uinput, both read the device as
+ * before.
+ */
+static int rt_uinput = -1;
+static struct { int min_x, max_x, min_y, max_y; bool swap; } rt_cal;
+static int rt_raw_x, rt_raw_y;
+static bool rt_down;			/* the device's state */
+static lv_point_t rt_pt;		/* what LVGL sees */
+static bool rt_ui_down;
+static enum { RT_NONE, RT_UI, RT_APP } rt_owner;
+static struct input_event rt_frame[64];
+static int rt_n;
+static uint64_t rt_frame_us;		/* when LVGL last had a frame */
+
+static void rt_reset(void)
+{
+	if (rt_owner == RT_APP && rt_uinput >= 0) {
+		/* the application's touch ends here */
+		struct input_event up[3] = {
+			{ .type = EV_KEY, .code = BTN_TOUCH, .value = 0 },
+			{ .type = EV_SYN, .code = SYN_MT_REPORT },
+			{ .type = EV_SYN, .code = SYN_REPORT },
+		};
+
+		if (write(rt_uinput, up, sizeof(up)) < 0)
+			;
+	}
+	rt_n = 0;
+	rt_owner = RT_NONE;
+	rt_down = rt_ui_down = false;
+}
+
+static int rt_scale(int v, int in_min, int in_max, int out_max)
+{
+	if (in_min != in_max)
+		v = (v - in_min) * out_max / (in_max - in_min);
+	return LV_CLAMP(0, v, out_max);
+}
+
+static lv_point_t rt_map(int x, int y)
+{
+	lv_display_t *d = lv_display_get_default();
+	lv_point_t p;
+
+	if (rt_cal.swap) {
+		int t = x;
+
+		x = y;
+		y = t;
+	}
+	p.x = rt_scale(x, rt_cal.min_x, rt_cal.max_x, lv_display_get_horizontal_resolution(d) - 1);
+	p.y = rt_scale(y, rt_cal.min_y, rt_cal.max_y, lv_display_get_vertical_resolution(d) - 1);
+	return p;
+}
+
+static void rt_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
+{
+	LV_UNUSED(indev);
+	data->point = rt_pt;
+	data->state = rt_ui_down ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+}
+
+/* A frame is complete (SYN_REPORT): route it. True if LVGL has news. */
+static bool rt_frame_done(void)
+{
+	lv_point_t p = rt_map(rt_raw_x, rt_raw_y);
+	bool news = false;
+
+	if (rt_owner == RT_NONE && rt_down)
+		rt_owner = app_pid > 0 && !ui_wants_touch(p.x, p.y) ? RT_APP : RT_UI;
+	if (rt_owner == RT_APP) {
+		if (write(rt_uinput, rt_frame, rt_n * sizeof(rt_frame[0])) < 0)
+			;
+	} else {
+		news = rt_ui_down != rt_down || rt_pt.x != p.x || rt_pt.y != p.y;
+		rt_pt = p;
+		rt_ui_down = rt_down;
+	}
+	if (!rt_down)
+		rt_owner = RT_NONE;
+	rt_n = 0;
+	return news;
+}
+
+/* Read what the touch screen has; hand LVGL each frame of its touches. */
+static void rt_feed(int fd, lv_indev_t *indev)
+{
+	struct input_event ev[32];
+	ssize_t r;
+	int i;
+
+	while ((r = read(fd, ev, sizeof(ev))) > 0) {
+		for (i = 0; i < (int)(r / sizeof(ev[0])); i++) {
+			const struct input_event *e = &ev[i];
+
+			if (e->type == EV_SYN && e->code == SYN_DROPPED) {
+				rt_n = 0;
+				continue;
+			}
+			if (e->type == EV_ABS && (e->code == ABS_X || e->code == ABS_MT_POSITION_X))
+				rt_raw_x = e->value;
+			else if (e->type == EV_ABS && (e->code == ABS_Y || e->code == ABS_MT_POSITION_Y))
+				rt_raw_y = e->value;
+			else if (e->type == EV_KEY && e->code == BTN_TOUCH)
+				rt_down = e->value != 0;
+			if (rt_n < (int)(sizeof(rt_frame) / sizeof(rt_frame[0])))
+				rt_frame[rt_n++] = *e;
+			if (e->type == EV_SYN && e->code == SYN_REPORT) {
+				/* every frame: a move and the lift in one read
+				 * would lose the move (and the gesture) */
+				if (rt_frame_done()) {
+					rt_frame_us = mono_us();
+					lv_indev_read(indev);
+				}
+				if (!lat_event_us && rt_owner != RT_APP)
+					lat_event_us = (uint64_t)e->input_event_sec * 1000000 +
+						       e->input_event_usec;
+			}
+		}
+	}
+}
+
+/*
+ * LVGL's own read timer, between frames: a read with no movement in it
+ * resets LVGL's gesture count, so a swipe of small steps never became one.
+ * Read only when the finger has rested a while (long press needs reads).
+ */
+static void rt_timer_cb(lv_timer_t *t)
+{
+	if (rt_ui_down && mono_us() - rt_frame_us < 40000)
+		return;
+	lv_indev_read(lv_timer_get_user_data(t));
+}
+
+/* Set up the router on the touch screen fd; false: no uinput. */
+static bool rt_init(int fd, const char *cal, const char *swap)
+{
+	unsigned long absbits[ABS_CNT / (8 * sizeof(long)) + 1] = { 0 };
+	struct uinput_setup us;
+	struct input_absinfo ai;
+	char sys[32], path[96];
+	struct dirent *de;
+	DIR *d;
+	int u, c;
+
+	u = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	if (u < 0)
+		return false;
+	if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits) < 0)
+		goto fail;
+	ioctl(u, UI_SET_EVBIT, EV_SYN);
+	ioctl(u, UI_SET_EVBIT, EV_KEY);
+	ioctl(u, UI_SET_EVBIT, EV_ABS);
+	ioctl(u, UI_SET_KEYBIT, BTN_TOUCH);
+	ioctl(u, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
+	for (c = 0; c < ABS_CNT; c++) {
+		struct uinput_abs_setup as;
+
+		if (!(absbits[c / (8 * sizeof(long))] & (1UL << (c % (8 * sizeof(long))))))
+			continue;
+		if (ioctl(fd, EVIOCGABS(c), &ai) < 0)
+			continue;
+		memset(&as, 0, sizeof(as));
+		as.code = c;
+		as.absinfo = ai;
+		ioctl(u, UI_SET_ABSBIT, c);
+		if (ioctl(u, UI_ABS_SETUP, &as) < 0)
+			goto fail;
+	}
+	memset(&us, 0, sizeof(us));
+	ioctl(fd, EVIOCGID, &us.id);
+	snprintf(us.name, sizeof(us.name), "n72-ui touch");
+	if (ioctl(u, UI_DEV_SETUP, &us) < 0 || ioctl(u, UI_DEV_CREATE) < 0)
+		goto fail;
+
+	/* /dev/input/eventN of the new device, for the applications */
+	rt_node[0] = 0;
+	if (ioctl(u, UI_GET_SYSNAME(sizeof(sys)), sys) >= 0) {
+		snprintf(path, sizeof(path), "/sys/devices/virtual/input/%s", sys);
+		d = opendir(path);
+		while (d && (de = readdir(d)))
+			if (!strncmp(de->d_name, "event", 5))
+				snprintf(rt_node, sizeof(rt_node), "/dev/input/%s", de->d_name);
+		if (d)
+			closedir(d);
+	}
+	if (ioctl(fd, EVIOCGRAB, 1) < 0) {
+		ioctl(u, UI_DEV_DESTROY);
+		goto fail;
+	}
+
+	if (ioctl(fd, EVIOCGABS(ABS_X), &ai) == 0) {
+		rt_cal.min_x = ai.minimum;
+		rt_cal.max_x = ai.maximum;
+	}
+	if (ioctl(fd, EVIOCGABS(ABS_Y), &ai) == 0) {
+		rt_cal.min_y = ai.minimum;
+		rt_cal.max_y = ai.maximum;
+	}
+	if (cal)	/* as lv_evdev_set_calibration: min x, min y, max x, max y */
+		sscanf(cal, "%d %d %d %d", &rt_cal.min_x, &rt_cal.min_y,
+		       &rt_cal.max_x, &rt_cal.max_y);
+	rt_cal.swap = swap && *swap == '1';
+	rt_uinput = u;
+	fprintf(stderr, "n72-ui: touch router on, applications get %s\n",
+		rt_node[0] ? rt_node : "(no node)");
+	return true;
+fail:
+	close(u);
+	return false;
+}
 
 /*
  * A crash report on stderr (the log): signal, fault address, PC and LR, and
@@ -1065,6 +1288,11 @@ int main(int argc, char **argv)
 				int clk = CLOCK_MONOTONIC;
 
 				ioctl(touch_wait_fd, EVIOCSCLOCKID, &clk);
+				if (mbx_gpu_on_shell_layer() &&
+				    rt_init(touch_wait_fd, cal, swap)) {
+					lv_indev_set_read_cb(indev, rt_read_cb);
+					lv_timer_set_cb(lv_indev_get_read_timer(indev), rt_timer_cb);
+				}
 			}
 		}
 		lat_on = getenv("N72_LATENCY") && *getenv("N72_LATENCY") == '1';
@@ -1108,7 +1336,14 @@ int main(int argc, char **argv)
 		uint32_t idle = lv_timer_handler();
 
 		if (poll(pf, 3, LV_MIN(idle, LV_DEF_REFR_PERIOD)) > 0) {
-			if (pf[0].revents & POLLIN) {
+			if ((pf[0].revents & POLLIN) && rt_uinput >= 0) {
+				lat_read_us = mono_us();
+				rt_feed(touch_wait_fd, touch_indev);	/* reads LVGL's side */
+				if (mbx_gpu_frame_waiting())
+					render_pending = true;
+				else
+					render_now();
+			} else if (pf[0].revents & POLLIN) {
 				struct input_event ev[16];
 				ssize_t r;
 

@@ -588,6 +588,11 @@ static int nav_n;
 static void shade_set(bool open, bool anim);
 
 static bool app_end(void);
+static lv_obj_t *app_scr;	/* the empty screen over a running application */
+static pid_t app_pid;
+static void app_shade_slide(bool open);
+static void app_bar_update(void);
+static lv_obj_t *vol_hud;
 
 static void go_home(void)
 {
@@ -1796,6 +1801,7 @@ static void home_update(lv_timer_t *t)
 			     bt_powered ? "On" : "Off");
 	qs_style(qs_wifi, wifi_up);
 	qs_style(qs_bt, bt_powered);
+	app_bar_update();
 }
 
 static void open_settings(lv_event_t *e);
@@ -1899,6 +1905,10 @@ static void shade_set(bool open, bool anim)
 		home_wake();
 	}
 	lv_obj_remove_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+	if (anim && app_scr && lv_screen_active() == app_scr) {
+		app_shade_slide(open);	/* no pictures to move: the application shows */
+		return;
+	}
 	if (anim && lv_screen_active() == home_scr) {
 		lv_obj_set_y(shade, -SHADE_H);
 		lv_obj_add_flag(shade, LV_OBJ_FLAG_HIDDEN);
@@ -1938,12 +1948,16 @@ static void shade_tap_cb(lv_event_t *e)
 /* Tiles in the shade open their page, closing the shade behind them. */
 static void qs_open_wifi(lv_event_t *e)
 {
+	if (app_pid > 0)
+		return;		/* over an application the tiles only show state */
 	shade_set(false, false);
 	open_wifi(e);
 }
 
 static void qs_open_bt(lv_event_t *e)
 {
+	if (app_pid > 0)
+		return;
 	shade_set(false, false);
 	open_bt(e);
 }
@@ -2038,22 +2052,244 @@ static void build_shade(void)
  * handed to it, and whatever the launcher shows then, the volume pop-up
  * for one, lies over it with its own edges and shadow.
  *
- * Home ends the application; so does its own exit. Input still goes to
- * both for now (they read the same event devices).
+ * Home ends the application; so does its own exit. The launcher holds
+ * the touch screen and passes the application the touches that are not
+ * its own through a virtual one (main.c, touch router), named to it in
+ * N72_TOUCH.
  *
  * Manifests: APPS_DIR/<x>.app with the lines "name=<title>" and
  * "exec=<shell command>"; each becomes a tile on the home screen.
  */
 #define APPS_DIR "/usr/share/n72-ui/apps"
 
-static lv_obj_t *app_scr;
-static pid_t app_pid;
 static lv_timer_t *app_timer;
+
+/*
+ * Over an application the launcher keeps the top edge. A pull down from it
+ * slides in a status bar (time, Wi-Fi, Bluetooth, battery) that goes away
+ * again by itself after APP_BAR_MS; a second pull, or a tap on the bar,
+ * brings the quick settings shade down over the application. A push up
+ * closes the shade, and a push up on the bar hides the bar.
+ *
+ * The shade and its scrim move to the top layer while an application runs
+ * (they live on the home screen otherwise). The touch router (main.c) asks
+ * ui_wants_touch() where each touch begins and gives the launcher those,
+ * the application all the others.
+ */
+#define APP_BAR_H	40
+#define APP_EDGE_H	24	/* the strip at the top that pulls the bar */
+#define APP_BAR_MS	3000
+
+static lv_obj_t *app_bar, *app_bar_time, *app_bar_icons, *app_bar_batt;
+static bool app_bar_shown;
+static lv_timer_t *app_bar_timer;
+
+static void app_y(void *obj, int32_t v)
+{
+	lv_obj_set_y(obj, v);
+}
+
+static void app_hide_done(lv_anim_t *a)
+{
+	lv_obj_add_flag(a->var, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void app_shade_done(lv_anim_t *a)
+{
+	LV_UNUSED(a);
+	shade_closed();
+}
+
+static void app_slide(lv_obj_t *obj, int32_t to, lv_anim_completed_cb_t done)
+{
+	lv_anim_t a;
+
+	lv_anim_delete(obj, app_y);
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, obj);
+	lv_anim_set_exec_cb(&a, app_y);
+	lv_anim_set_values(&a, lv_obj_get_y(obj), to);
+	lv_anim_set_duration(&a, 200);
+	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+	if (done)
+		lv_anim_set_completed_cb(&a, done);
+	lv_anim_start(&a);
+}
+
+static void app_shade_slide(bool open)
+{
+	app_slide(shade, open ? 0 : -SHADE_H, open ? NULL : app_shade_done);
+}
+
+static void app_bar_set(bool show);
+
+static void app_bar_expire(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	app_bar_timer = NULL;
+	if (shade_open) {
+		app_bar_set(true);	/* again once the shade is closed */
+		return;
+	}
+	app_bar_set(false);
+}
+
+static void app_bar_set(bool show)
+{
+	if (!app_bar)
+		return;
+	if (app_bar_timer) {
+		lv_timer_delete(app_bar_timer);
+		app_bar_timer = NULL;
+	}
+	if (show) {
+		app_bar_timer = lv_timer_create(app_bar_expire, APP_BAR_MS, NULL);
+		lv_timer_set_repeat_count(app_bar_timer, 1);
+		if (app_bar_shown)
+			return;
+		home_update(NULL);
+		lv_obj_remove_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
+		app_slide(app_bar, 0, NULL);
+	} else {
+		if (!app_bar_shown)
+			return;
+		app_slide(app_bar, -APP_BAR_H, app_hide_done);
+	}
+	app_bar_shown = show;
+}
+
+/*
+ * The bar is only 40 px high, less than a gesture (50 px), so it follows
+ * the finger itself: up 12 px hides it, down 20 px brings the shade, and a
+ * touch that went neither way is a tap (the shade too).
+ */
+static int32_t app_bar_y0;
+static bool app_bar_dragged;
+
+static void app_bar_touch_cb(lv_event_t *e)
+{
+	lv_event_code_t c = lv_event_get_code(e);
+	lv_indev_t *in = lv_indev_active();
+	lv_point_t p;
+
+	if (!in)
+		return;
+	lv_indev_get_point(in, &p);
+	if (c == LV_EVENT_PRESSED) {
+		app_bar_y0 = p.y;
+		app_bar_dragged = false;
+		app_bar_set(true);	/* touched: the timeout starts again */
+	} else if (c == LV_EVENT_PRESSING && !app_bar_dragged) {
+		if (p.y - app_bar_y0 <= -12) {
+			app_bar_dragged = true;
+			app_bar_set(false);
+		} else if (p.y - app_bar_y0 >= 20) {
+			app_bar_dragged = true;
+			shade_set(true, true);
+		}
+	} else if (c == LV_EVENT_CLICKED && !app_bar_dragged) {
+		shade_set(true, true);
+	}
+}
+
+/* Pulls and pushes over an application (on its screen and the top layer). */
+static void app_gesture_cb(lv_event_t *e)
+{
+	lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
+
+	LV_UNUSED(e);
+	if (app_pid <= 0)
+		return;
+	if (d == LV_DIR_BOTTOM) {
+		if (!app_bar_shown)
+			app_bar_set(true);
+		else
+			shade_set(true, true);
+	} else if (d == LV_DIR_TOP) {
+		if (shade_open) {
+			shade_set(false, true);
+			app_bar_set(true);	/* the timeout starts again */
+		} else {
+			app_bar_set(false);
+		}
+	}
+}
+
+static void app_bar_build(void)
+{
+	app_bar = lv_obj_create(lv_layer_top());
+	plain(app_bar);
+	lv_obj_set_size(app_bar, W, APP_BAR_H);
+	lv_obj_set_pos(app_bar, 0, -APP_BAR_H);
+	lv_obj_set_style_bg_color(app_bar, M.surface_c, 0);
+	lv_obj_set_style_bg_opa(app_bar, LV_OPA_COVER, 0);
+	lv_obj_set_style_radius(app_bar, 0, 0);
+	lv_obj_set_style_shadow_width(app_bar, 12, 0);
+	lv_obj_set_style_shadow_offset_y(app_bar, 2, 0);
+	lv_obj_set_style_shadow_opa(app_bar, LV_OPA_30, 0);
+	lv_obj_set_style_pad_hor(app_bar, 16, 0);
+	lv_obj_remove_flag(app_bar, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_add_event_cb(app_bar, app_bar_touch_cb, LV_EVENT_PRESSED, NULL);
+	lv_obj_add_event_cb(app_bar, app_bar_touch_cb, LV_EVENT_PRESSING, NULL);
+	lv_obj_add_event_cb(app_bar, app_bar_touch_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_remove_flag(app_bar, LV_OBJ_FLAG_GESTURE_BUBBLE);	/* its own */
+	app_bar_time = m3_label(app_bar, "", &lv_font_montserrat_14, M.on_surface);
+	lv_obj_align(app_bar_time, LV_ALIGN_LEFT_MID, 0, 0);
+	app_bar_batt = m3_label(app_bar, "", &lv_font_montserrat_14, M.on_surface_v);
+	lv_obj_align(app_bar_batt, LV_ALIGN_RIGHT_MID, 0, 0);
+	app_bar_icons = m3_label(app_bar, "", &lv_font_montserrat_14, M.on_surface_v);
+	lv_obj_align(app_bar_icons, LV_ALIGN_RIGHT_MID, -74, 0);
+	lv_obj_add_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
+	/* gestures on the bar, the shade and the scrim bubble up to here */
+	lv_obj_add_event_cb(lv_layer_top(), app_gesture_cb, LV_EVENT_GESTURE, NULL);
+}
+
+/* The bar shows what the home screen's bar shows (home_update). */
+static void app_bar_update(void)
+{
+	if (!app_bar)
+		return;
+	label_set_if_changed(app_bar_time, lv_label_get_text(status_time));
+	label_set_if_changed(app_bar_icons, lv_label_get_text(status_icons));
+	label_set_if_changed(app_bar_batt, lv_label_get_text(batt_lbl));
+}
+
+static bool in_obj(lv_obj_t *o, int x, int y)
+{
+	lv_area_t a;
+
+	if (!o || lv_obj_has_flag(o, LV_OBJ_FLAG_HIDDEN))
+		return false;
+	lv_obj_get_coords(o, &a);
+	return x >= a.x1 && x <= a.x2 && y >= a.y1 && y <= a.y2;
+}
+
+/* Does a touch that begins at (x, y) belong to the launcher? */
+static bool ui_wants_touch(int x, int y)
+{
+	if (app_pid <= 0 || lv_screen_active() != app_scr)
+		return true;
+	if (shade_open || y < APP_EDGE_H)
+		return true;
+	if (app_bar_shown && y < APP_BAR_H)
+		return true;
+	return in_obj(vol_hud, x, y);
+}
 
 /* The application is gone (or is being ended): back to the home screen. */
 static void app_closed(void)
 {
 	app_pid = 0;
+	shade_set(false, false);
+	app_bar_set(false);
+	if (app_bar) {
+		lv_anim_delete(app_bar, app_y);
+		lv_obj_set_y(app_bar, -APP_BAR_H);
+		lv_obj_add_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
+	}
+	lv_anim_delete(shade, app_y);
+	lv_obj_set_parent(scrim, home_scr);
+	lv_obj_set_parent(shade, home_scr);
 	if (app_timer) {
 		lv_timer_delete(app_timer);
 		app_timer = NULL;
@@ -2107,6 +2343,8 @@ static void app_launch_cb(lv_event_t *e)
 		/* LVGL draws its bottom layer under a screen that is not
 		 * opaque, and the theme has given that one a background */
 		lv_obj_remove_style_all(lv_layer_bottom());
+		lv_obj_add_event_cb(app_scr, app_gesture_cb, LV_EVENT_GESTURE, NULL);
+		app_bar_build();
 	}
 	tr_finish();
 	shade_set(false, false);
@@ -2115,11 +2353,16 @@ static void app_launch_cb(lv_event_t *e)
 		return;
 	if (!pid) {
 		setpgid(0, 0);		/* Home ends everything it starts */
+		if (rt_node[0])		/* its touch screen: the router's */
+			setenv("N72_TOUCH", rt_node, 1);
 		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
 		_exit(127);
 	}
 	setpgid(pid, pid);
 	app_pid = pid;
+	/* the shade comes down over the application from the top layer */
+	lv_obj_set_parent(scrim, lv_layer_top());
+	lv_obj_set_parent(shade, lv_layer_top());
 	mbx_gpu_set_transparent(true);
 	lv_screen_load(app_scr);
 	app_timer = lv_timer_create(app_poll, 200, NULL);
