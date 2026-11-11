@@ -597,10 +597,18 @@ static void app_shade_slide(bool open);
 static void app_bar_update(void);
 static lv_obj_t *vol_hud;
 
+static void ui_settle_all(void);
+
 static void go_home(void)
 {
 	if (locked)
 		return;		/* Home does not unlock */
+	/*
+	 * A shade drag, its settling or an app animation has a screen of its
+	 * own on display, which it deletes itself: end those first, or the
+	 * slide below would delete that screen as well.
+	 */
+	ui_settle_all();
 	if (app_end())
 		return;
 	tr_finish();
@@ -3042,6 +3050,19 @@ static void za_finish(void)
 		lv_anim_delete(&za, za_exec);
 		za_next();
 	}
+}
+
+/* Every animation of the launcher's own ends now (drags included). */
+static void ui_settle_all(void)
+{
+	if (sd.on) {			/* the finger is still on the shade */
+		sd.on = false;
+		sd.cand = 0;
+		sd_end(sd.y > -SHADE_H / 2);
+	}
+	sd_settle_now();
+	za_finish();
+	tr_finish();
 }
 
 /* Back to home (the application is gone, or going). */
