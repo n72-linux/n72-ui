@@ -598,6 +598,7 @@ static void app_bar_update(void);
 static lv_obj_t *vol_hud;
 
 static void ui_settle_all(void);
+static bool za_page_close(void);
 
 static void go_home(void)
 {
@@ -610,6 +611,8 @@ static void go_home(void)
 	 */
 	ui_settle_all();
 	if (app_end())
+		return;
+	if (za_page_close())
 		return;
 	tr_finish();
 	shade_set(false, false);
@@ -628,7 +631,7 @@ static void go_back(void)
 	lv_obj_t *prev;
 
 	if (nav_n <= 1) {
-		go_home();
+		go_home();	/* (with the card, for a page opened from a tile) */
 		return;
 	}
 	nav_n--;
@@ -739,7 +742,7 @@ static long pf_size(const lv_draw_buf_t *b)
  * FLING_GAP_MS of the last one throws 1.6x faster each time, up to 5x; a
  * slow flick, a pause or a change of direction starts again at 1x.
  */
-#define GLIDE_TAU_MS	325.0f	/* speed falls to 1/e in this time */
+#define GLIDE_TAU_MS	480.0f	/* speed falls to 1/e in this time (iOS ~500) */
 #define GLIDE_MIN_V	30.0f	/* px/s: slower than this is a stop */
 #define FLICK_WINDOW_US	80000	/* release velocity from this much of the drag */
 #define FLING_GAP_MS	700
@@ -914,6 +917,31 @@ static float ts_velocity(bool hor)
 	dt = (ts.t[i] - ts.t[j]) / 1e6f;
 	if (dt <= 0)
 		return 0;
+	{
+		/*
+		 * The slope of a least-squares line through the samples in the
+		 * window: two end points alone follow the touch controller's
+		 * jitter (reports every ~16 ms, a pixel or two off).
+		 */
+		double st = 0, sp = 0, stt = 0, stp = 0, n = 0;
+		int m = j;
+
+		for (;;) {
+			double t = (double)(ts.t[m] - ts.t[j]) / 1e6;
+			double pos = hor ? ts.x[m] : ts.y[m];
+
+			st += t;
+			sp += pos;
+			stt += t * t;
+			stp += t * pos;
+			n++;
+			if (m == i)
+				break;
+			m = (m + 1) % TS_N;
+		}
+		if (n >= 3 && n * stt - st * st > 1e-9)
+			return (float)((n * stp - st * sp) / (n * stt - st * st));
+	}
 	return (hor ? ts.x[i] - ts.x[j] : ts.y[i] - ts.y[j]) / dt;
 }
 
@@ -1457,7 +1485,10 @@ static lv_obj_t *m3_page(const char *title, lv_obj_t **scr_out)
 	lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_radius(body, 0, 0);
 	lv_obj_set_style_pad_hor(body, 12, 0);
-	lv_obj_set_style_pad_ver(body, 4, 0);
+	lv_obj_set_style_pad_top(body, 4, 0);
+	/* the last card ends as far above the bottom as the first starts
+	 * below the title (the bar's own margin included) */
+	lv_obj_set_style_pad_bottom(body, 20, 0);
 	lv_obj_set_style_pad_row(body, 8, 0);
 	lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_scroll_dir(body, LV_DIR_VER);
@@ -1467,10 +1498,17 @@ static lv_obj_t *m3_page(const char *title, lv_obj_t **scr_out)
 	return body;
 }
 
+static lv_obj_t *push_quiet_scr;	/* set: push() only records the page */
+static bool push_quiet;
+
 static void push(lv_obj_t *scr)
 {
 	if (nav_n < NAV_MAX)
 		nav[nav_n++] = scr;
+	if (push_quiet) {
+		push_quiet_scr = scr;	/* the card animation shows it */
+		return;
+	}
 	show(scr);
 }
 
@@ -1693,12 +1731,19 @@ static void kv_get(const char *text, const char *key, char *out, size_t len)
 }
 
 static char wifi_ssid[64];	/* connected network, "" if none */
+
+/* The radio is on: the card is there and not switched off (n72-wifi). */
+static bool wifi_powered(void)
+{
+	return access("/sys/class/net/wlan0", F_OK) == 0 &&
+	       access("/var/run/wifi.off", F_OK) != 0;
+}
 static bool wifi_up;
 static bool bt_powered;
 
 static void wifi_status_done(const char *out, void *ud)
 {
-	char st[32];
+	char st[32] = "";
 
 	LV_UNUSED(ud);
 	kv_get(out, "wpa_state", st, sizeof(st));
@@ -1823,7 +1868,8 @@ static void home_update(lv_timer_t *t)
 	snprintf(buf, sizeof(buf), "%s%s", wifi_up ? LV_SYMBOL_WIFI "  " : "",
 		 bt_powered ? LV_SYMBOL_BLUETOOTH : "");
 	label_set_if_changed(status_icons, buf);
-	label_set_if_changed(qs_wifi_sub, wifi_up ? wifi_ssid : "Not connected");
+	label_set_if_changed(qs_wifi_sub, !wifi_powered() ? "Off" :
+			     wifi_up ? wifi_ssid : "Not connected");
 	if (set_wifi_sub && lv_obj_is_valid(set_wifi_sub))
 		label_set_if_changed(set_wifi_sub, wifi_up ? wifi_ssid : "Not connected");
 	if (set_bt_sub && lv_obj_is_valid(set_bt_sub))
@@ -1831,7 +1877,7 @@ static void home_update(lv_timer_t *t)
 				     "Not installed" : bt_powered ? "On" : "Off");
 	label_set_if_changed(qs_bt_sub, !have_tool("/usr/bin/bluetoothctl") ? "Unavailable" :
 			     bt_powered ? "On" : "Off");
-	qs_style(qs_wifi, wifi_up);
+	qs_style(qs_wifi, wifi_powered());
 	qs_style(qs_bt, bt_powered);
 	app_bar_update();
 }
@@ -1896,7 +1942,7 @@ static void app_tile(lv_obj_t *parent, const char *icon, const char *name,
 	lv_obj_add_event_cb(t, cb, LV_EVENT_CLICKED, NULL);
 }
 
-static lv_obj_t *home_bright, *shade, *scrim;
+static lv_obj_t *home_bright, *shade, *scrim, *qs_settings_btn;
 static bool shade_open;
 
 /* Screen back on: bring the clock up to date now, not at the next run. */
@@ -1978,21 +2024,56 @@ static void shade_tap_cb(lv_event_t *e)
 	shade_set(lv_event_get_user_data(e) != NULL, true);
 }
 
-/* Tiles in the shade open their page, closing the shade behind them. */
+/*
+ * The tiles are switches: Wi-Fi disconnects or reconnects (wpa_supplicant
+ * keeps the network; the radio stays up), Bluetooth powers the controller
+ * off or on as its page does. The tile changes at once; the real state
+ * follows from the status read a moment later.
+ */
+static void bt_set(bool on);
+
+static void qs_refresh_done(const char *out, void *ud)
+{
+	LV_UNUSED(out);
+	LV_UNUSED(ud);
+	status_refresh(true);
+	home_update(NULL);
+}
+
 static void qs_open_wifi(lv_event_t *e)
 {
-	if (app_pid > 0)
-		return;		/* over an application the tiles only show state */
-	shade_set(false, false);
-	open_wifi(e);
+	bool on = !wifi_powered();
+
+	LV_UNUSED(e);
+	if (!have_tool("/usr/sbin/n72-wifi"))
+		return;
+	qs_style(qs_wifi, on);
+	label_set_if_changed(qs_wifi_sub, on ? "Turning on..." : "Off");
+	/* (on: the card's power-up and firmware take a few seconds) */
+	job_run(on ? "n72-wifi on; sleep 4" : "n72-wifi off", NULL, qs_refresh_done, NULL);
 }
 
 static void qs_open_bt(lv_event_t *e)
 {
-	if (app_pid > 0)
+	LV_UNUSED(e);
+	if (!have_tool("/usr/bin/bluetoothctl"))
+		return;
+	bt_set(!bt_powered);
+	qs_style(qs_bt, !bt_powered);
+	label_set_if_changed(qs_bt_sub, !bt_powered ? "Turning on..." : "Off");
+}
+
+static void page_open_from(lv_obj_t *tile, void (*open)(lv_event_t *));
+static lv_obj_t *settings_tile;
+
+/* The gear at the top right of the shade: Settings, from its home tile. */
+static void qs_settings_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	if (app_pid > 0 || !settings_tile)
 		return;
 	shade_set(false, false);
-	open_bt(e);
+	page_open_from(settings_tile, open_settings);
 }
 
 static void build_shade(void)
@@ -2028,6 +2109,19 @@ static void build_shade(void)
 
 	clock_lbl = m3_label(shade, "", &lv_font_montserrat_48, M.on_surface);
 	lv_obj_align(clock_lbl, LV_ALIGN_TOP_LEFT, 20, 24);
+	{
+		/* Settings: a round tonal button at the top right */
+		lv_obj_t *b = lv_button_create(shade);
+
+		plain(b);
+		lv_obj_set_size(b, 48, 48);
+		lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
+		lv_obj_set_style_bg_color(b, M.surface_c_highest, 0);
+		lv_obj_align(b, LV_ALIGN_TOP_RIGHT, -16, 30);
+		lv_obj_add_event_cb(b, qs_settings_cb, LV_EVENT_CLICKED, NULL);
+		lv_obj_center(m3_label(b, LV_SYMBOL_SETTINGS, &lv_font_montserrat_20, M.on_surface));
+		qs_settings_btn = b;
+	}
 	date_lbl = m3_label(shade, "", &lv_font_montserrat_16, M.primary);
 	lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, 22, 84);
 
@@ -2915,6 +3009,9 @@ static struct {
 	lv_area_t icon;
 	lv_color_t col;
 	lv_timer_t *kill_timer;
+	bool page;		/* the launcher's own page (Settings, Paint) */
+	lv_obj_t *page_scr, *page_tile;
+	lv_draw_buf_t *page_pic;
 } za;
 
 static void za_next(void);
@@ -2969,6 +3066,8 @@ static void za_exec(void *var, int32_t v)
 		break;
 	case 3:
 	case 4:
+	case 6:
+	case 7:
 		lv_obj_set_style_opa(za.card, (lv_opa_t)v, 0);
 		break;
 	}
@@ -3034,6 +3133,36 @@ static void za_next(void)
 {
 	if (getenv("N72_FPS"))
 		fprintf(stderr, "za: phase %d ends at %u ms\n", za.phase, (unsigned)lv_tick_get());
+	if (za.page) {
+		switch (za.phase) {
+		case 1:		/* grown: the card fades off the page's picture */
+			lv_image_set_src(za.bg, za.page_pic);
+			lv_obj_set_style_radius(za.card, 0, 0);
+			za_run(6, LV_OPA_COVER, LV_OPA_TRANSP, ZA_FADE_MS, lv_anim_path_ease_in);
+			return;
+		case 6:
+			za.phase = 0;
+			za.page = false;
+			lv_screen_load(za.page_scr);
+			za_free();
+			tr_free(&za.page_pic);
+			return;
+		case 7:		/* covered: into the icon over home */
+			lv_image_set_src(za.bg, za.home);
+			za_run(5, 1024, 0, ZA_SHRINK_MS, lv_anim_path_ease_out);
+			return;
+		case 5:
+			za.phase = 0;
+			za.page = false;
+			lv_screen_load(home_scr);
+			while (nav_n > 0)
+				lv_obj_delete_async(nav[--nav_n]);
+			za_free();
+			tr_free(&za.page_pic);
+			home_update(NULL);
+			return;
+		}
+	}
 	switch (za.phase) {
 	case 1:			/* grown: hold while the application starts */
 		lv_obj_add_flag(za.bg, LV_OBJ_FLAG_HIDDEN);
@@ -3088,6 +3217,98 @@ static void ui_settle_all(void)
 	tr_finish();
 }
 
+/*
+ * The launcher's own pages open the same way: the page is built (quietly:
+ * push() only records it) and pictured first, the card grows from the
+ * tile, then fades off the page's picture, and the page takes over. Home,
+ * or Back from the first page, runs it backwards (za_page_close).
+ */
+static void page_open_from(lv_obj_t *tile, void (*open)(lv_event_t *))
+{
+	if (za.phase || app_pid > 0 || lv_screen_active() != home_scr)
+		return;
+	tr_finish();
+	shade_set(false, false);
+	push_quiet = true;
+	push_quiet_scr = NULL;
+	open(NULL);
+	push_quiet = false;
+	if (!push_quiet_scr)
+		return;
+	za.page_scr = push_quiet_scr;
+	tr_free(&za.page_pic);
+	za.page_pic = snap(za.page_scr, LV_COLOR_FORMAT_XRGB8888);
+	za.tile = za.page_tile = tile;
+	tr_free(&za.home);
+	za.home = grab_or_snap(home_scr);
+	za.home_min = bp_minute();
+	if (!za.page_pic || !za.home) {
+		lv_screen_load(za.page_scr);	/* no memory for pictures: no animation */
+		return;
+	}
+	za.page = true;
+	za_build();
+	lv_screen_load(za.scr);
+	za_run(1, 0, 1024, ZA_GROW_MS, lv_anim_path_ease_out);
+}
+
+static void page_launch_cb(lv_event_t *e)
+{
+	lv_obj_t *t = lv_event_get_current_target(e);
+	static lv_style_t none;
+	uint32_t i;
+
+	/* the tile back to rest at once (its transition would be pictured) */
+	lv_style_init(&none);
+	lv_obj_remove_state(t, LV_STATE_PRESSED);
+	for (i = 0; i <= lv_obj_get_child_count(t); i++) {
+		lv_obj_t *o = i ? lv_obj_get_child(t, i - 1) : t;
+
+		lv_obj_add_style(o, &none, 0);
+		lv_obj_remove_style(o, &none, 0);
+	}
+	page_open_from(t, (void (*)(lv_event_t *))lv_event_get_user_data(e));
+}
+
+/* The tile just added to @parent opens @open's page with the card. */
+static lv_obj_t *page_tile_anim(lv_obj_t *parent, void (*open)(lv_event_t *))
+{
+	lv_obj_t *t = lv_obj_get_child(parent, lv_obj_get_child_count(parent) - 1);
+
+	lv_obj_remove_event_cb(t, open);
+	lv_obj_add_event_cb(t, page_launch_cb, LV_EVENT_CLICKED, (void *)open);
+	return t;
+}
+
+/* Home (or Back from the first page) on a page opened from a tile. */
+static bool za_page_close(void)
+{
+	lv_obj_t *cur = lv_screen_active();
+
+	if (za.phase || !za.page_tile || nav_n < 1 || cur == home_scr || locked)
+		return false;
+	tr_finish();
+	cur = lv_screen_active();
+	tr_free(&za.page_pic);
+	za.page_pic = grab_or_snap(cur);
+	if (!za.home || za.home_min != bp_minute()) {
+		tr_free(&za.home);
+		za.home = snap(home_scr, LV_COLOR_FORMAT_XRGB8888);
+		za.home_min = bp_minute();
+	}
+	if (!za.page_pic || !za.home)
+		return false;
+	za.tile = za.page_tile;
+	za.page = true;
+	za_build();
+	lv_image_set_src(za.bg, za.page_pic);
+	za_rect(1024);
+	lv_obj_set_style_radius(za.card, 0, 0);
+	lv_screen_load(za.scr);
+	za_run(7, LV_OPA_TRANSP, LV_OPA_COVER, ZA_FADE_MS, lv_anim_path_ease_out);
+	return true;
+}
+
 /* Back to home (the application is gone, or going). */
 static void app_home_ui(void)
 {
@@ -3101,6 +3322,8 @@ static void app_home_ui(void)
 	lv_anim_delete(shade, app_y);
 	lv_obj_set_parent(scrim, home_scr);
 	lv_obj_set_parent(shade, home_scr);
+	if (qs_settings_btn)
+		lv_obj_remove_flag(qs_settings_btn, LV_OBJ_FLAG_HIDDEN);
 	mbx_gpu_set_transparent(false);
 	if (lv_screen_active() != home_scr && !locked)
 		lv_screen_load(home_scr);
@@ -3244,9 +3467,12 @@ static void app_launch_cb(lv_event_t *e)
 	}
 	setpgid(pid, pid);
 	app_pid = pid;
-	/* the shade comes down over the application from the top layer */
+	/* the shade comes down over the application from the top layer;
+	 * its Settings button opens a page of the launcher: not over an app */
 	lv_obj_set_parent(scrim, lv_layer_top());
 	lv_obj_set_parent(shade, lv_layer_top());
+	if (qs_settings_btn)
+		lv_obj_add_flag(qs_settings_btn, LV_OBJ_FLAG_HIDDEN);
 	app_timer = lv_timer_create(app_poll, 200, NULL);
 
 	za_build();
@@ -3346,6 +3572,9 @@ static void build_home(void)
 	lv_obj_add_event_cb(bar, shade_tap_cb, LV_EVENT_CLICKED, (void *)1);
 	status_time = m3_label(bar, "", &lv_font_montserrat_14, M.on_surface);
 	lv_obj_align(status_time, LV_ALIGN_LEFT_MID, 0, 0);
+	/* the card below shows the time: the bar on home does not (the
+	 * label stays, hidden: the bar over applications copies it) */
+	lv_obj_add_flag(status_time, LV_OBJ_FLAG_HIDDEN);
 	batt_lbl = m3_label(bar, "", &lv_font_montserrat_14, M.on_surface_v);
 	lv_obj_align(batt_lbl, LV_ALIGN_RIGHT_MID, 0, 0);
 	status_icons = m3_label(bar, "", &lv_font_montserrat_14, M.on_surface_v);
@@ -3368,13 +3597,7 @@ static void build_home(void)
 		lv_obj_align(home_clock, LV_ALIGN_TOP_LEFT, 18, 12);
 		home_date = m3_label(c, "", &lv_font_montserrat_16, M.primary);
 		lv_obj_align(home_date, LV_ALIGN_BOTTOM_LEFT, 20, -14);
-		home_batt = m3_label(c, "", &lv_font_montserrat_16, M.on_surface);
-		lv_obj_align(home_batt, LV_ALIGN_TOP_RIGHT, -18, 20);
-		home_net = m3_label(c, "", &lv_font_montserrat_12, M.on_surface_v);
-		lv_obj_set_width(home_net, 110);
-		lv_obj_set_style_text_align(home_net, LV_TEXT_ALIGN_RIGHT, 0);
-		lv_label_set_long_mode(home_net, LV_LABEL_LONG_DOT);
-		lv_obj_align(home_net, LV_ALIGN_TOP_RIGHT, -18, 46);
+		/* (the right side is left for weather) */
 	}
 
 	/* apps: a launcher grid, four to a row, the whole width */
@@ -3390,7 +3613,9 @@ static void build_home(void)
 	lv_obj_set_flex_flow(apps, LV_FLEX_FLOW_ROW_WRAP);
 	lv_obj_set_flex_align(apps, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 	app_tile(apps, LV_SYMBOL_SETTINGS, "Settings", M.primary_c, M.on_primary_c, open_settings);
+	settings_tile = page_tile_anim(apps, open_settings);
 	app_tile(apps, LV_SYMBOL_EDIT, "Paint", M.tertiary_c, M.on_tertiary_c, open_paint);
+	page_tile_anim(apps, open_paint);
 	app_tiles(apps);
 
 	build_shade();
@@ -3846,6 +4071,11 @@ static void bt_page_refresh(void)
 			"echo -n serial0-0 > " BT_SERDEV "/bind; n=0; " \
 			"until bluetoothctl show 2>/dev/null | grep -q Powered || [ $n -ge 20 ]; " \
 			"do sleep 0.5; n=$((n+1)); done; bluetoothctl power on"
+
+static void bt_set(bool on)
+{
+	job_run(on ? BT_ON_CMD : BT_OFF_CMD, NULL, qs_refresh_done, NULL);
+}
 
 static void bt_switch_cb(lv_event_t *e)
 {

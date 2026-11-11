@@ -1306,6 +1306,8 @@ int main(int argc, char **argv)
 				if (mbx_gpu_on_shell_layer() &&
 				    rt_init(touch_wait_fd, cal, swap)) {
 					lv_indev_set_read_cb(indev, rt_read_cb);
+					/* a page follows the finger after 6 px, not 10 */
+					lv_indev_set_scroll_limit(indev, 6);
 					lv_timer_set_cb(lv_indev_get_read_timer(indev), rt_timer_cb);
 				}
 			}
