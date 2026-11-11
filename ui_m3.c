@@ -2920,6 +2920,29 @@ static struct {
 static void za_next(void);
 static void app_home_ui(void);
 
+/*
+ * Layer 0 shows the console's frame buffer until the application puts up
+ * its first frame, and the fade does not wait for that: the console, or
+ * the last picture of an application that drew into it, flashed through.
+ * Filled with the card's colour, a slow start just looks like the card.
+ */
+static void za_fill_layer0(lv_color_t c)
+{
+	int fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+	size_t len = (size_t)W * H * 4;
+	uint32_t *p, v = 0xff000000u | lv_color_to_u32(c);
+
+	if (fd < 0)
+		return;
+	p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (p != MAP_FAILED) {
+		for (size_t i = 0; i < len / 4; i++)
+			p[i] = v;
+		munmap(p, len);
+	}
+	close(fd);
+}
+
 static void za_rect(int32_t v)	/* 0 = the icon, 1024 = the screen */
 {
 	int32_t x1 = za.icon.x1 + (0 - za.icon.x1) * v / 1024;
@@ -3206,6 +3229,7 @@ static void app_launch_cb(lv_event_t *e)
 	za.home = grab_or_snap(home_scr);
 	za.home_min = bp_minute();
 
+	za_fill_layer0(lv_obj_get_style_bg_color(lv_obj_get_child(za.tile, 0), 0));
 	pid = fork();
 	if (pid < 0)
 		return;

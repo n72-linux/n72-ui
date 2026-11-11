@@ -40,6 +40,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/klog.h>
 #include <sys/socket.h>
 #include <sys/reboot.h>

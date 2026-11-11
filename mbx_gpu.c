@@ -1394,6 +1394,21 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 		long n = frame_no + 1;
 		int k = n % HIST;
 
+		if (!transparent && getenv("N72_ALPHACHECK")) {
+			/* (debug) an opaque frame must be alpha 255 everywhere */
+			uint32_t x, y, bad = 0, fx = 0, fy = 0;
+
+			for (y = 0; y < fb.height; y++)
+				for (x = 0; x < fb.width; x++)
+					if ((((uint32_t *)(px_map + y * fb.stride))[x] >> 24) != 255 && !bad++) {
+						fx = x;
+						fy = y;
+					}
+			if (bad)
+				fprintf(stderr, "alpha: frame %ld has %u non-opaque pixels, first at %u,%u\n",
+					n, bad, fx, fy);
+		}
+
 		gpu_wait(last_seq);		/* the GPU's part of the frame is done */
 		last_seq = 0;
 		memcpy(hist[k].a, cur_areas, sizeof(cur_areas));
