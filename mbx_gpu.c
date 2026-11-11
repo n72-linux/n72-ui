@@ -319,9 +319,6 @@ static void buf_clean(const lv_draw_buf_t *b, const lv_area_t *a)
 
 /* --------------------------------------------------- the draw unit */
 
-/* user_data of the fill tasks mbx_gpu_clear() makes: zeros, not a colour */
-static const char clear_tag;
-
 static bool cf_ok(lv_color_format_t cf)
 {
 	return cf == LV_COLOR_FORMAT_XRGB8888 || cf == LV_COLOR_FORMAT_ARGB8888;
@@ -405,10 +402,9 @@ static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 		 * areas are worth it. Opaque fills use the 2D engine, translucent
 		 * ones the 3D core (XRGB8888 targets only).
 		 */
-		if (d->base.user_data != &clear_tag &&
-		    (d->opa >= LV_OPA_MAX ? size < 16384 : size < 8192 ||
-		     dcf != LV_COLOR_FORMAT_XRGB8888))
-			return 0;	/* (a clear is the GPU's whatever its size) */
+		if (d->opa >= LV_OPA_MAX ? size < 16384 : size < 8192 ||
+		    dcf != LV_COLOR_FORMAT_XRGB8888)
+			return 0;
 	} else if (t->type == LV_DRAW_TASK_TYPE_LAYER) {
 		const lv_draw_image_dsc_t *d = t->draw_dsc;
 
@@ -606,18 +602,6 @@ static void mbx_fill(lv_draw_unit_t *u, lv_draw_task_t *t)
 
 	if (!lv_area_intersect(&a, c, clip))
 		return;
-	if (d->base.user_data == &clear_tag) {
-		uint32_t w[32];
-
-		if (!in_pool(b->data))
-			return;
-		lv_area_move(&a, -layer->buf_area.x1, -layer->buf_area.y1);
-		rect_flush();
-		buf_invalidate(b, &a);		/* drop CPU lines over the area */
-		submit(w, put_fill(w, gpu_addr(b->data), b->header.stride, 0, a.x1, a.y1,
-				   lv_area_get_width(&a), lv_area_get_height(&a)));
-		return;
-	}
 	if (!in_pool(b->data)) {
 		lv_draw_sw_fill(u, d, c);
 		return;
@@ -1393,8 +1377,13 @@ static void render_start_cb(lv_event_t *e)
 	cur_all = false;
 }
 
+static bool transparent;
+static void premultiply(uint8_t *px_map, const lv_area_t *a);
+
 static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
+	if (transparent)
+		premultiply(px_map, area);
 	/* what the CPU drew in this area goes out to memory for the display */
 	clean_rows(px_map, area);
 	if (cur_n < HIST_AREAS)
@@ -1833,24 +1822,52 @@ bool mbx_gpu_on_shell_layer(void)
 	return kms_fd >= 0 && kms_shell;
 }
 
-void mbx_gpu_clear(lv_layer_t *layer, const lv_area_t *area)
-{
-	lv_draw_rect_dsc_t d;
+/*
+ * Transparent mode, for what the launcher shows over an application. The
+ * display is rendered as ARGB8888: LVGL then clears every area it redraws
+ * and its software renderer keeps the alpha of what it draws (edges,
+ * shadows, fading), where the usual XRGB8888 rendering would leave an
+ * opaque box around every rounded or shadowed thing. The GPU paths want an
+ * opaque target and step aside, so everything is the CPU's: fine for a bar
+ * or a pop-up. Each finished area is then turned from LVGL's straight
+ * alpha into the premultiplied alpha the display's layer 1 blends
+ * (flush_flip).
+ */
+static bool transparent;
 
-	if (mbx < 0)
+void mbx_gpu_set_transparent(bool on)
+{
+	if (on == transparent || !mbx_gpu_on_shell_layer())
 		return;
-	/*
-	 * A fill task like any other, so that it runs in its turn among the
-	 * layer's tasks (done at once it came before the fills queued ahead
-	 * of it, which then painted over the zeros); mbx_fill() knows it by
-	 * the tag.
-	 */
-	lv_draw_rect_dsc_init(&d);
-	d.bg_color = lv_color_black();
-	d.bg_opa = LV_OPA_COVER;
-	d.base.layer = layer;
-	d.base.user_data = (void *)&clear_tag;
-	lv_draw_rect(layer, &d, area);
+	transparent = on;
+	lv_display_set_color_format(lv_display_get_default(),
+				    on ? LV_COLOR_FORMAT_ARGB8888 : LV_COLOR_FORMAT_XRGB8888);
+}
+
+/* Straight alpha to premultiplied; nothing but zeros where alpha is 0. */
+static void premultiply(uint8_t *px_map, const lv_area_t *a)
+{
+	int32_t x, y, w = lv_area_get_width(a);
+
+	for (y = a->y1; y <= a->y2; y++) {
+		uint32_t *p = (uint32_t *)(px_map + y * fb.stride) + a->x1;
+
+		for (x = 0; x < w; x++) {
+			uint32_t v = p[x], al = v >> 24;
+
+			if (al == 255)
+				continue;
+			if (!al) {
+				if (v)
+					p[x] = 0;
+				continue;
+			}
+			p[x] = al << 24 |
+			       (((v >> 16 & 255) * al + 127) / 255) << 16 |
+			       (((v >> 8 & 255) * al + 127) / 255) << 8 |
+			       ((v & 255) * al + 127) / 255;
+		}
+	}
 }
 
 /* The pixels on screen now (stride fb.stride), for screenshots. */

@@ -2033,10 +2033,10 @@ static void build_shade(void)
  * An application is a program of its own that draws on the display's
  * layer 0: as the master of KMS device n72-clcd, or through the frame
  * buffer. The launcher has layer 1 above it (mbx_gpu.c, kms_open) and,
- * while the application runs, shows a screen that is zeros, hence
- * transparent, wherever it has nothing to draw. So the application never
- * needs the screen handed to it, and whatever the launcher puts on that
- * screen lies over it.
+ * while the application runs, renders with alpha (mbx_gpu_set_transparent)
+ * a screen with nothing on it. So the application never needs the screen
+ * handed to it, and whatever the launcher shows then, the volume pop-up
+ * for one, lies over it with its own edges and shadow.
  *
  * Home ends the application; so does its own exit. Input still goes to
  * both for now (they read the same event devices).
@@ -2050,14 +2050,6 @@ static lv_obj_t *app_scr;
 static pid_t app_pid;
 static lv_timer_t *app_timer;
 
-static void app_clear_cb(lv_event_t *e)
-{
-	lv_area_t a;
-
-	lv_obj_get_coords(lv_event_get_target(e), &a);
-	mbx_gpu_clear(lv_event_get_layer(e), &a);
-}
-
 /* The application is gone (or is being ended): back to the home screen. */
 static void app_closed(void)
 {
@@ -2066,8 +2058,10 @@ static void app_closed(void)
 		lv_timer_delete(app_timer);
 		app_timer = NULL;
 	}
+	mbx_gpu_set_transparent(false);
 	if (lv_screen_active() == app_scr)
 		lv_screen_load(home_scr);
+	lv_obj_invalidate(lv_layer_top());
 	home_update(NULL);
 }
 
@@ -2106,16 +2100,13 @@ static void app_launch_cb(lv_event_t *e)
 	if (app_pid > 0 || !mbx_gpu_on_shell_layer())
 		return;
 	if (!app_scr) {
-		lv_obj_t *clear;
-
+		/* nothing on it: transparent, the application shows */
 		app_scr = lv_obj_create(NULL);
 		lv_obj_remove_style_all(app_scr);
 		lv_obj_remove_flag(app_scr, LV_OBJ_FLAG_SCROLLABLE);
-		clear = lv_obj_create(app_scr);
-		lv_obj_remove_style_all(clear);
-		lv_obj_set_size(clear, W, H);
-		lv_obj_remove_flag(clear, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_add_event_cb(clear, app_clear_cb, LV_EVENT_DRAW_MAIN, NULL);
+		/* LVGL draws its bottom layer under a screen that is not
+		 * opaque, and the theme has given that one a background */
+		lv_obj_remove_style_all(lv_layer_bottom());
 	}
 	tr_finish();
 	shade_set(false, false);
@@ -2129,6 +2120,7 @@ static void app_launch_cb(lv_event_t *e)
 	}
 	setpgid(pid, pid);
 	app_pid = pid;
+	mbx_gpu_set_transparent(true);
 	lv_screen_load(app_scr);
 	app_timer = lv_timer_create(app_poll, 200, NULL);
 }
