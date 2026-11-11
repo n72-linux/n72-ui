@@ -1849,6 +1849,11 @@ static void premultiply(uint8_t *px_map, const lv_area_t *a)
 {
 	int32_t x, y, w = lv_area_get_width(a);
 
+	/* c * a / 255 rounded, without a division; runs of one colour (fills)
+	 * reuse the last result */
+#define MUL255(c, al) ({ uint32_t t_ = (c) * (al) + 128; (t_ + (t_ >> 8)) >> 8; })
+	uint32_t last_in = 0, last_out = 0;
+
 	for (y = a->y1; y <= a->y2; y++) {
 		uint32_t *p = (uint32_t *)(px_map + y * fb.stride) + a->x1;
 
@@ -1862,12 +1867,15 @@ static void premultiply(uint8_t *px_map, const lv_area_t *a)
 					p[x] = 0;
 				continue;
 			}
-			p[x] = al << 24 |
-			       (((v >> 16 & 255) * al + 127) / 255) << 16 |
-			       (((v >> 8 & 255) * al + 127) / 255) << 8 |
-			       ((v & 255) * al + 127) / 255;
+			if (v != last_in) {
+				last_in = v;
+				last_out = al << 24 | MUL255(v >> 16 & 255, al) << 16 |
+					   MUL255(v >> 8 & 255, al) << 8 | MUL255(v & 255, al);
+			}
+			p[x] = last_out;
 		}
 	}
+#undef MUL255
 }
 
 /* The pixels on screen now (stride fb.stride), for screenshots. */

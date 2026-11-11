@@ -10,6 +10,28 @@ A touch launcher for Linux on the iPod touch 2G (N72AP), built on
 - Buttons: Home returns to the launcher (the demos restart the process),
   Power turns the backlight off and on, the volume keys change the brightness.
 
+## Gestures and animations (frame rates measured on the device)
+
+| What | How it is drawn | fps |
+| --- | --- | --- |
+| Quick settings follow the finger on home (open / close) | pictures of home and the shade moved by the GPU; home and scrim drawn only below the shade | 53-61 |
+| ... over an application | the shade's picture moved by the CPU (alpha); the dim is added once it settles | 61-69 |
+| App opens: a card in the tile's colour grows from the icon | home picture + rounded GPU fill | 55-57 |
+| ... then fades to show the application | CPU, alpha | ~50 |
+| App closes (Home or its own exit): card fades in, shrinks into the icon | CPU fade, then GPU | ~50 / 56 |
+| Lock screen swipe up (home or over an application) | the lock screen's picture follows the finger, a scrim fades | ~63 |
+
+- The touch router (`main.c`) offers each launcher touch to `ui_drag()`; a
+  vertical drag past 12 px where the shade (or the lock screen) can move is
+  taken from LVGL, which loses the press without a click. The release
+  settles by position and speed.
+- The lock screen goes up whenever the screen goes off; its clock is
+  Montserrat SemiBold at 88 px through LVGL's tiny_ttf (`clock_font.h`, SIL
+  Open Font License 1.1, from LVGL's demos).
+- Manifests may set `icon=` (video, image, music, gears, file, list, ...) and
+  `color=#rrggbb` for the tile.
+- `N72_FPS=1` logs every burst of frames and the animation phases.
+
 ## GPU
 
 When `/dev/mbx` exists (the PowerVR MBX Lite driver in the n72 kernel), n72-ui

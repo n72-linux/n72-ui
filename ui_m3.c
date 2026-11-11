@@ -589,6 +589,9 @@ static void shade_set(bool open, bool anim);
 
 static bool app_end(void);
 static lv_obj_t *app_scr;	/* the empty screen over a running application */
+static bool locked;		/* the lock screen is up */
+static void lock_wake(void);
+static void za_finish(void);
 static pid_t app_pid;
 static void app_shade_slide(bool open);
 static void app_bar_update(void);
@@ -596,6 +599,8 @@ static lv_obj_t *vol_hud;
 
 static void go_home(void)
 {
+	if (locked)
+		return;		/* Home does not unlock */
 	if (app_end())
 		return;
 	tr_finish();
@@ -1717,6 +1722,7 @@ static void status_refresh(bool with_bt)
 /* ------------------------------------------------------------- home */
 
 static lv_obj_t *clock_lbl, *date_lbl, *batt_lbl, *status_icons, *status_time;
+static lv_obj_t *home_clock, *home_date, *home_batt, *home_net;	/* the widget */
 static lv_obj_t *qs_wifi_sub, *qs_bt_sub, *qs_wifi, *qs_bt;
 static lv_obj_t *set_wifi_sub, *set_bt_sub;	/* on the Settings page */
 
@@ -1786,8 +1792,26 @@ static void home_update(lv_timer_t *t)
 		snprintf(buf, sizeof(buf), "%s, %d %s", days[tm.tm_wday],
 			 tm.tm_mday, months[tm.tm_mon]);
 	label_set_if_changed(date_lbl, buf);
+	if (home_date) {
+		char d[32];
+
+		if (tm.tm_year + 1900 < 2024)
+			snprintf(d, sizeof(d), "Clock not set");
+		else
+			snprintf(d, sizeof(d), "%.3s %d %.3s", days[tm.tm_wday], tm.tm_mday,
+				 months[tm.tm_mon]);
+		label_set_if_changed(home_date, d);
+	}
+	if (home_clock) {
+		snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
+		label_set_if_changed(home_clock, buf);
+	}
 	battery_text(buf, sizeof(buf));
 	label_set_if_changed(batt_lbl, buf);
+	if (home_batt)
+		label_set_if_changed(home_batt, buf);
+	if (home_net)
+		label_set_if_changed(home_net, wifi_up ? wifi_ssid : "Wi-Fi off");
 	snprintf(buf, sizeof(buf), "%s%s", wifi_up ? LV_SYMBOL_WIFI "  " : "",
 		 bt_powered ? LV_SYMBOL_BLUETOOTH : "");
 	label_set_if_changed(status_icons, buf);
@@ -1872,6 +1896,7 @@ static void home_wake(void)
 {
 	if (home_timer)
 		lv_timer_ready(home_timer);
+	lock_wake();
 }
 
 static void home_bright_cb(lv_event_t *e)
@@ -2267,7 +2292,7 @@ static bool in_obj(lv_obj_t *o, int x, int y)
 /* Does a touch that begins at (x, y) belong to the launcher? */
 static bool ui_wants_touch(int x, int y)
 {
-	if (app_pid <= 0 || lv_screen_active() != app_scr)
+	if (locked || app_pid <= 0 || lv_screen_active() != app_scr)
 		return true;
 	if (shade_open || y < APP_EDGE_H)
 		return true;
@@ -2276,10 +2301,745 @@ static bool ui_wants_touch(int x, int y)
 	return in_obj(vol_hud, x, y);
 }
 
-/* The application is gone (or is being ended): back to the home screen. */
-static void app_closed(void)
+/*
+ * The shade follows the finger. The touch router (main.c) offers every
+ * launcher touch to ui_drag(); once a vertical drag passes SD_SLOP in a
+ * place where the shade can move, the drag is the launcher's: LVGL loses
+ * the press, and the shade sits under the finger until the lift, then
+ * settles open or closed by where it is and how fast it was moving.
+ *
+ * On the home screen the frames move two pictures (home, and the shade)
+ * with a scrim between them, as the shade's animation does: GPU copies.
+ * Over an application the shade and scrim themselves move (the launcher
+ * draws with the CPU there anyway).
+ */
+#define SD_SLOP 12
+
+static struct {
+	int8_t cand;		/* this touch may start a drag: +1 down (open), -1 up */
+	bool on, pics;
+	int px, py;		/* where the finger came down */
+	int32_t base, y;	/* the shade's y at the start, and now */
+	int last_y;
+	uint32_t last_t;
+	float v;		/* px per ms, smoothed */
+	lv_obj_t *scr, *bgclip, *bg, *scrim, *fg, *back;
+	lv_draw_buf_t *sbg, *sfg;
+} sd;
+
+static void sd_free_pics(void)
 {
-	app_pid = 0;
+	if (sd.scr) {
+		lv_obj_delete(sd.scr);
+		sd.scr = NULL;
+	}
+	tr_free(&sd.sbg);
+	tr_free(&sd.sfg);
+}
+
+static lv_opa_t sd_scrim_opa(int32_t y)
+{
+	return (lv_opa_t)(LV_OPA_50 * (y + SHADE_H) / SHADE_H);
+}
+
+static void sd_set(int32_t y)
+{
+	sd.y = LV_CLAMP(-SHADE_H, y, 0);
+	if (sd.pics) {
+		/* the scrim only where the shade does not cover (its corners
+		 * have the radius): less to blend, and to redraw */
+		int32_t top = LV_MAX(0, sd.y + SHADE_H - 28);
+
+		lv_obj_set_y(sd.fg, sd.y);
+		/* above top the shade hides home: draw home only below it */
+		if (sd.bgclip) {
+			lv_obj_set_pos(sd.bgclip, 0, top);
+			lv_obj_set_height(sd.bgclip, H - top);
+			lv_obj_set_y(sd.bg, -top);
+		}
+		lv_obj_set_pos(sd.scrim, 0, top);
+		lv_obj_set_height(sd.scrim, H - top);
+		lv_obj_set_style_bg_opa(sd.scrim, sd_scrim_opa(sd.y), 0);
+	} else {
+		lv_obj_set_y(shade, sd.y);
+		lv_obj_set_style_bg_opa(scrim, sd_scrim_opa(sd.y), 0);
+	}
+}
+
+static void sd_anim_exec(void *var, int32_t v)
+{
+	LV_UNUSED(var);
+	sd_set(v);
+}
+
+/* The shade has settled: the real objects take over from the pictures. */
+static void sd_end(bool open)
+{
+	if (sd.pics) {
+		lv_screen_load(sd.back);
+		sd_free_pics();
+		sd.pics = false;
+		lv_obj_remove_flag(shade, LV_OBJ_FLAG_HIDDEN);
+		if (app_bar && app_bar_shown)
+			lv_obj_remove_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
+	}
+	lv_obj_set_style_bg_opa(scrim, LV_OPA_50, 0);
+	shade_open = open;
+	lv_obj_set_y(shade, open ? 0 : -SHADE_H);
+	if (open) {
+		lv_obj_remove_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+		lv_slider_set_value(home_bright, backlight_get(), LV_ANIM_OFF);
+		home_wake();
+	} else {
+		shade_closed();
+		if (app_pid > 0)
+			app_bar_set(true);	/* the bar's timeout starts again */
+	}
+}
+
+static void sd_anim_done(lv_anim_t *a)
+{
+	sd_end(a->end_value == 0);
+}
+
+/* A settling shade is finished at once when a new touch comes. */
+static void sd_settle_now(void)
+{
+	lv_anim_t *a = lv_anim_get(&sd, sd_anim_exec);
+
+	if (a) {
+		int32_t end = a->end_value;
+
+		lv_anim_delete(&sd, sd_anim_exec);
+		sd_end(end == 0);
+	}
+}
+
+/* LVGL's press ends here without a click (the launcher's drag has it). */
+static void ui_touch_lost(void)
+{
+	lv_obj_t *a = touch_indev ? touch_indev->pointer.act_obj : NULL;
+
+	if (a) {
+		/* no transition back: the picture taken next must show it plain */
+		static const lv_style_prop_t none[] = { 0 };
+		static lv_style_transition_dsc_t no_tr;
+
+		lv_style_transition_dsc_init(&no_tr, none, NULL, 0, 0, NULL);
+		lv_obj_set_style_transition(a, &no_tr, 0);
+		lv_obj_remove_state(a, LV_STATE_PRESSED);
+		lv_obj_remove_local_style_prop(a, LV_STYLE_TRANSITION, 0);
+		lv_obj_send_event(a, LV_EVENT_PRESS_LOST, touch_indev);
+	}
+	lv_indev_reset(touch_indev, NULL);
+}
+
+static bool sd_begin(void)
+{
+	bool home = lv_screen_active() == home_scr;
+	lv_draw_buf_t *bg = NULL, *fg;
+
+	ui_touch_lost();
+	tr_finish();
+	sd.base = shade_open ? 0 : -SHADE_H;
+	sd.pics = false;
+	/*
+	 * Pictures: the shade by itself, and (on home) home without shade or
+	 * scrim. Over an application there is no picture below: the screen is
+	 * transparent, and moving one picture is much less for the CPU than
+	 * drawing the shade's widgets every frame.
+	 */
+	if (home) {
+		if (!shade_open) {
+			bg = grab_or_snap(home_scr);
+		} else {
+			lv_obj_add_flag(shade, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+			bg = snap(home_scr, LV_COLOR_FORMAT_XRGB8888);
+			lv_obj_remove_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+			lv_obj_remove_flag(shade, LV_OBJ_FLAG_HIDDEN);
+		}
+	}
+	lv_obj_set_y(shade, 0);
+	fg = snap(shade, LV_COLOR_FORMAT_ARGB8888);
+	lv_obj_set_y(shade, sd.base);
+	if (fg && (bg || !home)) {
+		sd.sbg = bg;
+		sd.sfg = fg;
+		sd.back = lv_screen_active();
+		sd.scr = lv_obj_create(NULL);
+		/* no background: the pictures cover everything (or nothing is
+		 * wanted: the application shows) */
+		lv_obj_remove_style_all(sd.scr);
+		lv_obj_remove_flag(sd.scr, LV_OBJ_FLAG_SCROLLABLE);
+		sd.bgclip = NULL;
+		if (bg) {
+			sd.bgclip = lv_obj_create(sd.scr);	/* clips the picture */
+			lv_obj_remove_style_all(sd.bgclip);
+			lv_obj_remove_flag(sd.bgclip, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+			lv_obj_set_width(sd.bgclip, W);
+			sd.bg = lv_image_create(sd.bgclip);
+			lv_image_set_src(sd.bg, bg);
+		}
+		sd.scrim = lv_obj_create(sd.scr);
+		plain(sd.scrim);
+		lv_obj_set_size(sd.scrim, W, H);
+		lv_obj_set_style_radius(sd.scrim, 0, 0);
+		lv_obj_set_style_bg_color(sd.scrim, lv_color_black(), 0);
+		/* over an application the dimming waits for the shade to settle:
+		 * blending it with the CPU every frame would halve the rate */
+		if (!bg)
+			lv_obj_add_flag(sd.scrim, LV_OBJ_FLAG_HIDDEN);
+		if (app_bar && !bg)
+			lv_obj_add_flag(app_bar, LV_OBJ_FLAG_HIDDEN);	/* not over the shade */
+		sd.fg = lv_image_create(sd.scr);
+		lv_image_set_src(sd.fg, fg);
+		/* the real ones (on the top layer over an application) hide */
+		lv_obj_add_flag(shade, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+		lv_screen_load(sd.scr);
+		sd.pics = true;
+	} else {
+		tr_free(&bg);
+		tr_free(&fg);
+	}
+	if (!sd.pics)
+		lv_obj_remove_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+	sd.on = true;
+	sd.v = 0;
+	sd_set(sd.base);
+	return true;
+}
+
+static void sd_release(void)
+{
+	bool open;
+	int32_t to, dist;
+	lv_anim_t a;
+
+	sd.on = false;
+	if (sd.v > 0.4f)
+		open = true;
+	else if (sd.v < -0.4f)
+		open = false;
+	else
+		open = sd.y > -SHADE_H / 2;
+	to = open ? 0 : -SHADE_H;
+	dist = LV_ABS(to - sd.y);
+	if (!dist) {
+		sd_end(open);
+		return;
+	}
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, &sd);
+	lv_anim_set_exec_cb(&a, sd_anim_exec);
+	lv_anim_set_values(&a, sd.y, to);
+	lv_anim_set_duration(&a, 60 + 180 * dist / SHADE_H);
+	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+	lv_anim_set_completed_cb(&a, sd_anim_done);
+	lv_anim_start(&a);
+}
+
+/* ------------------------------------------------------------ lock */
+
+/*
+ * The lock screen: date and a large clock, a hint and a home indicator.
+ * It goes up whenever the screen goes off (screen_set, screen_off_or_sleep),
+ * so waking shows it at once. A swipe up unlocks: the lock screen's picture
+ * follows the finger up, uncovering a picture of where you were (taken at
+ * wake, while nobody can touch yet) under a scrim that clears as it goes.
+ * Only the part not covered is drawn, so a frame is about one screen of
+ * GPU copies. Over an application the launcher draws with the CPU and
+ * alpha (nothing of it under the picture), as it does there anyway.
+ */
+#include "clock_font.h"
+
+static lv_obj_t *lock_scr, *lock_time, *lock_date, *lock_batt;
+static lv_obj_t *lock_from;		/* the screen the lock went over */
+static lv_font_t *clock_font;
+
+static struct {
+	bool on;
+	int py, last_y;
+	uint32_t last_t;
+	float v;
+	int32_t y;			/* the lock picture's y, -H..0 */
+	lv_obj_t *scr, *clip, *bg, *scrim, *fg;
+	lv_draw_buf_t *sbg, *sfg;	/* where you were; the lock screen */
+} ul;
+
+static void lock_update(void)
+{
+	time_t now = time(NULL);
+	struct tm tm;
+	char buf[48];
+	static const char *const days[] = { "Sunday", "Monday", "Tuesday",
+		"Wednesday", "Thursday", "Friday", "Saturday" };
+	static const char *const months[] = { "January", "February", "March",
+		"April", "May", "June", "July", "August", "September",
+		"October", "November", "December" };
+
+	if (!lock_scr)
+		return;
+	localtime_r(&now, &tm);
+	snprintf(buf, sizeof(buf), "%d:%02d", tm.tm_hour, tm.tm_min);
+	label_set_if_changed(lock_time, buf);
+	if (tm.tm_year + 1900 < 2024)
+		snprintf(buf, sizeof(buf), "Clock not set");
+	else
+		snprintf(buf, sizeof(buf), "%s, %d %s", days[tm.tm_wday], tm.tm_mday,
+			 months[tm.tm_mon]);
+	label_set_if_changed(lock_date, buf);
+	battery_text(buf, sizeof(buf));
+	label_set_if_changed(lock_batt, strstr(buf, LV_SYMBOL_CHARGE) ? buf : "");
+}
+
+static void lock_build(void)
+{
+	lv_obj_t *o;
+
+	if (!clock_font)
+		clock_font = lv_tiny_ttf_create_data(clock_ttf, clock_ttf_len, 88);
+	lock_scr = lv_obj_create(NULL);
+	m3_screen(lock_scr);
+	/* a dark wash of the accent colour, top to bottom */
+	lv_obj_set_style_bg_color(lock_scr, lv_color_mix(M.primary_c, lv_color_black(), 150), 0);
+	lv_obj_set_style_bg_grad_color(lock_scr, lv_color_black(), 0);
+	lv_obj_set_style_bg_grad_dir(lock_scr, LV_GRAD_DIR_VER, 0);
+
+	lock_date = m3_label(lock_scr, "", &lv_font_montserrat_20, lv_color_hex(0xe8e0f0));
+	lv_obj_align(lock_date, LV_ALIGN_TOP_MID, 0, 64);
+	lock_time = m3_label(lock_scr, "", clock_font ? clock_font : &lv_font_montserrat_48,
+			     lv_color_white());
+	lv_obj_align(lock_time, LV_ALIGN_TOP_MID, 0, 90);
+	lock_batt = m3_label(lock_scr, "", &lv_font_montserrat_14, lv_color_hex(0xc8c0d0));
+	lv_obj_align(lock_batt, LV_ALIGN_BOTTOM_MID, 0, -74);
+	o = m3_label(lock_scr, "Swipe up to unlock", &lv_font_montserrat_14, lv_color_hex(0xb0a8b8));
+	lv_obj_align(o, LV_ALIGN_BOTTOM_MID, 0, -36);
+	o = lv_obj_create(lock_scr);	/* home indicator */
+	plain(o);
+	lv_obj_set_size(o, 120, 5);
+	lv_obj_set_style_radius(o, 3, 0);
+	lv_obj_set_style_bg_color(o, lv_color_white(), 0);
+	lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+	lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_align(o, LV_ALIGN_BOTTOM_MID, 0, -12);
+}
+
+static void ul_free(void)
+{
+	if (ul.scr) {
+		lv_obj_delete(ul.scr);
+		ul.scr = NULL;
+	}
+	tr_free(&ul.sbg);
+	tr_free(&ul.sfg);
+}
+
+/* The screen goes off: the lock screen goes up (nothing is animated). */
+static void ui_lock(void)
+{
+	lv_obj_t *cur;
+
+	if (locked || !home_scr)
+		return;
+	za_finish();
+	sd_settle_now();
+	tr_finish();
+	if (shade_open)
+		sd_end(false);
+	app_bar_set(false);
+	if (!lock_scr)
+		lock_build();
+	cur = lv_screen_active();
+	lock_from = cur == lock_scr ? home_scr : cur;
+	lock_update();
+	if (app_pid > 0)
+		mbx_gpu_set_transparent(false);
+	lv_screen_load(lock_scr);
+	locked = true;
+	lv_refr_now(NULL);
+}
+
+/* Screen on: a fresh picture of where you were, for the swipe. */
+static void lock_wake(void)
+{
+	if (!locked)
+		return;
+	lock_update();
+	ul_free();
+	if (lock_from && lock_from != app_scr && lv_obj_is_valid(lock_from))
+		ul.sbg = snap(lock_from, LV_COLOR_FORMAT_XRGB8888);
+}
+
+static void ul_set(int32_t y)
+{
+	int32_t top;
+
+	ul.y = LV_CLAMP(-H, y, 0);
+	top = ul.y + H;
+	lv_obj_set_y(ul.fg, ul.y);
+	if (ul.clip) {
+		/* where you were shows only below the lock screen's picture */
+		lv_obj_set_pos(ul.clip, 0, top);
+		lv_obj_set_height(ul.clip, H - top);
+		lv_obj_set_y(ul.bg, -top);
+		lv_obj_set_pos(ul.scrim, 0, top);
+		lv_obj_set_height(ul.scrim, H - top);
+		lv_obj_set_style_bg_opa(ul.scrim, (lv_opa_t)(LV_OPA_60 * top / H), 0);
+	}
+}
+
+static void ul_exec(void *var, int32_t v)
+{
+	LV_UNUSED(var);
+	ul_set(v);
+}
+
+static void ul_finish(bool open)
+{
+	if (open) {
+		locked = false;
+		lv_screen_load(lock_from && lv_obj_is_valid(lock_from) ? lock_from : home_scr);
+		ul_free();
+		if (lock_from == app_scr && app_pid > 0)
+			mbx_gpu_set_transparent(true);
+		else
+			mbx_gpu_set_transparent(false);
+		home_update(NULL);
+	} else {
+		lv_screen_load(lock_scr);
+		lv_obj_delete(ul.scr);
+		ul.scr = NULL;
+		ul.clip = NULL;
+		tr_free(&ul.sfg);	/* (where you were stays for the next try) */
+		mbx_gpu_set_transparent(false);
+	}
+}
+
+static void ul_done(lv_anim_t *a)
+{
+	ul_finish(a->end_value == -H);
+}
+
+static void ul_begin(void)
+{
+	bool over_app = lock_from == app_scr && app_pid > 0;
+
+	ui_touch_lost();
+	ul.sfg = grab_or_snap(lock_scr);
+	if (!ul.sbg && !over_app && lock_from && lv_obj_is_valid(lock_from))
+		ul.sbg = snap(lock_from, LV_COLOR_FORMAT_XRGB8888);
+	ul.scr = lv_obj_create(NULL);
+	lv_obj_remove_style_all(ul.scr);
+	lv_obj_remove_flag(ul.scr, LV_OBJ_FLAG_SCROLLABLE);
+	ul.clip = NULL;
+	if (!over_app && ul.sbg) {
+		ul.clip = lv_obj_create(ul.scr);
+		lv_obj_remove_style_all(ul.clip);
+		lv_obj_remove_flag(ul.clip, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_set_width(ul.clip, W);
+		ul.bg = lv_image_create(ul.clip);
+		lv_image_set_src(ul.bg, ul.sbg);
+		ul.scrim = lv_obj_create(ul.scr);
+		plain(ul.scrim);
+		lv_obj_set_width(ul.scrim, W);
+		lv_obj_set_style_radius(ul.scrim, 0, 0);
+		lv_obj_set_style_bg_color(ul.scrim, lv_color_black(), 0);
+	}
+	ul.fg = lv_image_create(ul.scr);
+	if (ul.sfg)
+		lv_image_set_src(ul.fg, ul.sfg);
+	if (over_app)
+		mbx_gpu_set_transparent(true);	/* the application shows below */
+	lv_screen_load(ul.scr);
+	ul.on = true;
+	ul.v = 0;
+	ul_set(0);
+}
+
+static void ul_release(void)
+{
+	bool open = ul.v < -0.5f || (ul.v < 0.3f && ul.y < -H / 4);
+	int32_t to = open ? -H : 0, dist = LV_ABS(to - ul.y);
+	lv_anim_t a;
+
+	ul.on = false;
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, &ul);
+	lv_anim_set_exec_cb(&a, ul_exec);
+	lv_anim_set_values(&a, ul.y, to);
+	lv_anim_set_duration(&a, LV_MAX(80, 300 * dist / H));
+	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+	lv_anim_set_completed_cb(&a, ul_done);
+	lv_anim_start(&a);
+}
+
+/* A touch on the lock screen (from ui_drag). */
+static bool ul_drag(int phase, int y)
+{
+	uint32_t now = lv_tick_get();
+
+	if (phase == 0) {
+		lv_anim_t *a = lv_anim_get(&ul, ul_exec);
+
+		if (a) {		/* still settling: finish it */
+			int32_t end = a->end_value;
+
+			lv_anim_delete(&ul, ul_exec);
+			ul_set(end);
+			ul_finish(end == -H);
+		}
+		ul.py = ul.last_y = y;
+		ul.last_t = now;
+		return false;
+	}
+	if (!ul.on) {
+		if (phase == 2 || ul.py - y <= SD_SLOP || lv_screen_active() != lock_scr)
+			return false;
+		ul_begin();
+		ul.py -= SD_SLOP;
+	}
+	if (now != ul.last_t) {
+		float v = (float)(y - ul.last_y) / (float)(now - ul.last_t);
+
+		ul.v = ul.v * 0.5f + v * 0.5f;
+		ul.last_y = y;
+		ul.last_t = now;
+	}
+	if (phase == 2) {
+		if (now - ul.last_t > 80)
+			ul.v = 0;
+		ul_release();
+	} else {
+		ul_set(y - ul.py);
+	}
+	return true;
+}
+
+/*
+ * A launcher touch, from the router: phase 0 down, 1 move, 2 lift.
+ * True once the drag is the shade's (the router then keeps it from LVGL).
+ */
+static bool ui_drag(int phase, int x, int y)
+{
+	uint32_t now = lv_tick_get();
+
+	if (locked || ul.scr)
+		return ul_drag(phase, y);
+	if (phase == 0) {
+		bool home = lv_screen_active() == home_scr && !tr.scr;
+		bool app = app_pid > 0 && lv_screen_active() == app_scr;
+
+		sd_settle_now();
+		sd.cand = 0;
+		sd.px = x;
+		sd.py = y;
+		sd.last_y = y;
+		sd.last_t = now;
+		if (!shade || screen_off || (!home && !app))
+			return false;
+		if (shade_open && !in_obj(home_bright, x, y))
+			sd.cand = -1;
+		else if (!shade_open && (home || (app_bar_shown && y < APP_BAR_H)))
+			sd.cand = 1;
+		return false;
+	}
+	if (!sd.on) {
+		int dy = y - sd.py, dx = x - sd.px;
+
+		if (!sd.cand || phase == 2)
+			return false;
+		if (LV_ABS(dx) > SD_SLOP && LV_ABS(dx) > LV_ABS(dy)) {
+			sd.cand = 0;	/* sideways: not the shade's */
+			return false;
+		}
+		if (sd.cand * dy <= SD_SLOP)
+			return false;
+		sd_begin();
+		sd.py += sd.cand * SD_SLOP;	/* no jump by the slop */
+	}
+	if (now != sd.last_t) {
+		float v = (float)(y - sd.last_y) / (float)(now - sd.last_t);
+
+		sd.v = sd.v * 0.5f + v * 0.5f;
+		sd.last_y = y;
+		sd.last_t = now;
+	}
+	if (phase == 2) {
+		if (now - sd.last_t > 80)
+			sd.v = 0;	/* held still before the lift */
+		sd_release();
+	} else {
+		sd_set(sd.base + (y - sd.py));
+	}
+	return true;
+}
+
+/* The application is gone (or is being ended): back to the home screen. */
+/*
+ * Opening and closing animations. A card in the tile's colour, with its
+ * symbol, grows from the icon to the whole screen over a picture of home
+ * (GPU: the picture, a rounded fill), stays while the application starts
+ * below, and fades to show it. Closing runs it backwards: the card fades
+ * in over the application, then shrinks into its icon over home, and
+ * home's icon shows through as it ends. Fades are drawn with alpha by the
+ * CPU (the launcher's transparent mode); the moves are XRGB, on the GPU.
+ */
+#define ZA_GROW_MS	260
+#define ZA_HOLD_MS	140
+#define ZA_FADE_MS	160
+#define ZA_SHRINK_MS	260
+
+static struct {
+	int phase;		/* 0 idle, 1 grow, 2 hold, 3 fade out, 4 fade in, 5 shrink */
+	lv_obj_t *scr, *bg, *card, *sym;
+	lv_draw_buf_t *home;	/* home, as it was at the launch */
+	long home_min;
+	lv_obj_t *tile;		/* the tile (its badge gives place and colour) */
+	lv_area_t icon;
+	lv_color_t col;
+	lv_timer_t *kill_timer;
+} za;
+
+static void za_next(void);
+static void app_home_ui(void);
+
+static void za_rect(int32_t v)	/* 0 = the icon, 1024 = the screen */
+{
+	int32_t x1 = za.icon.x1 + (0 - za.icon.x1) * v / 1024;
+	int32_t y1 = za.icon.y1 + (0 - za.icon.y1) * v / 1024;
+	int32_t x2 = za.icon.x2 + (W - 1 - za.icon.x2) * v / 1024;
+	int32_t y2 = za.icon.y2 + (H - 1 - za.icon.y2) * v / 1024;
+
+	lv_obj_set_pos(za.card, x1, y1);
+	lv_obj_set_size(za.card, x2 - x1 + 1, y2 - y1 + 1);
+	lv_obj_set_style_radius(za.card, 20 + (28 - 20) * v / 1024, 0);
+}
+
+static void za_exec(void *var, int32_t v)
+{
+	LV_UNUSED(var);
+	switch (za.phase) {
+	case 1:
+		za_rect(v);
+		break;
+	case 5:
+		za_rect(v);
+		/* home's icon shows through in the last third */
+		lv_obj_set_style_opa(za.card, v > 340 ? LV_OPA_COVER : (lv_opa_t)(255 * v / 340), 0);
+		break;
+	case 3:
+	case 4:
+		lv_obj_set_style_opa(za.card, (lv_opa_t)v, 0);
+		break;
+	}
+}
+
+static void za_done(lv_anim_t *a)
+{
+	LV_UNUSED(a);
+	za_next();
+}
+
+static void za_run(int phase, int32_t from, int32_t to, uint32_t ms, lv_anim_path_cb_t path)
+{
+	lv_anim_t a;
+
+	za.phase = phase;
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, &za);
+	lv_anim_set_exec_cb(&a, za_exec);
+	lv_anim_set_values(&a, from, to);
+	lv_anim_set_duration(&a, ms);
+	lv_anim_set_path_cb(&a, path);
+	lv_anim_set_completed_cb(&a, za_done);
+	za_exec(NULL, from);
+	lv_anim_start(&a);
+}
+
+static void za_free(void)
+{
+	if (za.scr) {
+		lv_obj_delete(za.scr);
+		za.scr = NULL;
+	}
+}
+
+/* The animation screen: home's picture (hidden in the fades) and the card. */
+static void za_build(void)
+{
+	lv_obj_t *badge = lv_obj_get_child(za.tile, 0), *l;
+
+	lv_obj_get_coords(badge, &za.icon);
+	za.col = lv_obj_get_style_bg_color(badge, 0);
+	za.scr = lv_obj_create(NULL);
+	lv_obj_remove_style_all(za.scr);
+	lv_obj_remove_flag(za.scr, LV_OBJ_FLAG_SCROLLABLE);
+	za.bg = lv_image_create(za.scr);
+	if (za.home)
+		lv_image_set_src(za.bg, za.home);
+	za.card = lv_obj_create(za.scr);
+	plain(za.card);
+	lv_obj_remove_flag(za.card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_style_bg_color(za.card, za.col, 0);
+	lv_obj_set_style_bg_opa(za.card, LV_OPA_COVER, 0);
+	lv_obj_set_style_pad_all(za.card, 0, 0);
+	l = lv_obj_get_child(badge, 0);
+	za.sym = m3_label(za.card, l ? lv_label_get_text(l) : "", &lv_font_montserrat_28,
+			  lv_color_white());
+	lv_obj_center(za.sym);
+}
+
+/* One phase ends: the next begins. */
+static void za_next(void)
+{
+	if (getenv("N72_FPS"))
+		fprintf(stderr, "za: phase %d ends at %u ms\n", za.phase, (unsigned)lv_tick_get());
+	switch (za.phase) {
+	case 1:			/* grown: hold while the application starts */
+		lv_obj_add_flag(za.bg, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_style_radius(za.card, 0, 0);
+		za_run(2, 0, 1, ZA_HOLD_MS, lv_anim_path_linear);
+		break;
+	case 2:			/* fade the card: the application shows */
+		if (app_pid > 0)
+			setpriority(PRIO_PROCESS, app_pid, 0);
+		mbx_gpu_set_transparent(true);
+		za_run(3, LV_OPA_COVER, LV_OPA_TRANSP, ZA_FADE_MS, lv_anim_path_ease_in);
+		break;
+	case 3:
+		za.phase = 0;
+		lv_screen_load(app_pid > 0 ? app_scr : home_scr);
+		za_free();
+		if (app_pid <= 0)
+			app_home_ui();
+		break;
+	case 4:			/* covered: shrink into the icon over home */
+		mbx_gpu_set_transparent(false);
+		lv_obj_remove_flag(za.bg, LV_OBJ_FLAG_HIDDEN);
+		za_run(5, 1024, 0, ZA_SHRINK_MS, lv_anim_path_ease_out);
+		break;
+	case 5:
+		za.phase = 0;
+		app_home_ui();
+		za_free();
+		break;
+	}
+}
+
+/* Ending, the animation: finish whatever runs now, at once. */
+static void za_finish(void)
+{
+	while (za.phase) {
+		lv_anim_delete(&za, za_exec);
+		za_next();
+	}
+}
+
+/* Back to home (the application is gone, or going). */
+static void app_home_ui(void)
+{
 	shade_set(false, false);
 	app_bar_set(false);
 	if (app_bar) {
@@ -2290,15 +3050,57 @@ static void app_closed(void)
 	lv_anim_delete(shade, app_y);
 	lv_obj_set_parent(scrim, home_scr);
 	lv_obj_set_parent(shade, home_scr);
+	mbx_gpu_set_transparent(false);
+	if (lv_screen_active() != home_scr && !locked)
+		lv_screen_load(home_scr);
+	if (locked)
+		lock_from = home_scr;
+	lv_obj_invalidate(lv_layer_top());
+	home_update(NULL);
+}
+
+/* Close: the card covers the application, then goes into its icon. */
+static void za_close(void)
+{
+	if (za.phase || locked || lv_screen_active() != app_scr || !za.tile) {
+		app_home_ui();
+		return;
+	}
+	if (!za.home || za.home_min != bp_minute()) {
+		tr_free(&za.home);
+		za.home = snap(home_scr, LV_COLOR_FORMAT_XRGB8888);
+		za.home_min = bp_minute();
+	}
+	shade_set(false, false);
+	app_bar_set(false);
+	za_build();
+	lv_obj_add_flag(za.bg, LV_OBJ_FLAG_HIDDEN);
+	za_rect(1024);
+	lv_obj_set_style_radius(za.card, 0, 0);
+	lv_screen_load(za.scr);
+	za_run(4, LV_OPA_TRANSP, LV_OPA_COVER, ZA_FADE_MS, lv_anim_path_ease_out);
+}
+
+/* The application has gone (reaped). */
+static void app_closed(void)
+{
+	bool was_ending = za.kill_timer != NULL;
+
+	app_pid = 0;
 	if (app_timer) {
 		lv_timer_delete(app_timer);
 		app_timer = NULL;
 	}
-	mbx_gpu_set_transparent(false);
-	if (lv_screen_active() == app_scr)
-		lv_screen_load(home_scr);
-	lv_obj_invalidate(lv_layer_top());
-	home_update(NULL);
+	if (za.kill_timer) {
+		lv_timer_delete(za.kill_timer);
+		za.kill_timer = NULL;
+	}
+	if (za.phase)
+		return;			/* the animation ends on home */
+	if (!was_ending && lv_screen_active() == app_scr)
+		za_close();		/* it quit by itself */
+	else
+		app_home_ui();
 }
 
 static void app_poll(lv_timer_t *t)
@@ -2310,21 +3112,26 @@ static void app_poll(lv_timer_t *t)
 		app_closed();
 }
 
-/* Home: end the application, if one runs. */
+static void app_kill_cb(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	za.kill_timer = NULL;
+	if (app_pid > 0)
+		kill(-app_pid, SIGKILL);	/* app_poll reaps it */
+}
+
+/* Home: end the application, if one runs (without waiting for it). */
 static bool app_end(void)
 {
-	int st, i;
-
 	if (app_pid <= 0)
 		return false;
+	if (za.kill_timer || (za.phase && za.phase >= 4))
+		return true;		/* already ending */
+	za_finish();
 	kill(-app_pid, SIGTERM);
-	for (i = 0; i < 50 && waitpid(app_pid, &st, WNOHANG) == 0; i++)
-		usleep(10000);
-	if (i == 50) {
-		kill(-app_pid, SIGKILL);
-		waitpid(app_pid, &st, 0);
-	}
-	app_closed();
+	za.kill_timer = lv_timer_create(app_kill_cb, 600, NULL);
+	lv_timer_set_repeat_count(za.kill_timer, 1);
+	za_close();
 	return true;
 }
 
@@ -2333,7 +3140,7 @@ static void app_launch_cb(lv_event_t *e)
 	const char *cmd = lv_event_get_user_data(e);
 	pid_t pid;
 
-	if (app_pid > 0 || !mbx_gpu_on_shell_layer())
+	if (app_pid > 0 || za.phase || !mbx_gpu_on_shell_layer())
 		return;
 	if (!app_scr) {
 		/* nothing on it: transparent, the application shows */
@@ -2348,6 +3155,29 @@ static void app_launch_cb(lv_event_t *e)
 	}
 	tr_finish();
 	shade_set(false, false);
+
+	/* home as it is now, for the grow (and the close) */
+	za.tile = lv_event_get_current_target(e);
+	{
+		/* the tile back to rest at once, not by its transition: adding
+		 * a style ends an object's transitions */
+		static lv_style_t none;
+		uint32_t i;
+
+		if (!none.values_and_props)
+			lv_style_init(&none);
+		lv_obj_remove_state(za.tile, LV_STATE_PRESSED);
+		for (i = 0; i <= lv_obj_get_child_count(za.tile); i++) {
+			lv_obj_t *o = i ? lv_obj_get_child(za.tile, i - 1) : za.tile;
+
+			lv_obj_add_style(o, &none, 0);
+			lv_obj_remove_style(o, &none, 0);
+		}
+	}
+	tr_free(&za.home);
+	za.home = grab_or_snap(home_scr);
+	za.home_min = bp_minute();
+
 	pid = fork();
 	if (pid < 0)
 		return;
@@ -2355,6 +3185,8 @@ static void app_launch_cb(lv_event_t *e)
 		setpgid(0, 0);		/* Home ends everything it starts */
 		if (rt_node[0])		/* its touch screen: the router's */
 			setenv("N72_TOUCH", rt_node, 1);
+		/* the animation first: full priority again when it fades */
+		setpriority(PRIO_PROCESS, 0, 5);
 		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
 		_exit(127);
 	}
@@ -2363,9 +3195,11 @@ static void app_launch_cb(lv_event_t *e)
 	/* the shade comes down over the application from the top layer */
 	lv_obj_set_parent(scrim, lv_layer_top());
 	lv_obj_set_parent(shade, lv_layer_top());
-	mbx_gpu_set_transparent(true);
-	lv_screen_load(app_scr);
 	app_timer = lv_timer_create(app_poll, 200, NULL);
+
+	za_build();
+	lv_screen_load(za.scr);
+	za_run(1, 0, 1024, ZA_GROW_MS, lv_anim_path_ease_out);
 }
 
 /* One tile for every manifest in APPS_DIR. */
@@ -2380,7 +3214,9 @@ static void app_tiles(lv_obj_t *parent)
 		return;
 	}
 	while ((de = readdir(d))) {
-		char path[300], line[400], name[40] = "", cmd[400] = "";
+		char path[300], line[400], name[40] = "", cmd[400] = "", icon[24] = "";
+		unsigned rgb = 0;
+		bool have_rgb = false;
 		size_t n = strlen(de->d_name);
 		FILE *f;
 
@@ -2396,13 +3232,33 @@ static void app_tiles(lv_obj_t *parent)
 				snprintf(name, sizeof(name), "%s", line + 5);
 			else if (!strncmp(line, "exec=", 5))
 				snprintf(cmd, sizeof(cmd), "%s", line + 5);
+			else if (!strncmp(line, "icon=", 5))
+				snprintf(icon, sizeof(icon), "%s", line + 5);
+			else if (!strncmp(line, "color=#", 7))
+				have_rgb = sscanf(line + 7, "%x", &rgb) == 1;
 		}
 		fclose(f);
 		if (name[0] && cmd[0]) {
 			uint32_t before = lv_obj_get_child_count(parent);
 
-			app_tile(parent, LV_SYMBOL_PLAY, name, M.secondary_c, M.on_secondary_c,
-				 app_launch_cb);
+			/* icon=<name> picks a symbol, color=#rrggbb the badge */
+			static const struct { const char *n, *sym; } syms[] = {
+				{ "video", LV_SYMBOL_VIDEO }, { "image", LV_SYMBOL_IMAGE },
+				{ "music", LV_SYMBOL_AUDIO }, { "gears", LV_SYMBOL_SETTINGS },
+				{ "shuffle", LV_SYMBOL_SHUFFLE }, { "eye", LV_SYMBOL_EYE_OPEN },
+				{ "file", LV_SYMBOL_FILE }, { "list", LV_SYMBOL_LIST },
+				{ "terminal", LV_SYMBOL_KEYBOARD }, { "gps", LV_SYMBOL_GPS },
+				{ "charge", LV_SYMBOL_CHARGE }, { "home", LV_SYMBOL_HOME },
+			};
+			const char *sym = LV_SYMBOL_PLAY;
+			size_t k;
+
+			for (k = 0; k < sizeof(syms) / sizeof(syms[0]); k++)
+				if (!strcmp(icon, syms[k].n))
+					sym = syms[k].sym;
+			app_tile(parent, sym, name,
+				 have_rgb ? lv_color_hex(rgb) : M.secondary_c,
+				 have_rgb ? lv_color_white() : M.on_secondary_c, app_launch_cb);
 			/* the manifest's command rides on the tile's click */
 			if (lv_obj_get_child_count(parent) > before) {
 				lv_obj_t *t = lv_obj_get_child(parent, before);
@@ -2443,14 +3299,41 @@ static void build_home(void)
 	status_icons = m3_label(bar, "", &lv_font_montserrat_14, M.on_surface_v);
 	lv_obj_align(status_icons, LV_ALIGN_RIGHT_MID, -74, 0);
 
-	/* apps: a launcher grid, four to a row */
+	/* a widget: the time large, the date, battery and Wi-Fi */
+	{
+		lv_obj_t *c = lv_obj_create(home_scr);
+
+		plain(c);
+		lv_obj_set_size(c, W - 32, 112);
+		lv_obj_set_pos(c, 16, 44);
+		lv_obj_set_style_radius(c, 24, 0);
+		lv_obj_set_style_bg_color(c, M.surface_c_high, 0);
+		lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
+		lv_obj_set_style_pad_all(c, 0, 0);
+		lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+		lv_obj_add_event_cb(c, shade_tap_cb, LV_EVENT_CLICKED, (void *)1);
+		home_clock = m3_label(c, "", &lv_font_montserrat_48, M.on_surface);
+		lv_obj_align(home_clock, LV_ALIGN_TOP_LEFT, 18, 12);
+		home_date = m3_label(c, "", &lv_font_montserrat_16, M.primary);
+		lv_obj_align(home_date, LV_ALIGN_BOTTOM_LEFT, 20, -14);
+		home_batt = m3_label(c, "", &lv_font_montserrat_16, M.on_surface);
+		lv_obj_align(home_batt, LV_ALIGN_TOP_RIGHT, -18, 20);
+		home_net = m3_label(c, "", &lv_font_montserrat_12, M.on_surface_v);
+		lv_obj_set_width(home_net, 110);
+		lv_obj_set_style_text_align(home_net, LV_TEXT_ALIGN_RIGHT, 0);
+		lv_label_set_long_mode(home_net, LV_LABEL_LONG_DOT);
+		lv_obj_align(home_net, LV_ALIGN_TOP_RIGHT, -18, 46);
+	}
+
+	/* apps: a launcher grid, four to a row, the whole width */
 	apps = lv_obj_create(home_scr);
 	plain(apps);
-	lv_obj_set_size(apps, W - 16, H - 56);
-	lv_obj_set_pos(apps, 8, 52);
+	lv_obj_set_size(apps, W - 16, H - 172);
+	lv_obj_set_pos(apps, 8, 172);
 	lv_obj_set_style_bg_opa(apps, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_pad_all(apps, 0, 0);
 	lv_obj_set_style_pad_row(apps, 12, 0);
+	lv_obj_set_style_pad_column(apps, 0, 0);	/* 4 x 76 = the width */
 	lv_obj_remove_flag(apps, LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_set_flex_flow(apps, LV_FLEX_FLOW_ROW_WRAP);
 	lv_obj_set_flex_align(apps, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);

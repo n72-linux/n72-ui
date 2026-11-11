@@ -43,6 +43,7 @@
 #include <sys/klog.h>
 #include <sys/socket.h>
 #include <sys/reboot.h>
+#include <sys/resource.h>
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #include <time.h>
@@ -50,6 +51,7 @@
 #include <unistd.h>
 
 #include "lvgl/lvgl.h"
+#include "lvgl/src/indev/lv_indev_private.h"
 #include "mbx_gpu.h"
 
 #define W 320
@@ -430,8 +432,12 @@ static char touch_inhibit[96];
 static char rt_node[64];	/* the touch router's virtual device, for applications */
 static void rt_reset(void);
 
+static void ui_lock(void);
+
 static void screen_set(bool on)
 {
+	if (!on)
+		ui_lock();
 	screen_off = !on;
 	if (access(PANEL_POWER, W_OK) == 0)
 		write_int(PANEL_POWER, on);
@@ -472,6 +478,8 @@ static enum { RT_NONE, RT_UI, RT_APP } rt_owner;
 static struct input_event rt_frame[64];
 static int rt_n;
 static uint64_t rt_frame_us;		/* when LVGL last had a frame */
+static bool rt_ui_touch;		/* a launcher touch is down */
+static bool rt_claim;			/* ... and ui_drag() has it */
 
 static void rt_reset(void)
 {
@@ -489,6 +497,7 @@ static void rt_reset(void)
 	rt_n = 0;
 	rt_owner = RT_NONE;
 	rt_down = rt_ui_down = false;
+	rt_ui_touch = rt_claim = false;
 }
 
 static int rt_scale(int v, int in_min, int in_max, int out_max)
@@ -533,9 +542,25 @@ static bool rt_frame_done(void)
 		if (write(rt_uinput, rt_frame, rt_n * sizeof(rt_frame[0])) < 0)
 			;
 	} else {
-		news = rt_ui_down != rt_down || rt_pt.x != p.x || rt_pt.y != p.y;
-		rt_pt = p;
-		rt_ui_down = rt_down;
+		if (rt_down || rt_ui_touch) {
+			int ph = !rt_down ? 2 : rt_ui_touch ? 1 : 0;
+
+			if (ui_drag(ph, p.x, p.y) && !rt_claim) {
+				/* the launcher's drag now (ui_drag has ended LVGL's press) */
+				rt_claim = true;
+			}
+		}
+		rt_ui_touch = rt_down;
+		if (rt_claim) {
+			news = rt_ui_down;
+			rt_ui_down = false;
+			if (!rt_down)
+				rt_claim = false;
+		} else {
+			news = rt_ui_down != rt_down || rt_pt.x != p.x || rt_pt.y != p.y;
+			rt_pt = p;
+			rt_ui_down = rt_down;
+		}
 	}
 	if (!rt_down)
 		rt_owner = RT_NONE;
@@ -831,6 +856,7 @@ static bool screen_off_for_sound;
 
 static void screen_off_or_sleep(void)
 {
+	ui_lock();
 	if (audio_playing()) {
 		screen_off_for_sound = true;
 		screen_set(false);
