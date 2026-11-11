@@ -368,6 +368,22 @@ static bool gt_cpu_only;
 static bool gt_init(void);
 static bool gt_worth_it(const lv_draw_task_t *t);
 
+/* Is nothing drawn before @t in its layer where @t draws? */
+static bool first_over(const lv_draw_task_t *t)
+{
+	const lv_draw_dsc_base_t *base = t->draw_dsc;
+	const lv_draw_task_t *u;
+	lv_area_t a, x;
+
+	if (!lv_area_intersect(&a, &t->area, &t->clip_area))
+		return false;
+	for (u = base->layer->draw_task_head; u && u != t; u = u->next)
+		if (lv_area_intersect(&x, &u->area, &a) &&
+		    lv_area_intersect(&x, &x, &u->clip_area))
+			return false;
+	return u == t;
+}
+
 static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 {
 	const lv_draw_dsc_base_t *base = t->draw_dsc;
@@ -380,7 +396,21 @@ static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 	if (!cf_ok(dcf))
 		return 0;
 
-	if (t->type == LV_DRAW_TASK_TYPE_FILL) {
+	if (t->type == LV_DRAW_TASK_TYPE_FILL && dcf == LV_COLOR_FORMAT_ARGB8888) {
+		const lv_draw_fill_dsc_t *d = t->draw_dsc;
+
+		/*
+		 * The launcher's transparent mode (alpha, premultiplied at the
+		 * flush). A plain fill is one 2D fill of its word: opaque ones
+		 * anywhere; translucent ones only where nothing is drawn under
+		 * them this frame (LVGL cleared it), as the card's fades: the
+		 * straight (alpha, colour) is then exactly what LVGL's blend
+		 * would leave, ~1.3 ms instead of ~15 ms of CPU blending.
+		 */
+		if (d->radius != 0 || d->grad.dir != LV_GRAD_DIR_NONE || d->opa <= LV_OPA_MIN ||
+		    size < 16384 || (d->opa < LV_OPA_MAX && !first_over(t)))
+			return 0;
+	} else if (t->type == LV_DRAW_TASK_TYPE_FILL) {
 		const lv_draw_fill_dsc_t *d = t->draw_dsc;
 
 		/*
@@ -640,6 +670,75 @@ static void mbx_fill(lv_draw_unit_t *u, lv_draw_task_t *t)
 	}
 	u->clip_area = clip;
 	mbx_gpu_stats.fill_corners++;
+}
+
+/*
+ * Areas of the display buffer this frame whose pixels are premultiplied
+ * already (mbx_fill_straight): the flush leaves them alone. Reading them
+ * back to convert them cost 13-19 ms a full screen (all cache misses).
+ */
+static bool transparent;
+#define PM_SKIP_MAX 4
+static lv_area_t pm_skip[PM_SKIP_MAX];
+static int pm_skip_n;
+
+static bool later_over(const lv_draw_task_t *t, const lv_area_t *a)
+{
+	const lv_draw_task_t *u;
+	lv_area_t x;
+
+	for (u = t->next; u; u = u->next)
+		if (lv_area_intersect(&x, &u->area, a) && lv_area_intersect(&x, &x, &u->clip_area))
+			return true;
+	return false;
+}
+
+static uint32_t premul_word(lv_opa_t a, lv_color_t c)
+{
+	uint32_t r = c.red * a + 128, g = c.green * a + 128, bl = c.blue * a + 128;
+
+	r = (r + (r >> 8)) >> 8;
+	g = (g + (g >> 8)) >> 8;
+	bl = (bl + (bl >> 8)) >> 8;
+	return (uint32_t)a << 24 | r << 16 | g << 8 | bl;
+}
+
+/*
+ * A translucent plain fill into an ARGB8888 layer with nothing under it
+ * (mbx_evaluate checked): a 2D fill of its straight (alpha, colour) word;
+ * of the premultiplied word, and the flush told to skip it, when it is
+ * the display's buffer and nothing is drawn over it afterwards.
+ */
+static void mbx_fill_straight(lv_draw_unit_t *u, lv_draw_task_t *t)
+{
+	lv_layer_t *layer = u->target_layer;
+	lv_draw_buf_t *b = layer->draw_buf;
+	lv_draw_fill_dsc_t *d = t->draw_dsc;
+	lv_area_t a, scr;
+	uint32_t word;
+
+	if (!lv_area_intersect(&a, &t->area, u->clip_area))
+		return;
+	if (!in_pool(b->data)) {
+		lv_draw_sw_fill(u, d, &t->area);
+		return;
+	}
+	scr = a;
+	word = (uint32_t)d->opa << 24 | (lv_color_to_u32(d->color) & 0xffffff);
+	if (transparent && b->data == lv_display_get_default()->buf_1->data &&
+	    pm_skip_n < PM_SKIP_MAX && !later_over(t, &scr)) {
+		word = premul_word(d->opa, d->color);
+		pm_skip[pm_skip_n++] = scr;	/* (screen = buffer coordinates here) */
+	}
+	lv_area_move(&a, -layer->buf_area.x1, -layer->buf_area.y1);
+	if (rect_n)
+		rect_flush();
+	rect_buf = b;
+	rect_rows = a;
+	rect_n = put_fill(rect_words, gpu_addr(b->data), b->header.stride, word,
+			  a.x1, a.y1, lv_area_get_width(&a), lv_area_get_height(&a));
+	rect_flush();
+	mbx_gpu_stats.fills++;
 }
 
 /* Blend a translucent plain fill with the 3D core. */
@@ -1127,6 +1226,8 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 	}
 	else if (((lv_draw_fill_dsc_t *)t->draw_dsc)->opa >= LV_OPA_MAX)
 		mbx_fill(u, t);
+	else if (layer->color_format == LV_COLOR_FORMAT_ARGB8888)
+		mbx_fill_straight(u, t);
 	else
 		mbx_fill_blend(u, t);
 	ADBG("mbx: dispatch on layer %p\n", (void *)layer);
@@ -1347,6 +1448,7 @@ static void render_start_cb(lv_event_t *e)
 	pthread_mutex_unlock(&flip_mx);
 
 	/* bring the buffer up to date: frames buf_frame[dr]+1 .. frame_no */
+	double dbg_t0 = gpu_now_us();
 	have = buf_frame[dr];
 	if (src >= 0 && src != dr && have < frame_no) {
 		if (have < 0 || frame_no - have > HIST - 1) {
@@ -1375,6 +1477,9 @@ static void render_start_cb(lv_event_t *e)
 	d->buf_1->data = scan[dr];
 	cur_n = 0;
 	cur_all = false;
+	pm_skip_n = 0;
+	if (gpu_now_us() - dbg_t0 > 8000 && getenv("N72_FPS"))
+		fprintf(stderr, "render start: catch-up %.1f ms\n", (gpu_now_us() - dbg_t0) / 1000.0);
 }
 
 static bool transparent;
@@ -1382,10 +1487,17 @@ static void premultiply(uint8_t *px_map, const lv_area_t *a);
 
 static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
+	double dbg_t0 = gpu_now_us(), dbg_t1;
+
 	if (transparent)
 		premultiply(px_map, area);
+	dbg_t1 = gpu_now_us();
 	/* what the CPU drew in this area goes out to memory for the display */
 	clean_rows(px_map, area);
+	if (gpu_now_us() - dbg_t0 > 8000 && getenv("N72_FPS"))
+		fprintf(stderr, "flush: premultiply %.1f ms, clean %.1f ms (%d rows)\n",
+			(dbg_t1 - dbg_t0) / 1000.0, (gpu_now_us() - dbg_t1) / 1000.0,
+			(int)lv_area_get_height(area));
 	if (cur_n < HIST_AREAS)
 		cur_areas[cur_n++] = *area;
 	else
@@ -1785,11 +1897,20 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void)
 	gpu_wait(flush_seq);		/* the last frame is complete */
 	flush_seq = 0;
 	buf_invalidate(b, &all);
-	submit(w, put_copy(w, gpu_addr(b->data), b->header.stride,
-			   gpu_addr(flipping ? scan[st_latest] : disp_buf),
-			   fb.stride, 0, 0, 0, 0, fb.width, fb.height));
-	gpu_wait(last_seq);
-	last_seq = 0;
+	{
+		/* the 3D copy: ~3 ms a screen against the 2D engine's ~8 */
+		uint32_t w3[48];
+		uint32_t src = gpu_addr(flipping ? scan[st_latest] : disp_buf);
+		int n = mbx_cmd_copy(w3, 0, b->header.stride, fb.stride, 0, 0, 0, 0,
+				     fb.width, fb.height, LV_OPA_COVER);
+
+		if (blit3d(8, gpu_addr(b->data), src, w3, n)) {
+			submit(w, put_copy(w, gpu_addr(b->data), b->header.stride, src,
+					   fb.stride, 0, 0, 0, 0, fb.width, fb.height));
+			gpu_wait(last_seq);
+			last_seq = 0;
+		}
+	}
 	return b;
 }
 
@@ -1860,35 +1981,64 @@ void mbx_gpu_set_transparent(bool on)
 }
 
 /* Straight alpha to premultiplied; nothing but zeros where alpha is 0. */
+static void premultiply_span(uint32_t *p, int32_t w);
+
 static void premultiply(uint8_t *px_map, const lv_area_t *a)
 {
-	int32_t x, y, w = lv_area_get_width(a);
-
-	/* c * a / 255 rounded, without a division; runs of one colour (fills)
-	 * reuse the last result */
-#define MUL255(c, al) ({ uint32_t t_ = (c) * (al) + 128; (t_ + (t_ >> 8)) >> 8; })
-	uint32_t last_in = 0, last_out = 0;
+	int32_t y;
 
 	for (y = a->y1; y <= a->y2; y++) {
-		uint32_t *p = (uint32_t *)(px_map + y * fb.stride) + a->x1;
+		uint32_t *row = (uint32_t *)(px_map + y * fb.stride);
+		int32_t x = a->x1;
 
-		for (x = 0; x < w; x++) {
-			uint32_t v = p[x], al = v >> 24;
+		while (x <= a->x2) {
+			int32_t end = a->x2, i;
+			bool skip = false;
 
-			if (al == 255)
-				continue;
-			if (!al) {
-				if (v)
-					p[x] = 0;
-				continue;
+			/* the next span: inside one skip area, or up to the next */
+			for (i = 0; i < pm_skip_n; i++) {
+				const lv_area_t *k = &pm_skip[i];
+
+				if (y < k->y1 || y > k->y2 || k->x2 < x)
+					continue;
+				if (k->x1 <= x) {
+					skip = true;
+					end = LV_MIN(a->x2, k->x2);
+					break;
+				}
+				end = LV_MIN(end, k->x1 - 1);
 			}
-			if (v != last_in) {
-				last_in = v;
-				last_out = al << 24 | MUL255(v >> 16 & 255, al) << 16 |
-					   MUL255(v >> 8 & 255, al) << 8 | MUL255(v & 255, al);
-			}
-			p[x] = last_out;
+			if (!skip)
+				premultiply_span(row + x, end - x + 1);
+			x = end + 1;
 		}
+	}
+}
+
+/* Straight alpha to premultiplied over @w pixels; runs of one colour reuse
+ * the last result; c * a / 255 rounded without a division. */
+static void premultiply_span(uint32_t *p, int32_t w)
+{
+#define MUL255(c, al) ({ uint32_t t_ = (c) * (al) + 128; (t_ + (t_ >> 8)) >> 8; })
+	uint32_t last_in = 0, last_out = 0;
+	int32_t x;
+
+	for (x = 0; x < w; x++) {
+		uint32_t v = p[x], al = v >> 24;
+
+		if (al == 255)
+			continue;
+		if (!al) {
+			if (v)
+				p[x] = 0;
+			continue;
+		}
+		if (v != last_in) {
+			last_in = v;
+			last_out = al << 24 | MUL255(v >> 16 & 255, al) << 16 |
+				   MUL255(v >> 8 & 255, al) << 8 | MUL255(v & 255, al);
+		}
+		p[x] = last_out;
 	}
 #undef MUL255
 }

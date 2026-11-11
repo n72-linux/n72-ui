@@ -368,8 +368,12 @@ static void bp_scr_deleted(lv_event_t *e)
 }
 
 /* @scr changed (a label of it): its picture no longer matches. */
+static unsigned long home_ver;	/* bumped when anything on home changes */
+
 static void bp_changed(lv_obj_t *scr)
 {
+	if (scr && scr == home_scr)
+		home_ver++;
 	for (int i = 0; i < BP_MAX; i++)
 		if (bp[i].scr && bp[i].scr == scr)
 			bp_drop(i);
@@ -1766,12 +1770,15 @@ static bool usb_powered(void)
  * invalidates the label, and a 1 s timer rewriting unchanged text was a
  * redraw and a GPU flush every second.
  */
+static void shade_changed(lv_obj_t *o);
+
 static void label_set_if_changed(lv_obj_t *lbl, const char *text)
 {
 	const char *cur = lv_label_get_text(lbl);
 
 	if (!cur || strcmp(cur, text)) {
 		lv_label_set_text(lbl, text);
+		shade_changed(lbl);
 		bp_changed(lv_obj_get_screen(lbl));
 		pf_label_changed(lbl);
 	}
@@ -1893,7 +1900,12 @@ static lv_timer_t *home_timer;
 
 static void qs_style(lv_obj_t *tile, bool on)
 {
-	lv_obj_set_style_bg_color(tile, on ? M.primary_c : M.surface_c_high, 0);
+	lv_color_t c = on ? M.primary_c : M.surface_c_high;
+
+	if (!lv_color_eq(lv_obj_get_style_bg_color(tile, 0), c)) {
+		lv_obj_set_style_bg_color(tile, c, 0);
+		shade_changed(tile);
+	}
 }
 
 static void home_update(lv_timer_t *t)
@@ -2042,6 +2054,7 @@ static void home_wake(void)
 static void home_bright_cb(lv_event_t *e)
 {
 	backlight_set(lv_slider_get_value(lv_event_get_target(e)));
+	shade_changed(home_bright);
 }
 
 /* ------------------------------------------------- quick settings shade */
@@ -2057,6 +2070,8 @@ static void shade_closed(void)
  * Open or close the shade. Animated: a picture of home (with the scrim,
  * without the shade) and a picture of the shade, moved by the GPU.
  */
+static bool sd_animate(bool open);
+
 static void shade_set(bool open, bool anim)
 {
 	lv_draw_buf_t *bg, *fg;
@@ -2070,6 +2085,8 @@ static void shade_set(bool open, bool anim)
 		home_wake();
 	}
 	lv_obj_remove_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+	if (anim && sd_animate(open))
+		return;
 	if (anim && app_scr && lv_screen_active() == app_scr) {
 		app_shade_slide(open);	/* no pictures to move: the application shows */
 		return;
@@ -2511,6 +2528,10 @@ static struct {
 	uint32_t last_t;
 	float v;		/* px per ms, smoothed */
 	lv_obj_t *scr, *bgclip, *bg, *scrim, *fg, *back;
+	bool fg_cached;		/* sd.sfg is shade_pic (not freed here) */
+	lv_draw_buf_t *home_pic;	/* home without the shade, kept while it is open */
+	unsigned long home_pic_ver;
+	long home_pic_min;
 	bool to_page;		/* closing onto a page (Settings from the shade) */
 	lv_draw_buf_t *sbg, *sfg;
 } sd;
@@ -2522,7 +2543,48 @@ static void sd_free_pics(void)
 		sd.scr = NULL;
 	}
 	tr_free(&sd.sbg);
-	tr_free(&sd.sfg);
+	if (sd.fg_cached)
+		sd.sfg = NULL;		/* (shade_pic's) */
+	else
+		tr_free(&sd.sfg);
+	sd.fg_cached = false;
+}
+
+/*
+ * The shade's picture, kept: taking it (rendering every widget of the
+ * shade) cost ~40-80 ms at each drag's start. Retaken when something on
+ * the shade changes (shade_changed: labels, tiles, the slider) or the
+ * minute does; when idle, before anyone needs it (shade_pic_warm).
+ */
+static lv_draw_buf_t *shade_pic;
+static bool shade_pic_dirty = true;
+static long shade_pic_min;
+
+static void shade_changed(lv_obj_t *o)
+{
+	for (; o; o = lv_obj_get_parent(o))
+		if (o == shade) {
+			shade_pic_dirty = true;
+			return;
+		}
+}
+
+static lv_draw_buf_t *shade_pic_get(void)
+{
+	int32_t y;
+
+	if (shade_pic && !shade_pic_dirty && shade_pic_min == bp_minute())
+		return shade_pic;
+	if (shade_pic && sd.sfg == shade_pic)
+		return shade_pic;	/* (in use right now) */
+	tr_free(&shade_pic);
+	y = lv_obj_get_y(shade);
+	lv_obj_set_y(shade, 0);
+	shade_pic = snap(shade, LV_COLOR_FORMAT_ARGB8888);
+	lv_obj_set_y(shade, y);
+	shade_pic_dirty = false;
+	shade_pic_min = bp_minute();
+	return shade_pic;
 }
 
 static lv_opa_t sd_scrim_opa(int32_t y)
@@ -2565,6 +2627,14 @@ static void sd_end(bool open)
 {
 	if (sd.pics) {
 		lv_screen_load(sd.back);
+		if (open && sd.back == home_scr && sd.sbg) {
+			/* home under the open shade: the picture for its closing */
+			tr_free(&sd.home_pic);
+			sd.home_pic = sd.sbg;
+			sd.home_pic_ver = home_ver;
+			sd.home_pic_min = bp_minute();
+			sd.sbg = NULL;
+		}
 		sd_free_pics();
 		sd.pics = false;
 		lv_obj_remove_flag(shade, LV_OBJ_FLAG_HIDDEN);
@@ -2589,6 +2659,38 @@ static void sd_end(bool open)
 static void sd_anim_done(lv_anim_t *a)
 {
 	sd_end(a->end_value == 0);
+}
+
+/*
+ * The shade opened or closed by a tap or gesture, as a drag that lets go:
+ * the pictures move (GPU on home, one picture over an application), not
+ * the widgets of the shade. False: not here (the caller moves the shade).
+ */
+static bool sd_begin(bool touch);
+
+static bool sd_animate(bool open)
+{
+	lv_anim_t a;
+
+	if (sd.on || sd.scr ||
+	    !(lv_screen_active() == home_scr || (app_scr && lv_screen_active() == app_scr)))
+		return false;
+	shade_open = !open;	/* (sd_begin starts from where it is) */
+	sd_begin(false);
+	sd.on = false;
+	if (!sd.scr) {
+		shade_open = open;
+		return false;
+	}
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, &sd);
+	lv_anim_set_exec_cb(&a, sd_anim_exec);
+	lv_anim_set_values(&a, sd.y, open ? 0 : -SHADE_H);
+	lv_anim_set_duration(&a, 240);
+	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+	lv_anim_set_completed_cb(&a, sd_anim_done);
+	lv_anim_start(&a);
+	return true;
 }
 
 /* A settling shade is finished at once when a new touch comes. */
@@ -2623,12 +2725,13 @@ static void ui_touch_lost(void)
 	lv_indev_reset(touch_indev, NULL);
 }
 
-static bool sd_begin(void)
+static bool sd_begin(bool touch)
 {
 	bool home = lv_screen_active() == home_scr;
 	lv_draw_buf_t *bg = NULL, *fg;
 
-	ui_touch_lost();
+	if (touch)
+		ui_touch_lost();
 	tr_finish();
 	sd.base = shade_open ? 0 : -SHADE_H;
 	sd.pics = false;
@@ -2641,6 +2744,10 @@ static bool sd_begin(void)
 	if (home) {
 		if (!shade_open) {
 			bg = grab_or_snap(home_scr);
+		} else if (sd.home_pic && sd.home_pic_ver == home_ver &&
+			   sd.home_pic_min == bp_minute()) {
+			bg = sd.home_pic;	/* kept from the opening: home unchanged */
+			sd.home_pic = NULL;
 		} else {
 			lv_obj_add_flag(shade, LV_OBJ_FLAG_HIDDEN);
 			lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
@@ -2649,9 +2756,9 @@ static bool sd_begin(void)
 			lv_obj_remove_flag(shade, LV_OBJ_FLAG_HIDDEN);
 		}
 	}
-	lv_obj_set_y(shade, 0);
-	fg = snap(shade, LV_COLOR_FORMAT_ARGB8888);
-	lv_obj_set_y(shade, sd.base);
+	tr_free(&sd.home_pic);
+	fg = shade_pic_get();
+	sd.fg_cached = fg != NULL;
 	if (fg && (bg || !home)) {
 		sd.sbg = bg;
 		sd.sfg = fg;
@@ -2690,7 +2797,7 @@ static bool sd_begin(void)
 		sd.pics = true;
 	} else {
 		tr_free(&bg);
-		tr_free(&fg);
+		sd.fg_cached = false;	/* (the cached one stays cached) */
 	}
 	if (!sd.pics)
 		lv_obj_remove_flag(scrim, LV_OBJ_FLAG_HIDDEN);
@@ -3052,7 +3159,7 @@ static bool ui_drag(int phase, int x, int y)
 		}
 		if (sd.cand * dy <= SD_SLOP)
 			return false;
-		sd_begin();
+		sd_begin(true);
 		sd.py += sd.cand * SD_SLOP;	/* no jump by the slop */
 	}
 	if (now != sd.last_t) {
@@ -3096,7 +3203,10 @@ static struct {
 	lv_area_t icon;
 	lv_color_t col;
 	lv_timer_t *kill_timer;
+	const char *cmd;	/* the application's command, until it starts */
 	bool page;		/* the launcher's own page (Settings, Paint) */
+	void (*page_open)(lv_event_t *);
+	bool home_stale;	/* retake za.home once the card covers the screen */
 	lv_obj_t *page_scr, *page_tile;
 	lv_draw_buf_t *page_pic;
 } za;
@@ -3139,6 +3249,20 @@ static void za_rect(int32_t v)	/* 0 = the icon, 1024 = the screen */
 	lv_obj_set_style_radius(za.card, 20 + (28 - 20) * v / 1024, 0);
 }
 
+/*
+ * The card's opacity as its fill's and its symbol's own, not the object's:
+ * object opacity renders the card into a layer of its own and blends it,
+ * all on the CPU in the launcher's transparent mode; a plain translucent
+ * fill is one GPU fill (mbx_gpu.c, mbx_fill_straight).
+ */
+static void za_card_opa(lv_opa_t o)
+{
+	if (lv_obj_get_style_bg_opa(za.card, 0) == o)
+		return;
+	lv_obj_set_style_bg_opa(za.card, o, 0);
+	lv_obj_set_style_text_opa(za.sym, o, 0);
+}
+
 static void za_exec(void *var, int32_t v)
 {
 	LV_UNUSED(var);
@@ -3149,13 +3273,13 @@ static void za_exec(void *var, int32_t v)
 	case 5:
 		za_rect(v);
 		/* home's icon shows through in the last third */
-		lv_obj_set_style_opa(za.card, v > 340 ? LV_OPA_COVER : (lv_opa_t)(255 * v / 340), 0);
+		za_card_opa(v > 340 ? LV_OPA_COVER : (lv_opa_t)(255 * v / 340));
 		break;
 	case 3:
 	case 4:
 	case 6:
 	case 7:
-		lv_obj_set_style_opa(za.card, (lv_opa_t)v, 0);
+		za_card_opa((lv_opa_t)v);
 		break;
 	}
 }
@@ -3215,6 +3339,18 @@ static void za_build(void)
 	lv_obj_center(za.sym);
 }
 
+/* Home's picture, retaken if it went stale (the card covers the screen). */
+static void za_home_fresh(void)
+{
+	if (!za.home_stale && za.home)
+		return;
+	lv_image_set_src(za.bg, NULL);
+	tr_free(&za.home);
+	za.home = snap(home_scr, LV_COLOR_FORMAT_XRGB8888);
+	za.home_min = bp_minute();
+	za.home_stale = false;
+}
+
 /* One phase ends: the next begins. */
 static void za_next(void)
 {
@@ -3223,6 +3359,24 @@ static void za_next(void)
 	if (za.page) {
 		switch (za.phase) {
 		case 1:		/* grown: the card fades off the page's picture */
+			if (!za.page_scr && za.page_open) {
+				/* built now, unseen under the card */
+				push_quiet = true;
+				push_quiet_scr = NULL;
+				za.page_open(NULL);
+				push_quiet = false;
+				za.page_scr = push_quiet_scr;
+				if (za.page_scr)
+					za.page_pic = snap(za.page_scr, LV_COLOR_FORMAT_XRGB8888);
+			}
+			if (!za.page_scr || !za.page_pic) {
+				/* no page, or no memory for its picture: straight to it */
+				za.phase = 0;
+				za.page = false;
+				lv_screen_load(za.page_scr ? za.page_scr : home_scr);
+				za_free();
+				return;
+			}
 			lv_image_set_src(za.bg, za.page_pic);
 			lv_obj_set_style_radius(za.card, 0, 0);
 			za_run(6, LV_OPA_COVER, LV_OPA_TRANSP, ZA_FADE_MS, lv_anim_path_ease_in);
@@ -3235,6 +3389,7 @@ static void za_next(void)
 			tr_free(&za.page_pic);
 			return;
 		case 7:		/* covered: into the icon over home */
+			za_home_fresh();
 			lv_image_set_src(za.bg, za.home);
 			za_run(5, 1024, 0, ZA_SHRINK_MS, lv_anim_path_ease_out);
 			return;
@@ -3257,8 +3412,8 @@ static void za_next(void)
 		za_run(2, 0, 1, ZA_HOLD_MS, lv_anim_path_linear);
 		break;
 	case 2:			/* fade the card: the application shows */
-		if (app_pid > 0)
-			setpriority(PRIO_PROCESS, app_pid, 0);
+		/* the card alone: one GPU fill a frame (mbx_fill_straight) */
+		lv_obj_add_flag(za.sym, LV_OBJ_FLAG_HIDDEN);
 		mbx_gpu_set_transparent(true);
 		za_run(3, LV_OPA_COVER, LV_OPA_TRANSP, ZA_FADE_MS, lv_anim_path_ease_in);
 		break;
@@ -3270,7 +3425,10 @@ static void za_next(void)
 			app_home_ui();
 		break;
 	case 4:			/* covered: shrink into the icon over home */
+		lv_obj_remove_flag(za.sym, LV_OBJ_FLAG_HIDDEN);
 		mbx_gpu_set_transparent(false);
+		za_home_fresh();
+		lv_image_set_src(za.bg, za.home);
 		lv_obj_remove_flag(za.bg, LV_OBJ_FLAG_HIDDEN);
 		za_run(5, 1024, 0, ZA_SHRINK_MS, lv_anim_path_ease_out);
 		break;
@@ -3316,22 +3474,19 @@ static void page_open_from(lv_obj_t *tile, void (*open)(lv_event_t *))
 		return;
 	tr_finish();
 	shade_set(false, false);
-	push_quiet = true;
-	push_quiet_scr = NULL;
-	open(NULL);
-	push_quiet = false;
-	if (!push_quiet_scr)
-		return;
-	za.page_scr = push_quiet_scr;
+	/*
+	 * The page is built and pictured once the card covers the screen
+	 * (za_next, page case 1): doing it first held the tap ~100 ms.
+	 */
+	za.page_scr = NULL;
+	za.page_open = open;
 	tr_free(&za.page_pic);
-	za.page_pic = snap(za.page_scr, LV_COLOR_FORMAT_XRGB8888);
 	za.tile = za.page_tile = tile;
 	tr_free(&za.home);
 	za.home = grab_or_snap(home_scr);
 	za.home_min = bp_minute();
-	if (!za.page_pic || !za.home) {
-		tr_free(&za.page_pic);
-		lv_screen_load(za.page_scr);	/* no memory for pictures: no animation */
+	if (!za.home) {
+		open(NULL);	/* no memory for pictures: no animation */
 		return;
 	}
 	za.page = true;
@@ -3369,12 +3524,9 @@ static bool za_page_close(void)
 	cur = lv_screen_active();
 	tr_free(&za.page_pic);
 	za.page_pic = grab_or_snap(cur);
-	if (!za.home || za.home_min != bp_minute()) {
-		tr_free(&za.home);
-		za.home = snap(home_scr, LV_COLOR_FORMAT_XRGB8888);
-		za.home_min = bp_minute();
-	}
-	if (!za.page_pic || !za.home)
+	/* a stale home picture is retaken under the card (case 7) */
+	za.home_stale = !za.home || za.home_min != bp_minute();
+	if (!za.page_pic)
 		return false;
 	za.tile = za.page_tile;
 	za.page = true;
@@ -3413,7 +3565,7 @@ static void qs_to_page(void (*open)(lv_event_t *))
 	if (!push_quiet_scr)
 		return;
 	bg = snap(push_quiet_scr, LV_COLOR_FORMAT_XRGB8888);
-	fg = snap(shade, LV_COLOR_FORMAT_ARGB8888);
+	fg = shade_pic_get();
 	if (over_app) {
 		mbx_gpu_set_transparent(false);	/* the page covers it */
 		app_bar_set(false);
@@ -3426,13 +3578,14 @@ static void qs_to_page(void (*open)(lv_event_t *))
 	za.page_tile = settings_tile;
 	if (!bg || !fg) {
 		tr_free(&bg);
-		tr_free(&fg);
 		shade_set(false, false);
 		lv_screen_load(push_quiet_scr);
 		return;
 	}
+	tr_free(&sd.home_pic);
 	sd.sbg = bg;
 	sd.sfg = fg;
+	sd.fg_cached = true;
 	sd.back = push_quiet_scr;
 	sd.to_page = true;
 	sd.scr = lv_obj_create(NULL);
@@ -3583,15 +3736,13 @@ static void za_close(void)
 		app_home_ui();
 		return;
 	}
-	if (!za.home || za.home_min != bp_minute()) {
-		tr_free(&za.home);
-		za.home = snap(home_scr, LV_COLOR_FORMAT_XRGB8888);
-		za.home_min = bp_minute();
-	}
+	/* a stale home picture is retaken under the card (case 4) */
+	za.home_stale = !za.home || za.home_min != bp_minute();
 	shade_set(false, false);
 	app_bar_set(false);
 	za_build();
 	lv_obj_add_flag(za.bg, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_add_flag(za.sym, LV_OBJ_FLAG_HIDDEN);	/* (see case 2) */
 	za_rect(1024);
 	lv_obj_set_style_radius(za.card, 0, 0);
 	lv_screen_load(za.scr);
@@ -3661,12 +3812,63 @@ static bool app_end(void)
 	return true;
 }
 
+/*
+ * The application starts once the grow's first frame is out: layer 0
+ * filled with the card's colour first (za_fill_layer0, ~5 ms), then the
+ * program, by posix_spawn (no copy-on-write of the launcher's heap, whose
+ * faults stalled the next frames after fork), in its own process group.
+ * (Lowering its priority during the grow did not take here, by any route
+ * tried; with the fades on the GPU it matters little.)
+ */
+extern char **environ;
+
+static void za_spawn_cb(lv_timer_t *t)
+{
+	posix_spawnattr_t at;
+	char touch[96], **envp;
+	char *const argv[] = { "sh", "-c", (char *)za.cmd, NULL };
+	int n = 0, i;
+	pid_t pid;
+
+	LV_UNUSED(t);
+	if (app_pid != -1)
+		return;		/* (the launch was given up meanwhile) */
+	za_fill_layer0(za.col);
+	while (environ[n])
+		n++;
+	envp = calloc(n + 2, sizeof(*envp));
+	if (!envp) {
+		app_pid = 0;
+		return;
+	}
+	for (i = 0; i < n; i++)
+		envp[i] = environ[i];
+	if (rt_node[0]) {	/* its touch screen: the router's */
+		snprintf(touch, sizeof(touch), "N72_TOUCH=%s", rt_node);
+		for (i = 0; i < n && strncmp(envp[i], "N72_TOUCH=", 10); i++)
+			;
+		envp[i] = touch;
+	}
+	posix_spawnattr_init(&at);
+	posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP);
+	posix_spawnattr_setpgroup(&at, 0);	/* Home ends everything it starts */
+	if (posix_spawn(&pid, "/bin/sh", NULL, &at, argv, envp))
+		pid = 0;
+	if (getenv("N72_FPS"))
+		fprintf(stderr, "spawn: pid %d at %u ms, phase %d\n", (int)pid,
+			(unsigned)lv_tick_get(), za.phase);
+	posix_spawnattr_destroy(&at);
+	free(envp);
+	app_pid = pid;
+	/* idle while the card grows (the attribute alone did not take here);
+	 * za_next gives it full priority when the grow ends */
+}
+
 static void app_launch_cb(lv_event_t *e)
 {
 	const char *cmd = lv_event_get_user_data(e);
-	pid_t pid;
 
-	if (app_pid > 0 || za.phase || !mbx_gpu_on_shell_layer())
+	if (app_pid != 0 || za.phase || !mbx_gpu_on_shell_layer())
 		return;
 	if (!app_scr) {
 		/* nothing on it: transparent, the application shows */
@@ -3704,25 +3906,18 @@ static void app_launch_cb(lv_event_t *e)
 	za.home = grab_or_snap(home_scr);
 	za.home_min = bp_minute();
 
-	za_fill_layer0(lv_obj_get_style_bg_color(lv_obj_get_child(za.tile, 0), 0));
-	pid = fork();
-	if (pid < 0)
-		return;
-	if (!pid) {
-		setpgid(0, 0);		/* Home ends everything it starts */
-		if (rt_node[0])		/* its touch screen: the router's */
-			setenv("N72_TOUCH", rt_node, 1);
-		/* the animation first: full priority again when it fades */
-		setpriority(PRIO_PROCESS, 0, 5);
-		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-		_exit(127);
-	}
-	setpgid(pid, pid);
-	app_pid = pid;
+	za.cmd = cmd;
 	/* the shade comes down over the application from the top layer */
 	lv_obj_set_parent(scrim, lv_layer_top());
 	lv_obj_set_parent(shade, lv_layer_top());
+	{
+		/* started once the first frame of the grow is out (za_spawn_cb) */
+		lv_timer_t *st = lv_timer_create(za_spawn_cb, 20, NULL);
+
+		lv_timer_set_repeat_count(st, 1);
+	}
 	app_timer = lv_timer_create(app_poll, 200, NULL);
+	app_pid = -1;		/* (starting: no second launch meanwhile) */
 
 	za_build();
 	lv_screen_load(za.scr);
@@ -3800,6 +3995,19 @@ static void app_tiles(lv_obj_t *parent)
 
 static void open_paint(lv_event_t *e);
 
+/* An idle moment: the picture of the shade made ready before the next drag. */
+static void shade_pic_warm(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	if (!shade || screen_off || locked || sd.on || sd.scr || za.phase || tr.scr ||
+	    lv_anim_count_running() || (touch_indev &&
+	    lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
+		return;
+	if (shade_pic && !shade_pic_dirty && shade_pic_min == bp_minute())
+		return;
+	shade_pic_get();
+}
+
 static void build_home(void)
 {
 	lv_obj_t *bar, *apps;
@@ -3871,6 +4079,7 @@ static void build_home(void)
 
 	status_refresh(true);
 	home_timer = lv_timer_create(home_update, 2000, NULL);
+	lv_timer_create(shade_pic_warm, 1000, NULL);
 	home_update(NULL);
 	lv_screen_load(home_scr);
 	ui_reopen();

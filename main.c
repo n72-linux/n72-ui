@@ -32,7 +32,12 @@
 #include <linux/kd.h>
 #include <linux/uinput.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
+#include <spawn.h>
+#ifndef SCHED_IDLE
+#define SCHED_IDLE 5	/* (Linux; glibc shows it only with _GNU_SOURCE) */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,7 +66,8 @@
 static char *self_argv[4];
 static lv_obj_t *home_scr;
 static int keys_fd = -1;
-static int touch_wait_fd = -1;		/* own handle on the touch device, for poll() */
+static int touch_wait_fd = -1;
+static lv_timer_t *refr_timer;		/* LVGL's display refresh */		/* own handle on the touch device, for poll() */
 static lv_indev_t *touch_indev;
 
 /* Touch-to-screen latency (N72_LATENCY=1): newest touch event -> flush end. */
@@ -1344,13 +1350,35 @@ int main(int argc, char **argv)
 	 * waiting for its read timer.
 	 */
 	notify_fd = mbx_gpu_notify_fd();
+	refr_timer = lv_display_get_refr_timer(lv_display_get_default());
 	for (;;) {
 		struct pollfd pf[3] = {
 			{ .fd = touch_wait_fd, .events = POLLIN },
 			{ .fd = keys_fd, .events = POLLIN },
 			{ .fd = notify_fd, .events = POLLIN },
 		};
-		uint32_t idle = lv_timer_handler();
+		uint64_t th0;
+		uint32_t idle;
+
+		/*
+		 * Animation frames start when the display takes the last one,
+		 * not on LVGL's 16 ms timer, which drifts against the 16.7 ms
+		 * refresh: a frame drawn while one is still waiting replaces it
+		 * (drawn for nothing), and the one shown then stays two
+		 * refreshes. While a frame waits, the refresh timer rests;
+		 * the hand-over (notify_fd) wakes it.
+		 */
+		if (refr_timer && notify_fd >= 0) {
+			if (mbx_gpu_frame_waiting())
+				lv_timer_pause(refr_timer);
+			else
+				lv_timer_resume(refr_timer);
+		}
+		th0 = mono_us();
+		idle = lv_timer_handler();
+
+		if (fps_on && mono_us() - th0 > 30000)
+			fprintf(stderr, "timers: %.1f ms\n", (mono_us() - th0) / 1000.0);
 
 		if (poll(pf, 3, LV_MIN(idle, LV_DEF_REFR_PERIOD)) > 0) {
 			if ((pf[0].revents & POLLIN) && rt_uinput >= 0) {
@@ -1391,6 +1419,10 @@ int main(int argc, char **argv)
 				if (render_pending) {
 					render_pending = false;
 					render_now();
+				} else if (refr_timer && lv_anim_count_running()) {
+					/* an animation: its next frame now */
+					lv_timer_resume(refr_timer);
+					lv_timer_ready(refr_timer);
 				}
 			}
 			if (pf[1].revents & POLLIN)
