@@ -704,48 +704,250 @@ static long pf_size(const lv_draw_buf_t *b)
 }
 
 /*
- * Fling acceleration, as on iOS: a flick in the same direction soon after
- * the previous one (still gliding, or only just stopped) throws faster than
- * the finger did, 1.6x more each time up to 5x; a slow drag, a pause or a
- * change of direction starts again at 1x. LVGL then glides the throw down
- * as usual (scroll_throw per input period).
+ * Flick and glide. LVGL's own throw stopped hard: its velocity is a running
+ * average of the last input periods that the lift itself halves (the last
+ * read moves 0), and it lost 10 % per input period with integer steps (a
+ * time constant of ~150 ms). Instead: the velocity is measured over the
+ * last 80 ms of touch samples, and the page glides with an exponential
+ * decay (time constant GLIDE_TAU_MS, sub-pixel steps), as iOS and Android
+ * do, stopping at the end of the page; a touch catches it at once.
+ *
+ * Fling acceleration, also as on iOS: a flick in the same direction within
+ * FLING_GAP_MS of the last one throws 1.6x faster each time, up to 5x; a
+ * slow flick, a pause or a change of direction starts again at 1x.
  */
-#define FLING_GAP_MS	700	/* from one lift to the next, at most */
-#define FLING_MIN_V	6	/* px per input period: slower is a drag, not a flick */
+#define GLIDE_TAU_MS	325.0f	/* speed falls to 1/e in this time */
+#define GLIDE_MIN_V	30.0f	/* px/s: slower than this is a stop */
+#define FLICK_WINDOW_US	80000	/* release velocity from this much of the drag */
+#define FLING_GAP_MS	700
+#define FLING_MIN_V	400.0f	/* px/s: slower is a drag, not a flick */
+
+#define TS_N	16
+static struct {
+	uint64_t t[TS_N];
+	int32_t x[TS_N], y[TS_N];
+	int n, head;
+} ts;			/* recent touch samples while pressed */
+
+static struct {
+	lv_obj_t *obj;
+	bool hor;
+	float v0;	/* px/s at the lift, signed as the finger moved */
+	float tau_ms;	/* this glide's time constant */
+	int32_t done;	/* px moved so far */
+	bool on;
+} gl;
+
+static void glide_exec(void *var, int32_t ms);
+
+static void glide_end(const char *why)
+{
+	lv_obj_t *obj = gl.obj;
+
+	if (!gl.on)
+		return;
+	if (getenv("N72_FPS"))
+		fprintf(stderr, "glide: %d px, %s\n", (int)LV_ABS(gl.done), why);
+	gl.on = false;
+	gl.obj = NULL;
+	if (obj && lv_obj_is_valid(obj))
+		lv_obj_send_event(obj, LV_EVENT_SCROLL_END, NULL);
+}
+
+static void glide_stop(void)
+{
+	glide_end("caught");
+	lv_anim_delete(&gl, glide_exec);
+}
+
+static void glide_done(lv_anim_t *a)
+{
+	LV_UNUSED(a);
+	glide_end("slowed down");
+}
+
+/*
+ * One step per frame: an LVGL animation (stepped at the start of every
+ * refresh), whose value is the time since the lift. Position at time t of
+ * an exponential glide: v0 * tau * (1 - e^(-t/tau)).
+ */
+static void glide_exec(void *var, int32_t ms)
+{
+	float tau = gl.tau_ms / 1000.0f;
+	int32_t target, step, room;
+
+	LV_UNUSED(var);
+	if (!gl.on || !gl.obj || !lv_obj_is_valid(gl.obj)) {
+		gl.on = false;
+		gl.obj = NULL;
+		return;
+	}
+	target = (int32_t)lroundf(gl.v0 * tau * (1.0f - expf(-ms / gl.tau_ms)));
+	step = target - gl.done;
+	if (!step)
+		return;
+	/* positive: content follows a finger moving down/right (its top/left comes in) */
+	room = step > 0 ? (gl.hor ? lv_obj_get_scroll_left(gl.obj) : lv_obj_get_scroll_top(gl.obj))
+			: (gl.hor ? lv_obj_get_scroll_right(gl.obj) : lv_obj_get_scroll_bottom(gl.obj));
+	if (room <= 0) {
+		glide_end("at the end");
+		lv_anim_delete(&gl, glide_exec);
+		return;
+	}
+	if (LV_ABS(step) > room)
+		step = step > 0 ? room : -room;
+	gl.done += step;
+	/* raw: lv_obj_scroll_by() wraps each step in SCROLL_BEGIN/END */
+	if (gl.hor)
+		lv_obj_scroll_by_raw(gl.obj, step, 0);
+	else
+		lv_obj_scroll_by_raw(gl.obj, 0, step);
+}
+
+static void glide_start(lv_obj_t *obj, bool hor, float v)
+{
+	lv_anim_t a;
+	float tau_ms = GLIDE_TAU_MS;
+	int32_t room, dur;
+
+	/*
+	 * Would it run past the end of the page (the whole glide covers
+	 * v * tau)? Then a shorter time constant for this one, so it slows
+	 * to a stop at the end instead of hitting it at speed.
+	 */
+	room = v > 0 ? (hor ? lv_obj_get_scroll_left(obj) : lv_obj_get_scroll_top(obj))
+		     : (hor ? lv_obj_get_scroll_right(obj) : lv_obj_get_scroll_bottom(obj));
+	if (room > 0 && fabsf(v) * tau_ms / 1000.0f > room)
+		tau_ms = LV_MAX(1000.0f * room / fabsf(v), 20.0f);
+	/* until the speed falls below GLIDE_MIN_V */
+	dur = (int32_t)(tau_ms * logf(fabsf(v) / GLIDE_MIN_V));
+	glide_stop();
+	if (dur <= 0 || room <= 0)
+		return;
+	gl.tau_ms = tau_ms;
+	gl.obj = obj;
+	gl.hor = hor;
+	gl.v0 = v;
+	gl.done = 0;
+	gl.on = true;
+	lv_obj_send_event(obj, LV_EVENT_SCROLL_BEGIN, NULL);
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, &gl);
+	lv_anim_set_exec_cb(&a, glide_exec);
+	lv_anim_set_values(&a, 0, dur);
+	lv_anim_set_duration(&a, dur);
+	lv_anim_set_path_cb(&a, lv_anim_path_linear);
+	lv_anim_set_completed_cb(&a, glide_done);
+	lv_anim_start(&a);
+}
+
+/* a press anywhere stops a glide */
+static void ts_press_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	glide_stop();
+}
+
+/*
+ * The touch path, sampled at each scroll step the finger makes (LVGL sends
+ * no PRESSING to input devices); a glide's own steps have no active input.
+ */
+static void ts_cb(lv_event_t *e)
+{
+	lv_indev_t *in = lv_indev_active();
+	lv_point_t p;
+
+	if (lv_event_get_code(e) == LV_EVENT_SCROLL_BEGIN)
+		ts.n = 0;
+	if (!in || lv_indev_get_state(in) != LV_INDEV_STATE_PRESSED)
+		return;
+	lv_indev_get_point(in, &p);
+	ts.head = (ts.head + 1) % TS_N;
+	ts.t[ts.head] = mono_us();
+	ts.x[ts.head] = p.x;
+	ts.y[ts.head] = p.y;
+	if (ts.n < TS_N)
+		ts.n++;
+}
+
+/* finger velocity at the lift, px/s, over the last FLICK_WINDOW_US */
+static float ts_velocity(bool hor)
+{
+	int k, i = ts.head, j = ts.head;
+	uint64_t now = mono_us();
+	float dt;
+
+	if (ts.n < 2 || now - ts.t[ts.head] > FLICK_WINDOW_US)
+		return 0;		/* held still before the lift */
+	for (k = 1; k < ts.n; k++) {
+		int m = (ts.head - k + TS_N) % TS_N;
+
+		if (ts.t[ts.head] - ts.t[m] > FLICK_WINDOW_US)
+			break;
+		j = m;
+	}
+	if (j == i)
+		return 0;
+	dt = (ts.t[i] - ts.t[j]) / 1e6f;
+	if (dt <= 0)
+		return 0;
+	return (hor ? ts.x[i] - ts.x[j] : ts.y[i] - ts.y[j]) / dt;
+}
 
 static void fling_cb(lv_event_t *e)
 {
 	static uint32_t last_ms;
 	static int last_sign, mult10 = 10;
+	lv_obj_t *obj = lv_event_get_current_target(e);
 	lv_indev_t *in = lv_event_get_param(e);
-	int32_t *v;
-	int sign;
+	bool hor;
+	float v;
+	int sign, room_back;
 
 	if (!in)
 		return;
-	v = in->pointer.scroll_dir == LV_DIR_HOR ? &in->pointer.scroll_throw_vect.x :
-						   &in->pointer.scroll_throw_vect.y;
-	sign = *v > 0 ? 1 : -1;
-	if (LV_ABS(*v) < FLING_MIN_V) {
+	hor = in->pointer.scroll_dir == LV_DIR_HOR;
+	/* LVGL's throw off: the glide below replaces it */
+	in->pointer.scroll_throw_vect.x = in->pointer.scroll_throw_vect.y = 0;
+	in->pointer.scroll_throw_vect_ori = in->pointer.scroll_throw_vect;
+	/* pulled past an end: LVGL springs it back */
+	room_back = hor ? LV_MIN(lv_obj_get_scroll_left(obj), lv_obj_get_scroll_right(obj)) :
+			  LV_MIN(lv_obj_get_scroll_top(obj), lv_obj_get_scroll_bottom(obj));
+	if (room_back < 0)
+		return;
+	v = ts_velocity(hor);
+	sign = v > 0 ? 1 : -1;
+	if (fabsf(v) < FLING_MIN_V) {
 		mult10 = 10;
 		last_sign = 0;
-		return;
+	} else {
+		if (sign == last_sign && lv_tick_elaps(last_ms) < FLING_GAP_MS)
+			mult10 = LV_MIN(mult10 * 16 / 10, 50);
+		else
+			mult10 = 10;
+		last_sign = sign;
+		last_ms = lv_tick_get();
+		v = v * mult10 / 10;
 	}
-	if (sign == last_sign && lv_tick_elaps(last_ms) < FLING_GAP_MS)
-		mult10 = LV_MIN(mult10 * 16 / 10, 50);
-	else
-		mult10 = 10;
-	last_sign = sign;
-	last_ms = lv_tick_get();
-	*v = *v * mult10 / 10;
-	if (getenv("N72_FPS") && mult10 > 10)
-		fprintf(stderr, "fling: x%d.%d, throw %d px/period\n", mult10 / 10, mult10 % 10,
-			(int)*v);
+	if (getenv("N72_FPS"))
+		fprintf(stderr, "flick: %.0f px/s (x%d.%d)\n", v, mult10 / 10, mult10 % 10);
+	if (fabsf(v) >= GLIDE_MIN_V)
+		glide_start(obj, hor, v);
 }
 
 static void fling_accel(lv_obj_t *obj)
 {
+	lv_obj_add_event_cb(obj, ts_cb, LV_EVENT_SCROLL_BEGIN, NULL);
+	lv_obj_add_event_cb(obj, ts_cb, LV_EVENT_SCROLL, NULL);
 	lv_obj_add_event_cb(obj, fling_cb, LV_EVENT_SCROLL_THROW_BEGIN, NULL);
+}
+
+/* the touch path of every pointer device (after drags_init) */
+static void glide_init(void)
+{
+	for (lv_indev_t *in = lv_indev_get_next(NULL); in; in = lv_indev_get_next(in))
+		if (lv_indev_get_type(in) == LV_INDEV_TYPE_POINTER)
+			lv_indev_add_event_cb(in, ts_press_cb, LV_EVENT_PRESSED, NULL);
 }
 
 /* scroll-cached page bodies, to find the one on the active screen */
@@ -2861,6 +3063,7 @@ static void open_sound(lv_event_t *e)
 static void sound_ui_init(void)
 {
 	pf_init();
+	glide_init();
 	snd_init(conf.vol, conf.spk);
 	lv_timer_create(jack_check, 200, NULL);
 }
