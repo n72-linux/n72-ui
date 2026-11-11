@@ -599,6 +599,8 @@ static lv_obj_t *vol_hud;
 
 static void ui_settle_all(void);
 static bool za_page_close(void);
+static bool page_back_to_app(void);
+static bool page_home_over_app(void);
 
 static void go_home(void)
 {
@@ -610,6 +612,8 @@ static void go_home(void)
 	 * slide below would delete that screen as well.
 	 */
 	ui_settle_all();
+	if (page_home_over_app())
+		return;
 	if (app_end())
 		return;
 	if (za_page_close())
@@ -631,6 +635,8 @@ static void go_back(void)
 	lv_obj_t *prev;
 
 	if (nav_n <= 1) {
+		if (page_back_to_app())
+			return;	/* Settings over an application: back to it */
 		go_home();	/* (with the card, for a page opened from a tile) */
 		return;
 	}
@@ -1438,8 +1444,67 @@ static void sc_event(lv_event_t *e)
 	}
 }
 
+/*
+ * The scroll bar fades in as a page starts to move, stays a moment after it
+ * stops and fades out (LVGL's "active" mode switched it on and off with
+ * the scroll, a flash).
+ */
+#define SB_IN_MS	120
+#define SB_HOLD_MS	600
+#define SB_OUT_MS	300
+
+static void sb_opa(void *obj, int32_t v)
+{
+	lv_obj_set_style_opa(obj, (lv_opa_t)v, LV_PART_SCROLLBAR);
+}
+
+static void sb_fade(lv_obj_t *obj, bool in)
+{
+	lv_anim_t a;
+	int32_t now = lv_obj_get_style_opa(obj, LV_PART_SCROLLBAR);
+
+	lv_anim_delete(obj, sb_opa);
+	if (in && now == LV_OPA_COVER)
+		return;
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, obj);
+	lv_anim_set_exec_cb(&a, sb_opa);
+	lv_anim_set_values(&a, now, in ? LV_OPA_COVER : LV_OPA_TRANSP);
+	lv_anim_set_duration(&a, in ? SB_IN_MS : SB_OUT_MS);
+	lv_anim_set_delay(&a, in ? 0 : SB_HOLD_MS);
+	lv_anim_set_path_cb(&a, in ? lv_anim_path_ease_out : lv_anim_path_ease_in_out);
+	lv_anim_start(&a);
+}
+
+static void sb_cb(lv_event_t *e)
+{
+	lv_obj_t *obj = lv_event_get_current_target(e);
+
+	switch (lv_event_get_code(e)) {
+	case LV_EVENT_SCROLL_BEGIN:
+		sb_fade(obj, true);
+		break;
+	case LV_EVENT_SCROLL_END:
+		/* a glide sends its own begin and end: fade only when all is still */
+		if (!(gl.on && gl.obj == obj))
+			sb_fade(obj, false);
+		break;
+	case LV_EVENT_DELETE:
+		lv_anim_delete(obj, sb_opa);
+		break;
+	default:
+		break;
+	}
+}
+
 static void scroll_cached(lv_obj_t *body)
 {
+	/* the bar always drawn, its opacity animated (sb_cb) */
+	lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_ON);
+	lv_obj_set_style_opa(body, LV_OPA_TRANSP, LV_PART_SCROLLBAR);
+	lv_obj_add_event_cb(body, sb_cb, LV_EVENT_SCROLL_BEGIN, NULL);
+	lv_obj_add_event_cb(body, sb_cb, LV_EVENT_SCROLL_END, NULL);
+	lv_obj_add_event_cb(body, sb_cb, LV_EVENT_DELETE, NULL);
 	fling_accel(body);
 	if (pf_nbodies < PF_BODIES)
 		pf_bodies[pf_nbodies++] = body;
@@ -1492,10 +1557,31 @@ static lv_obj_t *m3_page(const char *title, lv_obj_t **scr_out)
 	lv_obj_set_style_pad_row(body, 8, 0);
 	lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_scroll_dir(body, LV_DIR_VER);
-	lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_ACTIVE);
 	scroll_cached(body);
 	*scr_out = scr;
 	return body;
+}
+
+/*
+ * An object back to its resting look at once, not through its style
+ * transition (adding a style ends an object's transitions): for pictures
+ * taken right after a tap.
+ */
+static void obj_rest(lv_obj_t *t)
+{
+	static lv_style_t none;
+	uint32_t i;
+
+	if (!t)
+		return;
+	lv_style_init(&none);
+	lv_obj_remove_state(t, LV_STATE_PRESSED);
+	for (i = 0; i <= lv_obj_get_child_count(t); i++) {
+		lv_obj_t *o = i ? lv_obj_get_child(t, i - 1) : t;
+
+		lv_obj_add_style(o, &none, 0);
+		lv_obj_remove_style(o, &none, 0);
+	}
 }
 
 static lv_obj_t *push_quiet_scr;	/* set: push() only records the page */
@@ -2066,14 +2152,13 @@ static void qs_open_bt(lv_event_t *e)
 static void page_open_from(lv_obj_t *tile, void (*open)(lv_event_t *));
 static lv_obj_t *settings_tile;
 
-/* The gear at the top right of the shade: Settings, from its home tile. */
+static void qs_to_page(void (*open)(lv_event_t *));
+
+/* The gear at the top right of the shade: the shade goes up off Settings. */
 static void qs_settings_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
-	if (app_pid > 0 || !settings_tile)
-		return;
-	shade_set(false, false);
-	page_open_from(settings_tile, open_settings);
+	qs_to_page(open_settings);
 }
 
 static void build_shade(void)
@@ -2426,6 +2511,7 @@ static struct {
 	uint32_t last_t;
 	float v;		/* px per ms, smoothed */
 	lv_obj_t *scr, *bgclip, *bg, *scrim, *fg, *back;
+	bool to_page;		/* closing onto a page (Settings from the shade) */
 	lv_draw_buf_t *sbg, *sfg;
 } sd;
 
@@ -2494,9 +2580,10 @@ static void sd_end(bool open)
 		home_wake();
 	} else {
 		shade_closed();
-		if (app_pid > 0)
+		if (app_pid > 0 && !sd.to_page)
 			app_bar_set(true);	/* the bar's timeout starts again */
 	}
+	sd.to_page = false;
 }
 
 static void sd_anim_done(lv_anim_t *a)
@@ -3243,6 +3330,7 @@ static void page_open_from(lv_obj_t *tile, void (*open)(lv_event_t *))
 	za.home = grab_or_snap(home_scr);
 	za.home_min = bp_minute();
 	if (!za.page_pic || !za.home) {
+		tr_free(&za.page_pic);
 		lv_screen_load(za.page_scr);	/* no memory for pictures: no animation */
 		return;
 	}
@@ -3255,18 +3343,8 @@ static void page_open_from(lv_obj_t *tile, void (*open)(lv_event_t *))
 static void page_launch_cb(lv_event_t *e)
 {
 	lv_obj_t *t = lv_event_get_current_target(e);
-	static lv_style_t none;
-	uint32_t i;
 
-	/* the tile back to rest at once (its transition would be pictured) */
-	lv_style_init(&none);
-	lv_obj_remove_state(t, LV_STATE_PRESSED);
-	for (i = 0; i <= lv_obj_get_child_count(t); i++) {
-		lv_obj_t *o = i ? lv_obj_get_child(t, i - 1) : t;
-
-		lv_obj_add_style(o, &none, 0);
-		lv_obj_remove_style(o, &none, 0);
-	}
+	obj_rest(t);	/* (its transition would be pictured) */
 	page_open_from(t, (void (*)(lv_event_t *))lv_event_get_user_data(e));
 }
 
@@ -3309,6 +3387,167 @@ static bool za_page_close(void)
 	return true;
 }
 
+/*
+ * Settings from the shade's gear: the page is built and pictured, and the
+ * shade goes up off it, the scrim clearing as it goes (the shade drag's
+ * pictures, with the page below instead of home). Over an application the
+ * launcher stops being transparent: the page covers the application, which
+ * runs on underneath. Back from that page slides it down off the
+ * application (page_back_to_app); Home ends the application, the card
+ * covering the page and going into the application's icon.
+ */
+static bool page_over_app;
+
+static void qs_to_page(void (*open)(lv_event_t *))
+{
+	lv_draw_buf_t *bg, *fg;
+	bool over_app = app_pid > 0 && lv_screen_active() == app_scr;
+
+	if (!shade_open || sd.on || sd.scr || za.phase || locked || !settings_tile ||
+	    (!over_app && lv_screen_active() != home_scr))
+		return;
+	push_quiet = true;
+	push_quiet_scr = NULL;
+	open(NULL);
+	push_quiet = false;
+	if (!push_quiet_scr)
+		return;
+	bg = snap(push_quiet_scr, LV_COLOR_FORMAT_XRGB8888);
+	fg = snap(shade, LV_COLOR_FORMAT_ARGB8888);
+	if (over_app) {
+		mbx_gpu_set_transparent(false);	/* the page covers it */
+		app_bar_set(false);
+		if (app_bar) {
+			lv_anim_delete(app_bar, app_y);
+			lv_obj_add_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
+		}
+		page_over_app = true;
+	}
+	za.page_tile = settings_tile;
+	if (!bg || !fg) {
+		tr_free(&bg);
+		tr_free(&fg);
+		shade_set(false, false);
+		lv_screen_load(push_quiet_scr);
+		return;
+	}
+	sd.sbg = bg;
+	sd.sfg = fg;
+	sd.back = push_quiet_scr;
+	sd.to_page = true;
+	sd.scr = lv_obj_create(NULL);
+	lv_obj_remove_style_all(sd.scr);
+	lv_obj_remove_flag(sd.scr, LV_OBJ_FLAG_SCROLLABLE);
+	sd.bgclip = lv_obj_create(sd.scr);
+	lv_obj_remove_style_all(sd.bgclip);
+	lv_obj_remove_flag(sd.bgclip, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_width(sd.bgclip, W);
+	sd.bg = lv_image_create(sd.bgclip);
+	lv_image_set_src(sd.bg, bg);
+	sd.scrim = lv_obj_create(sd.scr);
+	plain(sd.scrim);
+	lv_obj_set_width(sd.scrim, W);
+	lv_obj_set_style_radius(sd.scrim, 0, 0);
+	lv_obj_set_style_bg_color(sd.scrim, lv_color_black(), 0);
+	sd.fg = lv_image_create(sd.scr);
+	lv_image_set_src(sd.fg, fg);
+	lv_obj_add_flag(shade, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+	lv_screen_load(sd.scr);
+	sd.pics = true;
+	sd.y = 0;
+	sd_set(0);
+	{
+		lv_anim_t a;
+
+		lv_anim_init(&a);
+		lv_anim_set_var(&a, &sd);
+		lv_anim_set_exec_cb(&a, sd_anim_exec);
+		lv_anim_set_values(&a, 0, -SHADE_H);
+		lv_anim_set_duration(&a, 300);
+		lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+		lv_anim_set_completed_cb(&a, sd_anim_done);
+		lv_anim_start(&a);
+	}
+}
+
+/* Back from Settings over an application: the page slides down off it. */
+static struct {
+	lv_obj_t *scr, *img;
+	lv_draw_buf_t *pic;
+} pb;
+
+static void pb_exec(void *var, int32_t v)
+{
+	LV_UNUSED(var);
+	lv_obj_set_y(pb.img, v);
+}
+
+static void pb_done(lv_anim_t *a)
+{
+	LV_UNUSED(a);
+	lv_screen_load(app_pid > 0 ? app_scr : home_scr);
+	while (nav_n > 0)
+		lv_obj_delete_async(nav[--nav_n]);
+	lv_obj_delete(pb.scr);
+	pb.scr = NULL;
+	tr_free(&pb.pic);
+	if (app_pid <= 0)
+		app_home_ui();
+}
+
+static bool page_back_to_app(void)
+{
+	lv_anim_t a;
+
+	if (!page_over_app || app_pid <= 0 || pb.scr)
+		return false;
+	tr_finish();
+	obj_rest(lv_indev_get_active_obj());	/* the Back button, unpressed */
+	pb.pic = grab_or_snap(lv_screen_active());
+	if (!pb.pic)
+		return false;
+	page_over_app = false;
+	pb.scr = lv_obj_create(NULL);
+	lv_obj_remove_style_all(pb.scr);
+	lv_obj_remove_flag(pb.scr, LV_OBJ_FLAG_SCROLLABLE);
+	pb.img = lv_image_create(pb.scr);
+	lv_image_set_src(pb.img, pb.pic);
+	mbx_gpu_set_transparent(true);	/* the application shows as it goes */
+	lv_screen_load(pb.scr);
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, &pb);
+	lv_anim_set_exec_cb(&a, pb_exec);
+	lv_anim_set_values(&a, 0, H);
+	lv_anim_set_duration(&a, 280);
+	lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+	lv_anim_set_completed_cb(&a, pb_done);
+	lv_anim_start(&a);
+	return true;
+}
+
+static void app_kill_cb(lv_timer_t *t);
+
+/* Home on Settings over an application: the application ends into its icon. */
+static bool page_home_over_app(void)
+{
+	if (!page_over_app || app_pid <= 0)
+		return false;
+	page_over_app = false;
+	kill(-app_pid, SIGTERM);
+	if (!za.kill_timer) {
+		za.kill_timer = lv_timer_create(app_kill_cb, 600, NULL);
+		lv_timer_set_repeat_count(za.kill_timer, 1);
+	}
+	za.page_tile = za.tile;		/* the application's tile */
+	if (!za_page_close()) {
+		while (nav_n > 0)
+			lv_obj_delete_async(nav[--nav_n]);
+		lv_screen_load(home_scr);
+	}
+	return true;
+}
+
 /* Back to home (the application is gone, or going). */
 static void app_home_ui(void)
 {
@@ -3322,11 +3561,15 @@ static void app_home_ui(void)
 	lv_anim_delete(shade, app_y);
 	lv_obj_set_parent(scrim, home_scr);
 	lv_obj_set_parent(shade, home_scr);
-	if (qs_settings_btn)
-		lv_obj_remove_flag(qs_settings_btn, LV_OBJ_FLAG_HIDDEN);
 	mbx_gpu_set_transparent(false);
-	if (lv_screen_active() != home_scr && !locked)
+	if (page_over_app) {
+		/* the application went from under Settings: Settings stays,
+		 * a page like any other now (Home puts it into its tile) */
+		page_over_app = false;
+		za.page_tile = settings_tile;
+	} else if (lv_screen_active() != home_scr && !locked) {
 		lv_screen_load(home_scr);
+	}
 	if (locked)
 		lock_from = home_scr;
 	lv_obj_invalidate(lv_layer_top());
@@ -3359,6 +3602,15 @@ static void za_close(void)
 static void app_closed(void)
 {
 	bool was_ending = za.kill_timer != NULL;
+
+	/* a shade drag or settle over the application ends first: it would
+	 * otherwise reload the application's screen later (review finding) */
+	if (sd.on) {
+		sd.on = false;
+		sd.cand = 0;
+		sd_end(false);
+	}
+	sd_settle_now();
 
 	app_pid = 0;
 	if (app_timer) {
@@ -3467,12 +3719,9 @@ static void app_launch_cb(lv_event_t *e)
 	}
 	setpgid(pid, pid);
 	app_pid = pid;
-	/* the shade comes down over the application from the top layer;
-	 * its Settings button opens a page of the launcher: not over an app */
+	/* the shade comes down over the application from the top layer */
 	lv_obj_set_parent(scrim, lv_layer_top());
 	lv_obj_set_parent(shade, lv_layer_top());
-	if (qs_settings_btn)
-		lv_obj_add_flag(qs_settings_btn, LV_OBJ_FLAG_HIDDEN);
 	app_timer = lv_timer_create(app_poll, 200, NULL);
 
 	za_build();
