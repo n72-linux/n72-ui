@@ -2659,6 +2659,13 @@ static void ui_lock(void)
 	lv_screen_load(lock_scr);
 	locked = true;
 	lv_refr_now(NULL);
+	{
+		/* on the panel before the system sleeps: otherwise the old
+		 * frame shows for a moment on waking */
+		uint32_t stride;
+
+		(void)mbx_gpu_front(&stride);
+	}
 }
 
 /* Screen on: a fresh picture of where you were, for the swipe. */
@@ -2886,10 +2893,10 @@ static bool ui_drag(int phase, int x, int y)
  * home's icon shows through as it ends. Fades are drawn with alpha by the
  * CPU (the launcher's transparent mode); the moves are XRGB, on the GPU.
  */
-#define ZA_GROW_MS	260
-#define ZA_HOLD_MS	140
-#define ZA_FADE_MS	160
-#define ZA_SHRINK_MS	260
+#define ZA_GROW_MS	200
+#define ZA_HOLD_MS	40
+#define ZA_FADE_MS	110
+#define ZA_SHRINK_MS	210
 
 static struct {
 	int phase;		/* 0 idle, 1 grow, 2 hold, 3 fade out, 4 fade in, 5 shrink */

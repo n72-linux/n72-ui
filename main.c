@@ -151,11 +151,11 @@ static void fps_frame(void)
 	if (fps_n && iv > 100000) {
 		if (fps_n >= 4)
 			fprintf(stderr, "burst: %u frames in %.0f ms (%.1f fps), interval max %.1f ms, "
-				"%u over 20 ms; render avg %.1f max %.1f ms\n", fps_n,
+				"%u over 20 ms; render avg %.1f max %.1f ms; pool misses %lu\n", fps_n,
 				(fps_last_us - fps_first_us) / 1000.0,
 				(fps_n - 1) * 1e6 / (double)(fps_last_us - fps_first_us + 1),
 				fps_int_max / 1000.0, fps_slow, fps_rend_sum / 1000.0 / fps_n,
-				fps_rend_max / 1000.0);
+				fps_rend_max / 1000.0, mbx_gpu_stats.pool_misses);
 		if (fps_n >= 4) {
 			struct mbx_gpu_stats *g = &mbx_gpu_stats;
 			int i;
