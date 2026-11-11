@@ -13,7 +13,11 @@
  */
 
 #include <math.h>
+#include <spawn.h>
+#include "lvgl/src/indev/lv_indev_private.h"	/* the throw velocity */
 #include <sys/wait.h>
+
+extern char **environ;
 
 static bool system_sleep(void);
 
@@ -302,6 +306,7 @@ static void back_cb(lv_event_t *e);
 static struct {
 	lv_obj_t *scr, *bg, *fg;	/* transition screen and its two pictures */
 	lv_draw_buf_t *sbg, *sfg;
+	lv_obj_t *keep_for;		/* forward: keep the old page's picture for Back */
 	lv_obj_t *to, *from;		/* screen to load at the end, and to delete */
 	int kind;			/* 0 slide left, 1 slide right, 2 shade */
 	void (*done)(void);
@@ -327,9 +332,97 @@ static void tr_free(lv_draw_buf_t **b)
 	}
 }
 
+/*
+ * Back slides: the picture of a page taken when it was left (forward) is
+ * the picture to slide back to, so going back renders nothing. Two pages
+ * at most (each is a full screen of GPU memory). A picture is dropped when
+ * the page goes, when one of its labels changes (label_set_if_changed:
+ * status texts), or when the minute changes (the clock).
+ */
+#define BP_MAX 2
+static struct {
+	lv_obj_t *scr;
+	lv_draw_buf_t *buf;
+	long minute;
+} bp[BP_MAX];
+
+static long bp_minute(void)
+{
+	return (long)(time(NULL) / 60);
+}
+
+static void bp_drop(int i)
+{
+	tr_free(&bp[i].buf);
+	bp[i].scr = NULL;
+}
+
+static void bp_scr_deleted(lv_event_t *e)
+{
+	lv_obj_t *scr = lv_event_get_current_target(e);
+
+	for (int i = 0; i < BP_MAX; i++)
+		if (bp[i].scr == scr)
+			bp_drop(i);
+}
+
+/* @scr changed (a label of it): its picture no longer matches. */
+static void bp_changed(lv_obj_t *scr)
+{
+	for (int i = 0; i < BP_MAX; i++)
+		if (bp[i].scr && bp[i].scr == scr)
+			bp_drop(i);
+}
+
+static void bp_put(lv_obj_t *scr, lv_draw_buf_t *buf)
+{
+	int i, slot = 0;
+
+	bp_changed(scr);
+	for (i = 0; i < BP_MAX; i++)
+		if (!bp[i].scr) {
+			slot = i;
+			break;
+		}
+	if (i == BP_MAX) {		/* full: drop the older one */
+		slot = 0;
+		bp_drop(0);
+	}
+	bp[slot].scr = scr;
+	bp[slot].buf = buf;
+	bp[slot].minute = bp_minute();
+	lv_obj_remove_event_cb(scr, bp_scr_deleted);
+	lv_obj_add_event_cb(scr, bp_scr_deleted, LV_EVENT_DELETE, NULL);
+}
+
+/* @scr's picture, if still current (the caller owns it then). */
+static lv_draw_buf_t *bp_take(lv_obj_t *scr)
+{
+	lv_draw_buf_t *b;
+
+	for (int i = 0; i < BP_MAX; i++) {
+		if (bp[i].scr != scr)
+			continue;
+		if (bp[i].minute != bp_minute()) {
+			bp_drop(i);
+			return NULL;
+		}
+		b = bp[i].buf;
+		bp[i].buf = NULL;
+		bp[i].scr = NULL;
+		return b;
+	}
+	return NULL;
+}
+
 static void tr_finish(void)
 {
-	lv_obj_t *scr = tr.scr, *from = tr.from;
+	if (tr.scr && getenv("N72_FPS")) {
+		extern uint64_t n72_mark_us;
+
+		fprintf(stderr, "slide end at %.0f ms after the mark\n", (mono_us() - n72_mark_us) / 1000.0);
+	}
+	lv_obj_t *scr = tr.scr, *from = tr.from, *keep = tr.keep_for;
 	void (*done)(void) = tr.done;
 
 	if (!scr)
@@ -337,9 +430,15 @@ static void tr_finish(void)
 	tr.scr = NULL;
 	tr.from = NULL;
 	tr.done = NULL;
+	tr.keep_for = NULL;
 	lv_anim_delete(&tr, tr_exec);
 	lv_screen_load(tr.to);
 	lv_obj_delete(scr);
+	if (keep && tr.sbg && lv_obj_is_valid(keep)) {
+		lv_image_cache_drop(tr.sbg);	/* (its image object is gone) */
+		bp_put(keep, tr.sbg);
+		tr.sbg = NULL;
+	}
 	tr_free(&tr.sbg);
 	tr_free(&tr.sfg);
 	if (from)
@@ -366,14 +465,29 @@ static lv_draw_buf_t *snap(lv_obj_t *obj, lv_color_format_t cf)
 }
 
 /* The screen on display: copied from the display buffer when it is current. */
+static uint32_t gs_refr_ms, gs_grab_ms;	/* (statistics) */
+static uint32_t ui_release_ms;		/* (statistics) the last finger lift */
+
+static void ui_release_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	ui_release_ms = lv_tick_get();
+}
+static bool gs_grabbed;
+
 static lv_draw_buf_t *grab_or_snap(lv_obj_t *scr)
 {
 	lv_draw_buf_t *b = NULL;
+	uint32_t t0 = lv_tick_get(), t1 = t0;
 
 	if (scr == lv_screen_active()) {
 		lv_refr_now(NULL);	/* pending changes (a pressed row) first */
+		t1 = lv_tick_get();
 		b = mbx_gpu_grab_screen();
 	}
+	gs_refr_ms = t1 - t0;
+	gs_grab_ms = lv_tick_get() - t1;
+	gs_grabbed = b != NULL;
 	return b ? b : snap(scr, LV_COLOR_FORMAT_XRGB8888);
 }
 
@@ -424,14 +538,40 @@ static void slide(lv_obj_t *to, bool left, bool del_from)
 {
 	lv_obj_t *from;
 
+	lv_draw_buf_t *bg, *fg;
+	uint32_t t0, t1, t2;
+	bool reused;
+
 	tr_finish();
 	from = lv_screen_active();
 	if (from == to)
 		return;
-	if (!tr_start(grab_or_snap(from), snap(to, LV_COLOR_FORMAT_XRGB8888),
-		      left ? 0 : 1, to, del_from ? from : NULL, 0, left ? -W : W))
+	{
+		extern uint64_t n72_mark_us;
+
+		n72_mark_us = mono_us();
+	}
+	t0 = lv_tick_get();
+	bg = grab_or_snap(from);
+	t1 = lv_tick_get();
+	fg = bp_take(to);
+	reused = fg != NULL;
+	if (!fg)
+		fg = snap(to, LV_COLOR_FORMAT_XRGB8888);
+	t2 = lv_tick_get();
+	if (getenv("N72_FPS"))
+		fprintf(stderr, "slide %s: %u ms after the lift; old page %u ms (refresh %u, %s %u), new page %u ms%s\n",
+			left ? "forward" : "back", (unsigned)(t0 - ui_release_ms), (unsigned)(t1 - t0),
+			(unsigned)gs_refr_ms,
+			gs_grabbed ? "grab" : "grab failed, snapshot", (unsigned)gs_grab_ms,
+			(unsigned)(t2 - t1), reused ? " (kept picture)" : "");
+	if (!tr_start(bg, fg, left ? 0 : 1, to, del_from ? from : NULL, 0, left ? -W : W)) {
 		lv_screen_load_anim(to, left ? LV_SCR_LOAD_ANIM_MOVE_LEFT :
 				    LV_SCR_LOAD_ANIM_MOVE_RIGHT, TR_MS, 0, del_from);
+		return;
+	}
+	if (!del_from)
+		tr.keep_for = from;	/* the page stays: Back can slide to this picture */
 }
 
 static void show(lv_obj_t *scr)
@@ -544,14 +684,59 @@ static void sc_settle(lv_timer_t *t)
  * render them (a 35-57 ms hitch on Settings). Kept out of sight; a row that
  * is redrawn meanwhile loses its picture (see pf_invalidated).
  */
-#define PF_MAX		16
+#define PREF_MAX		16
 
 static struct {
 	lv_obj_t *owner;
-	lv_obj_t *child[PF_MAX];
-	lv_draw_buf_t *buf[PF_MAX];
+	lv_obj_t *child[PREF_MAX];
+	lv_draw_buf_t *buf[PREF_MAX];
 	int n;
 } pf;
+
+/*
+ * Fling acceleration, as on iOS: a flick in the same direction soon after
+ * the previous one (still gliding, or only just stopped) throws faster than
+ * the finger did, 1.6x more each time up to 5x; a slow drag, a pause or a
+ * change of direction starts again at 1x. LVGL then glides the throw down
+ * as usual (scroll_throw per input period).
+ */
+#define FLING_GAP_MS	700	/* from one lift to the next, at most */
+#define FLING_MIN_V	6	/* px per input period: slower is a drag, not a flick */
+
+static void fling_cb(lv_event_t *e)
+{
+	static uint32_t last_ms;
+	static int last_sign, mult10 = 10;
+	lv_indev_t *in = lv_event_get_param(e);
+	int32_t *v;
+	int sign;
+
+	if (!in)
+		return;
+	v = in->pointer.scroll_dir == LV_DIR_HOR ? &in->pointer.scroll_throw_vect.x :
+						   &in->pointer.scroll_throw_vect.y;
+	sign = *v > 0 ? 1 : -1;
+	if (LV_ABS(*v) < FLING_MIN_V) {
+		mult10 = 10;
+		last_sign = 0;
+		return;
+	}
+	if (sign == last_sign && lv_tick_elaps(last_ms) < FLING_GAP_MS)
+		mult10 = LV_MIN(mult10 * 16 / 10, 50);
+	else
+		mult10 = 10;
+	last_sign = sign;
+	last_ms = lv_tick_get();
+	*v = *v * mult10 / 10;
+	if (getenv("N72_FPS") && mult10 > 10)
+		fprintf(stderr, "fling: x%d.%d, throw %d px/period\n", mult10 / 10, mult10 % 10,
+			(int)*v);
+}
+
+static void fling_accel(lv_obj_t *obj)
+{
+	lv_obj_add_event_cb(obj, fling_cb, LV_EVENT_SCROLL_THROW_BEGIN, NULL);
+}
 
 /* scroll-cached page bodies, to find the one on the active screen */
 #define PF_BODIES	16
@@ -762,7 +947,7 @@ static void pf_tick(lv_timer_t *t)
 		pf_clear();
 		pf.owner = body;
 	}
-	if (!body || pf.n >= PF_MAX)
+	if (!body || pf.n >= PREF_MAX)
 		return;
 	lv_obj_update_layout(body);
 	lv_obj_get_coords(body, &bc);
@@ -816,13 +1001,16 @@ static void pf_invalidated(lv_event_t *e)
 			continue;
 		}
 		lv_obj_get_coords(pf.child[i], &cc);
-		if (lv_area_intersect(&x, &cc, a))
+		if (_lv_area_intersect(&x, &cc, a))
 			pf_drop(i);
 	}
 }
 
 static void pf_init(void)
 {
+	if (getenv("N72_FPS"))
+		for (lv_indev_t *in = lv_indev_get_next(NULL); in; in = lv_indev_get_next(in))
+			lv_indev_add_event_cb(in, ui_release_cb, LV_EVENT_RELEASED, NULL);
 	if (getenv("N72_NO_SCROLL_CACHE") || getenv("N72_NO_PREFETCH"))
 		return;
 	lv_display_add_event_cb(lv_display_get_default(), pf_invalidated,
@@ -885,6 +1073,7 @@ static void sc_event(lv_event_t *e)
 
 static void scroll_cached(lv_obj_t *body)
 {
+	fling_accel(body);
 	if (pf_nbodies < PF_BODIES)
 		pf_bodies[pf_nbodies++] = body;
 	lv_obj_add_event_cb(body, sc_event, LV_EVENT_SCROLL_BEGIN, NULL);
@@ -984,24 +1173,72 @@ static void job_poll(lv_timer_t *t)
 }
 
 static void job_run(const char *cmd, lv_obj_t *owner,
+		    void (*done)(const char *out, void *ud), void *ud);
+
+/* A job asked for during a page slide, started once the slide is over. */
+struct job_later {
+	char *cmd;
+	lv_obj_t *owner;
+	void (*done)(const char *out, void *ud);
+	void *ud;
+};
+
+static void job_later_cb(lv_timer_t *t)
+{
+	struct job_later *l = lv_timer_get_user_data(t);
+
+	if (tr.scr)
+		return;			/* still sliding (a second one): look again */
+	lv_timer_delete(t);
+	if (!l->owner || lv_obj_is_valid(l->owner))
+		job_run(l->cmd, l->owner, l->done, l->ud);
+	free(l->cmd);
+	free(l);
+}
+
+static void job_run(const char *cmd, lv_obj_t *owner,
 		    void (*done)(const char *out, void *ud), void *ud)
 {
-	struct job *j = calloc(1, sizeof(*j));
+	struct job *j;
+	posix_spawn_file_actions_t fa;
+	char *argv[] = { "sh", "-c", (char *)cmd, NULL };
 	int p[2];
 
+	/*
+	 * Not during a slide: on one core the command (bluetoothctl alone is
+	 * ~160 ms of CPU) takes the slide's frames. Its result lands a moment
+	 * later instead.
+	 */
+	if (tr.scr) {
+		struct job_later *l = calloc(1, sizeof(*l));
+
+		if (l && (l->cmd = strdup(cmd))) {
+			l->owner = owner;
+			l->done = done;
+			l->ud = ud;
+			lv_timer_create(job_later_cb, 50, l);
+			return;
+		}
+		free(l);
+	}
+	j = calloc(1, sizeof(*j));
 	if (!j || pipe(p)) {
 		free(j);
 		return;
 	}
-	j->pid = fork();
-	if (j->pid == 0) {
-		dup2(p[1], 1);
-		dup2(p[1], 2);
-		close(p[0]);
-		close(p[1]);
-		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-		_exit(127);
-	}
+	/*
+	 * posix_spawn, not fork: glibc's is a vfork-style clone, so the page
+	 * tables of this process (GPU pool, LVGL) are not copied for a
+	 * command that only execs a shell.
+	 */
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, p[1], 1);
+	posix_spawn_file_actions_adddup2(&fa, p[1], 2);
+	posix_spawn_file_actions_addclose(&fa, p[0]);
+	posix_spawn_file_actions_addclose(&fa, p[1]);
+	if (posix_spawn(&j->pid, "/bin/sh", &fa, NULL, argv, environ))
+		j->pid = -1;
+	posix_spawn_file_actions_destroy(&fa);
 	close(p[1]);
 	if (j->pid < 0) {
 		close(p[0]);
@@ -1070,8 +1307,10 @@ static void label_set_if_changed(lv_obj_t *lbl, const char *text)
 {
 	const char *cur = lv_label_get_text(lbl);
 
-	if (!cur || strcmp(cur, text))
+	if (!cur || strcmp(cur, text)) {
 		lv_label_set_text(lbl, text);
+		bp_changed(lv_obj_get_screen(lbl));
+	}
 }
 
 static void ip_of(const char *ifname, char *out, size_t len)
@@ -2615,6 +2854,7 @@ static void open_logs(lv_event_t *e)
 	lv_obj_set_style_radius(logs_box, 16, 0);
 	lv_obj_set_style_bg_color(logs_box, M.surface_c, 0);
 	lv_obj_set_scroll_dir(logs_box, LV_DIR_VER);
+	fling_accel(logs_box);
 	lv_obj_set_flex_flow(logs_box, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_style_pad_row(logs_box, 0, 0);
 	logs_nchunks = 0;

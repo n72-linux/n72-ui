@@ -135,9 +135,15 @@ void n72_refr_start(void)
 	lv_anim_refr_now();
 }
 
+uint64_t n72_mark_us;	/* (debug) a point to time long frames from, e.g. a slide start */
+
 static void fps_frame(void)
 {
 	uint64_t now = mono_us(), rend = now - fps_refr_us, iv = now - fps_last_us;
+
+	if (fps_n && iv > 40000 && iv < 100000)
+		fprintf(stderr, "long frame: %.1f ms (render %.1f), %.0f ms after the mark\n",
+			iv / 1000.0, rend / 1000.0, (now - n72_mark_us) / 1000.0);
 
 	if (fps_n && iv > 100000) {
 		if (fps_n >= 4)
@@ -1073,8 +1079,8 @@ int main(int argc, char **argv)
 	lv_timer_create(playback_check, 2000, NULL);
 
 	build_home();
-	sound_ui_init();
 	drags_init();
+	sound_ui_init();
 	crash_handlers();
 	signal(SIGUSR1, on_usr1);
 	signal(SIGUSR2, on_usr2);

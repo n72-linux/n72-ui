@@ -1543,8 +1543,12 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void)
 		return NULL;
 	}
 	lv_area_set(&all, 0, 0, fb.width - 1, fb.height - 1);
-	if (flipping)
-		flip_wait();		/* the last frame is on screen */
+	/*
+	 * No wait for the display: the newest finished frame (st_latest) is
+	 * complete once its flush is (flush_flip waits for the GPU), and only
+	 * this thread draws, so nothing writes it meanwhile. Waiting for it to
+	 * reach the screen cost up to a frame at every slide's start.
+	 */
 	gpu_wait(flush_seq);		/* the last frame is complete */
 	flush_seq = 0;
 	buf_invalidate(b, &all);
