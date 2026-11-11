@@ -587,8 +587,12 @@ static int nav_n;
 
 static void shade_set(bool open, bool anim);
 
+static bool app_end(void);
+
 static void go_home(void)
 {
+	if (app_end())
+		return;
 	tr_finish();
 	shade_set(false, false);
 	while (nav_n > 0) {
@@ -2023,6 +2027,159 @@ static void build_shade(void)
 	lv_obj_remove_flag(h, LV_OBJ_FLAG_CLICKABLE);
 }
 
+/* ------------------------------------------------------- applications */
+
+/*
+ * An application is a program of its own that draws on the display's
+ * layer 0: as the master of KMS device n72-clcd, or through the frame
+ * buffer. The launcher has layer 1 above it (mbx_gpu.c, kms_open) and,
+ * while the application runs, shows a screen that is zeros, hence
+ * transparent, wherever it has nothing to draw. So the application never
+ * needs the screen handed to it, and whatever the launcher puts on that
+ * screen lies over it.
+ *
+ * Home ends the application; so does its own exit. Input still goes to
+ * both for now (they read the same event devices).
+ *
+ * Manifests: APPS_DIR/<x>.app with the lines "name=<title>" and
+ * "exec=<shell command>"; each becomes a tile on the home screen.
+ */
+#define APPS_DIR "/usr/share/n72-ui/apps"
+
+static lv_obj_t *app_scr;
+static pid_t app_pid;
+static lv_timer_t *app_timer;
+
+static void app_clear_cb(lv_event_t *e)
+{
+	lv_area_t a;
+
+	lv_obj_get_coords(lv_event_get_target(e), &a);
+	mbx_gpu_clear(lv_event_get_layer(e), &a);
+}
+
+/* The application is gone (or is being ended): back to the home screen. */
+static void app_closed(void)
+{
+	app_pid = 0;
+	if (app_timer) {
+		lv_timer_delete(app_timer);
+		app_timer = NULL;
+	}
+	if (lv_screen_active() == app_scr)
+		lv_screen_load(home_scr);
+	home_update(NULL);
+}
+
+static void app_poll(lv_timer_t *t)
+{
+	int st;
+
+	LV_UNUSED(t);
+	if (app_pid > 0 && waitpid(app_pid, &st, WNOHANG) == app_pid)
+		app_closed();
+}
+
+/* Home: end the application, if one runs. */
+static bool app_end(void)
+{
+	int st, i;
+
+	if (app_pid <= 0)
+		return false;
+	kill(-app_pid, SIGTERM);
+	for (i = 0; i < 50 && waitpid(app_pid, &st, WNOHANG) == 0; i++)
+		usleep(10000);
+	if (i == 50) {
+		kill(-app_pid, SIGKILL);
+		waitpid(app_pid, &st, 0);
+	}
+	app_closed();
+	return true;
+}
+
+static void app_launch_cb(lv_event_t *e)
+{
+	const char *cmd = lv_event_get_user_data(e);
+	pid_t pid;
+
+	if (app_pid > 0 || !mbx_gpu_on_shell_layer())
+		return;
+	if (!app_scr) {
+		lv_obj_t *clear;
+
+		app_scr = lv_obj_create(NULL);
+		lv_obj_remove_style_all(app_scr);
+		lv_obj_remove_flag(app_scr, LV_OBJ_FLAG_SCROLLABLE);
+		clear = lv_obj_create(app_scr);
+		lv_obj_remove_style_all(clear);
+		lv_obj_set_size(clear, W, H);
+		lv_obj_remove_flag(clear, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+		lv_obj_add_event_cb(clear, app_clear_cb, LV_EVENT_DRAW_MAIN, NULL);
+	}
+	tr_finish();
+	shade_set(false, false);
+	pid = fork();
+	if (pid < 0)
+		return;
+	if (!pid) {
+		setpgid(0, 0);		/* Home ends everything it starts */
+		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+		_exit(127);
+	}
+	setpgid(pid, pid);
+	app_pid = pid;
+	lv_screen_load(app_scr);
+	app_timer = lv_timer_create(app_poll, 200, NULL);
+}
+
+/* One tile for every manifest in APPS_DIR. */
+static void app_tiles(lv_obj_t *parent)
+{
+	DIR *d = opendir(APPS_DIR);
+	struct dirent *de;
+
+	if (!d || !mbx_gpu_on_shell_layer()) {
+		if (d)
+			closedir(d);
+		return;
+	}
+	while ((de = readdir(d))) {
+		char path[300], line[400], name[40] = "", cmd[400] = "";
+		size_t n = strlen(de->d_name);
+		FILE *f;
+
+		if (n < 5 || strcmp(de->d_name + n - 4, ".app"))
+			continue;
+		snprintf(path, sizeof(path), APPS_DIR "/%s", de->d_name);
+		f = fopen(path, "r");
+		if (!f)
+			continue;
+		while (fgets(line, sizeof(line), f)) {
+			line[strcspn(line, "\n")] = 0;
+			if (!strncmp(line, "name=", 5))
+				snprintf(name, sizeof(name), "%s", line + 5);
+			else if (!strncmp(line, "exec=", 5))
+				snprintf(cmd, sizeof(cmd), "%s", line + 5);
+		}
+		fclose(f);
+		if (name[0] && cmd[0]) {
+			uint32_t before = lv_obj_get_child_count(parent);
+
+			app_tile(parent, LV_SYMBOL_PLAY, name, M.secondary_c, M.on_secondary_c,
+				 app_launch_cb);
+			/* the manifest's command rides on the tile's click */
+			if (lv_obj_get_child_count(parent) > before) {
+				lv_obj_t *t = lv_obj_get_child(parent, before);
+
+				lv_obj_remove_event_cb(t, app_launch_cb);
+				lv_obj_add_event_cb(t, app_launch_cb, LV_EVENT_CLICKED, strdup(cmd));
+			}
+		}
+	}
+	closedir(d);
+}
+
 static void open_paint(lv_event_t *e);
 
 static void build_home(void)
@@ -2064,6 +2221,7 @@ static void build_home(void)
 	lv_obj_set_flex_align(apps, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 	app_tile(apps, LV_SYMBOL_SETTINGS, "Settings", M.primary_c, M.on_primary_c, open_settings);
 	app_tile(apps, LV_SYMBOL_EDIT, "Paint", M.tertiary_c, M.on_tertiary_c, open_paint);
+	app_tiles(apps);
 
 	build_shade();
 

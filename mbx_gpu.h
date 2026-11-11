@@ -39,4 +39,14 @@ int mbx_gpu_notify_fd(void);
 /* An opaque (XRGB8888) copy of an ARGB8888 picture over @bg, or NULL. */
 lv_draw_buf_t *mbx_gpu_flatten(const lv_draw_buf_t *src, lv_color_t bg);
 
+/*
+ * Zeros, alpha included, over @area of @layer's buffer (clipped). On the
+ * display's layer 1 that is "show what layer 0 has": the launcher's screen
+ * while an application runs is cleared with this where it draws nothing.
+ * Without the GPU nothing is cleared.
+ */
+void mbx_gpu_clear(lv_layer_t *layer, const lv_area_t *area);
+/* True when the launcher has the display's layer 1 (KMS n72-clcd-shell). */
+bool mbx_gpu_on_shell_layer(void);
+
 #endif

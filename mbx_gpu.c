@@ -319,6 +319,9 @@ static void buf_clean(const lv_draw_buf_t *b, const lv_area_t *a)
 
 /* --------------------------------------------------- the draw unit */
 
+/* user_data of the fill tasks mbx_gpu_clear() makes: zeros, not a colour */
+static const char clear_tag;
+
 static bool cf_ok(lv_color_format_t cf)
 {
 	return cf == LV_COLOR_FORMAT_XRGB8888 || cf == LV_COLOR_FORMAT_ARGB8888;
@@ -402,9 +405,10 @@ static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 		 * areas are worth it. Opaque fills use the 2D engine, translucent
 		 * ones the 3D core (XRGB8888 targets only).
 		 */
-		if (d->opa >= LV_OPA_MAX ? size < 16384 : size < 8192 ||
-		    dcf != LV_COLOR_FORMAT_XRGB8888)
-			return 0;
+		if (d->base.user_data != &clear_tag &&
+		    (d->opa >= LV_OPA_MAX ? size < 16384 : size < 8192 ||
+		     dcf != LV_COLOR_FORMAT_XRGB8888))
+			return 0;	/* (a clear is the GPU's whatever its size) */
 	} else if (t->type == LV_DRAW_TASK_TYPE_LAYER) {
 		const lv_draw_image_dsc_t *d = t->draw_dsc;
 
@@ -602,6 +606,18 @@ static void mbx_fill(lv_draw_unit_t *u, lv_draw_task_t *t)
 
 	if (!lv_area_intersect(&a, c, clip))
 		return;
+	if (d->base.user_data == &clear_tag) {
+		uint32_t w[32];
+
+		if (!in_pool(b->data))
+			return;
+		lv_area_move(&a, -layer->buf_area.x1, -layer->buf_area.y1);
+		rect_flush();
+		buf_invalidate(b, &a);		/* drop CPU lines over the area */
+		submit(w, put_fill(w, gpu_addr(b->data), b->header.stride, 0, a.x1, a.y1,
+				   lv_area_get_width(&a), lv_area_get_height(&a)));
+		return;
+	}
 	if (!in_pool(b->data)) {
 		lv_draw_sw_fill(u, d, c);
 		return;
@@ -1491,13 +1507,46 @@ static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
 
 /* Page flipping: two contiguous scan-out buffers, if the kernel can flip. */
 /*
- * KMS (/dev/dri/card0, n72-clcd): the scan-out buffers are exported from
+ * KMS (kms_open() below): the scan-out buffers are exported from
  * the MBX driver as dma-bufs, imported as DRM framebuffers, and flipped
  * with DRM_IOCTL_MODE_PAGE_FLIP; the flip's event comes at the vblank that
  * shows it. When n72-ui exits, DRM gives the screen back to the console.
  * Without KMS (or N72_MBXFLIP=1) the MBX driver's own flip is used.
  */
 static uint32_t kms_fb[NSCAN], kms_crtc;
+static bool kms_shell;		/* on the display's layer 1, over the applications */
+
+/*
+ * The launcher's own layer if the kernel has it: n72-clcd-shell, the
+ * display controller's second RGB layer as a device of its own, blended
+ * over layer 0 with its alpha (premultiplied; 0 lets layer 0 through).
+ * Applications are then the masters of n72-clcd and the launcher never has
+ * to give the screen away. Older kernels (or N72_LAYER0=1): n72-clcd.
+ */
+static int kms_open(void)
+{
+	static const char *const want[] = { "n72-clcd-shell", "n72-clcd" };
+	char path[32], name[32];
+	int w, i, fd;
+
+	for (w = getenv("N72_LAYER0") ? 1 : 0; w < 2; w++) {
+		for (i = 0; i < 8; i++) {
+			struct drm_version v = { .name = name, .name_len = sizeof(name) - 1 };
+
+			snprintf(path, sizeof(path), "/dev/dri/card%d", i);
+			fd = open(path, O_RDWR | O_CLOEXEC);
+			if (fd < 0)
+				continue;
+			memset(name, 0, sizeof(name));
+			if (!ioctl(fd, DRM_IOCTL_VERSION, &v) && !strcmp(name, want[w])) {
+				kms_shell = !w;
+				return fd;
+			}
+			close(fd);
+		}
+	}
+	return -1;
+}
 
 static void kms_flip(int r)
 {
@@ -1526,7 +1575,7 @@ static bool kms_setup(void)
 	struct drm_mode_get_connector conn = { 0 };
 	struct drm_mode_modeinfo modes[4];
 	struct drm_mode_crtc set = { 0 };
-	int i, fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+	int i, fd = kms_open();
 
 	if (fd < 0 || getenv("N72_MBXFLIP"))
 		goto fail;
@@ -1538,6 +1587,12 @@ static bool kms_setup(void)
 	if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) || !res.count_crtcs ||
 	    !res.count_connectors)
 		goto fail;
+	/* asked without room for modes first: only that makes the kernel probe
+	 * a connector nobody has looked at yet (layer 1 has no console) */
+	conn.connector_id = conns[0];
+	if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) || !conn.count_modes)
+		goto fail;
+	memset(&conn, 0, sizeof(conn));
 	conn.connector_id = conns[0];
 	conn.modes_ptr = (uintptr_t)modes;
 	conn.count_modes = 4;
@@ -1558,7 +1613,7 @@ static bool kms_setup(void)
 		close(dfd);
 		f.width = fb.width;
 		f.height = fb.height;
-		f.pixel_format = 0x34325258;	/* XR24 */
+		f.pixel_format = kms_shell ? 0x34325241 : 0x34325258;	/* AR24 : XR24 */
 		f.handles[0] = ph.handle;
 		f.pitches[0] = fb.stride;
 		if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &f))
@@ -1682,7 +1737,8 @@ lv_display_t *mbx_gpu_display_create(void)
 	}
 	lv_display_set_flush_cb(disp, flush_cb);
 	lv_display_add_event_cb(disp, refr_start_cb, LV_EVENT_REFR_START, NULL);
-	fprintf(stderr, "n72-ui: %s; MBX GPU (%s):", kms_fd >= 0 ? "KMS (n72-clcd)" : "no KMS",
+	fprintf(stderr, "n72-ui: %s; MBX GPU (%s):", kms_fd < 0 ? "no KMS" :
+		kms_shell ? "KMS (n72-clcd-shell, layer 1)" : "KMS (n72-clcd)",
 		mbx_is_drm(mbx) ? "DRM render node" : "/dev/mbx");
 	fprintf(stderr, "  framebuffer at GPU %08x, %u KiB draw pool at %08x, %s jobs, %s\n",
 	       fb.gpu_addr, POOL_SIZE / 1024, pool_gpu, gpu_async ? "async" : "sync",
@@ -1770,6 +1826,31 @@ lv_draw_buf_t *mbx_gpu_flatten(const lv_draw_buf_t *src, lv_color_t bg)
 	gpu_wait(last_seq);
 	last_seq = 0;
 	return b;
+}
+
+bool mbx_gpu_on_shell_layer(void)
+{
+	return kms_fd >= 0 && kms_shell;
+}
+
+void mbx_gpu_clear(lv_layer_t *layer, const lv_area_t *area)
+{
+	lv_draw_rect_dsc_t d;
+
+	if (mbx < 0)
+		return;
+	/*
+	 * A fill task like any other, so that it runs in its turn among the
+	 * layer's tasks (done at once it came before the fills queued ahead
+	 * of it, which then painted over the zeros); mbx_fill() knows it by
+	 * the tag.
+	 */
+	lv_draw_rect_dsc_init(&d);
+	d.bg_color = lv_color_black();
+	d.bg_opa = LV_OPA_COVER;
+	d.base.layer = layer;
+	d.base.user_data = (void *)&clear_tag;
+	lv_draw_rect(layer, &d, area);
 }
 
 /* The pixels on screen now (stride fb.stride), for screenshots. */
