@@ -18,7 +18,7 @@ obj() { echo "$OUT/obj/$(echo "${1#$LVGL/}" | tr '/' '_' | sed 's/\.c$/.o/')"; }
 OBJS=$(for f in $SRCS; do obj "$f"; done)
 for f in $SRCS; do
 	o=$(obj "$f")
-	if [ ! -f "$o" ] || [ "$f" -nt "$o" ] || [ "$UI/lv_conf.h" -nt "$o" ]; then
+	if [ ! -f "$o" ] || [ "$f" -nt "$o" ] || [ "$UI/lv_conf.h" -nt "$o" ] || [ "$UI/n72_blend.h" -nt "$o" ]; then
 		echo "$CC -c $f -o $o $CFLAGS"
 	fi
 done | xargs -P "$(nproc)" -I{} sh -c '{}'

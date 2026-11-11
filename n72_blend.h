@@ -48,6 +48,49 @@ static inline uint32_t n72_mix_tab(uint32_t d, uint32_t m)
 	return (d & 0xff000000) | rb | g;
 }
 
+/*
+ * Text on a flat background, the usual case: the finished pixel for every
+ * coverage value, for one (text colour, background pixel) pair. A pixel is
+ * then a compare and a table load instead of two multiplies; any pixel
+ * that is not that background takes the mix above, so the result is the
+ * same. A few pairs are kept (a page has a handful of text colours and
+ * surfaces); a pair gets its table when a second glyph in a row asks for
+ * it, so pictures and gradients under text do not rebuild tables for every
+ * glyph.
+ */
+#define N72_RAMPS	8
+static struct n72_ramp {
+	uint32_t fg, bg;	/* bg: the whole pixel, X byte too */
+	uint32_t v[256];
+} n72_ramps[N72_RAMPS];
+static uint32_t n72_ramp_valid;	/* bit per slot */
+static uint32_t n72_ramp_next;	/* slot to replace */
+static uint32_t n72_want_fg = 0xffffffff, n72_want_bg;
+
+static inline const uint32_t *n72_ramp_get(uint32_t c, uint32_t bg)
+{
+	struct n72_ramp *r;
+	uint32_t i, m;
+
+	for (i = 0; i < N72_RAMPS; i++)
+		if ((n72_ramp_valid >> i & 1) && n72_ramps[i].fg == c && n72_ramps[i].bg == bg)
+			return n72_ramps[i].v;
+	if (n72_want_fg != c || n72_want_bg != bg) {	/* first time in a row: not yet */
+		n72_want_fg = c;
+		n72_want_bg = bg;
+		return NULL;
+	}
+	r = &n72_ramps[n72_ramp_next];
+	n72_ramp_valid |= 1u << n72_ramp_next;
+	n72_ramp_next = (n72_ramp_next + 1) % N72_RAMPS;
+	r->fg = c;
+	r->bg = bg;
+	r->v[0] = bg;
+	for (m = 1; m < 256; m++)
+		r->v[m] = m >= LV_OPA_MAX ? (bg & 0xff000000) | c : n72_mix_tab(bg, m);
+	return r->v;
+}
+
 /* Colour through a mask (and an overall opacity) into 4-byte RGB888 (XRGB8888). */
 static inline lv_result_t n72_blend_color_mask_xrgb(lv_draw_sw_blend_fill_dsc_t *dsc, uint32_t px, lv_opa_t opa)
 {
@@ -55,14 +98,33 @@ static inline lv_result_t n72_blend_color_mask_xrgb(lv_draw_sw_blend_fill_dsc_t 
 	const lv_opa_t *mask = dsc->mask_buf;
 	uint8_t *dest = dsc->dest_buf;
 	uint32_t c = lv_color_to_u32(dsc->color) & 0xffffff;
+	const uint32_t *ramp = NULL;
+	uint32_t bg = 0;
 
 	if (px != 4)
 		return LV_RESULT_INVALID;
 	n72_tab_set(c);
+	if (opa >= LV_OPA_MAX) {
+		/* the box's first pixel is background nearly always (drawn before the glyph) */
+		bg = *(const uint32_t *)dest;
+		ramp = n72_ramp_get(c, bg);
+	}
 	for (y = 0; y < h; y++) {
 		uint32_t *d = (uint32_t *)dest;
 
-		if (opa >= LV_OPA_MAX) {
+		if (ramp) {
+			for (x = 0; x < w; x++) {
+				uint32_t m = mask[x], dv;
+
+				if (m == 0)
+					continue;
+				dv = d[x];
+				if (dv == bg)
+					d[x] = ramp[m];
+				else
+					d[x] = m >= LV_OPA_MAX ? (dv & 0xff000000) | c : n72_mix_tab(dv, m);
+			}
+		} else if (opa >= LV_OPA_MAX) {
 			for (x = 0; x < w; x++) {
 				uint32_t m = mask[x];
 

@@ -15,6 +15,7 @@
 #include <math.h>
 #include <spawn.h>
 #include "lvgl/src/indev/lv_indev_private.h"	/* the throw velocity */
+#include "lvgl/src/core/lv_obj_scroll_private.h"	/* lv_obj_scroll_by_raw() */
 #include <sys/wait.h>
 
 extern char **environ;
