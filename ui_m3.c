@@ -2901,10 +2901,10 @@ static bool ui_drag(int phase, int x, int y)
  * home's icon shows through as it ends. Fades are drawn with alpha by the
  * CPU (the launcher's transparent mode); the moves are XRGB, on the GPU.
  */
-#define ZA_GROW_MS	200
-#define ZA_HOLD_MS	40
-#define ZA_FADE_MS	110
-#define ZA_SHRINK_MS	210
+#define ZA_GROW_MS	330
+#define ZA_HOLD_MS	60
+#define ZA_FADE_MS	170
+#define ZA_SHRINK_MS	320
 
 static struct {
 	int phase;		/* 0 idle, 1 grow, 2 hold, 3 fade out, 4 fade in, 5 shrink */

@@ -436,13 +436,16 @@ static void ui_lock(void);
 
 static void screen_set(bool on)
 {
-	if (!on)
-		ui_lock();
+	if (!on && screen_off)
+		return;
 	screen_off = !on;
 	if (access(PANEL_POWER, W_OK) == 0)
 		write_int(PANEL_POWER, on);
 	else
 		backlight_power(on);
+	/* the lock screen goes up in the dark: it is what waking shows */
+	if (!on)
+		ui_lock();
 	if (touch_indev)
 		lv_indev_enable(touch_indev, on);
 	if (touch_inhibit[0])
@@ -747,20 +750,6 @@ static void drain(int fd)
 			;
 }
 
-/* n72_lcd.panel_sleep reads "Y" or "N". */
-static bool panel_sleep_param_yes(void)
-{
-	char c = 0;
-	FILE *f = fopen("/sys/module/n72_lcd/parameters/panel_sleep", "r");
-
-	if (!f)
-		return false;
-	if (fread(&c, 1, 1, f) != 1)
-		c = 0;
-	fclose(f);
-	return c == 'Y';
-}
-
 /* Does the kernel offer this sleep state ("mem" only with n72_sleep.deep=1)? */
 static bool sleep_offered(const char *state)
 {
@@ -806,14 +795,7 @@ static bool system_sleep(void)
 	if (e && !strcmp(e, "0"))
 		return false;
 	deep = !(e && !strcmp(e, "freeze")) && !usb_powered() && sleep_offered("mem");
-	/*
-	 * The display driver switches the backlight and the panel off
-	 * together and back on once the picture is back, unless it leaves the
-	 * panel on in s2idle: blanking here first only showed a dim, unlit
-	 * picture for a moment on the way down and up.
-	 */
-	if (!deep && !panel_sleep_param_yes())
-		backlight_power(false);
+	/* (the caller has switched the panel off: screen_set(false)) */
 	ok = deep && write_sleep_state("mem");
 	if (!ok)	/* not deep, or the PMU refused: suspend to idle */
 		ok = write_sleep_state("freeze");
@@ -856,7 +838,13 @@ static bool screen_off_for_sound;
 
 static void screen_off_or_sleep(void)
 {
-	ui_lock();
+	/*
+	 * The panel off first, then the lock screen drawn into it, then the
+	 * system sleep: drawing it lit showed it for the second the sleep
+	 * takes, and the kernel's own panel bring-up on wake showed whatever
+	 * was in the controller before the layers were back.
+	 */
+	screen_set(false);
 	if (audio_playing()) {
 		screen_off_for_sound = true;
 		screen_set(false);
