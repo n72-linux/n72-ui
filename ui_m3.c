@@ -538,26 +538,69 @@ static void sc_settle(lv_timer_t *t)
 		sc_restore(true);
 }
 
-/* Picture of child @c in place of the live child; false if not possible now. */
-static bool sc_cache_child(lv_obj_t *body, lv_obj_t *c)
+/*
+ * Prefetch: pictures of the rows a scrollable page shows, taken one at a
+ * time while it sits idle, so that the first frame of a scroll does not
+ * render them (a 35-57 ms hitch on Settings). Kept out of sight; a row that
+ * is redrawn meanwhile loses its picture (see pf_invalidated).
+ */
+#define PF_MAX		16
+
+static struct {
+	lv_obj_t *owner;
+	lv_obj_t *child[PF_MAX];
+	lv_draw_buf_t *buf[PF_MAX];
+	int n;
+} pf;
+
+/* scroll-cached page bodies, to find the one on the active screen */
+#define PF_BODIES	16
+static lv_obj_t *pf_bodies[PF_BODIES];
+static int pf_nbodies;
+
+static int pf_had;		/* (statistics) */
+
+static void pf_drop(int i)
 {
-	/*
-	 * The snapshot covers the child's extra draw area too (labels: a
-	 * quarter of the line height on every side, for overhanging glyphs),
-	 * so the picture goes that much up and left of the child's position.
-	 */
-	int32_t ext = lv_obj_get_ext_draw_size(c);
-	long sz = (long)(lv_obj_get_width(c) + 2 * ext) * (lv_obj_get_height(c) + 2 * ext) * 4;
+	lv_draw_buf_destroy(pf.buf[i]);
+	pf.n--;
+	pf.child[i] = pf.child[pf.n];
+	pf.buf[i] = pf.buf[pf.n];
+}
+
+static void pf_clear(void)
+{
+	while (pf.n)
+		pf_drop(pf.n - 1);
+	pf.owner = NULL;
+}
+
+/* Take @c's prefetched picture, if there is one. */
+static lv_draw_buf_t *pf_take(lv_obj_t *c)
+{
+	lv_draw_buf_t *b;
+	int i;
+
+	for (i = 0; i < pf.n; i++) {
+		if (pf.child[i] != c)
+			continue;
+		b = pf.buf[i];
+		pf.n--;
+		pf.child[i] = pf.child[pf.n];
+		pf.buf[i] = pf.buf[pf.n];
+		return b;
+	}
+	return NULL;
+}
+
+/* A scroll picture of @c: rendered, in GPU memory, flattened onto the page. */
+static lv_draw_buf_t *sc_picture(lv_obj_t *c)
+{
 	lv_draw_buf_t *b, *flat;
-	lv_obj_t *p;
 
-	uint32_t t0 = lv_tick_get();
-
-	if (sc.n >= SC_MAX || sz <= 0 || sc.bytes + sz > SC_BUDGET)
-		return false;
 	b = lv_snapshot_take(c, LV_COLOR_FORMAT_ARGB8888);
 	if (!b)
-		return false;
+		return NULL;
 	lv_draw_buf_flush_cache(b, NULL);	/* the GPU reads it */
 	/*
 	 * Flatten it onto the page colour once: frames then copy opaque
@@ -569,6 +612,31 @@ static bool sc_cache_child(lv_obj_t *body, lv_obj_t *c)
 		lv_draw_buf_destroy(b);
 		b = flat;
 	}
+	return b;
+}
+
+/* Picture of child @c in place of the live child; false if not possible now. */
+static bool sc_cache_child(lv_obj_t *body, lv_obj_t *c)
+{
+	/*
+	 * The snapshot covers the child's extra draw area too (labels: a
+	 * quarter of the line height on every side, for overhanging glyphs),
+	 * so the picture goes that much up and left of the child's position.
+	 */
+	int32_t ext = lv_obj_get_ext_draw_size(c);
+	long sz = (long)(lv_obj_get_width(c) + 2 * ext) * (lv_obj_get_height(c) + 2 * ext) * 4;
+	lv_draw_buf_t *b;
+	lv_obj_t *p;
+
+	uint32_t t0 = lv_tick_get();
+
+	if (sc.n >= SC_MAX || sz <= 0 || sc.bytes + sz > SC_BUDGET)
+		return false;
+	b = pf_take(c);
+	if (!b)
+		b = sc_picture(c);
+	if (!b)
+		return false;
 	p = lv_image_create(body);
 	lv_image_set_src(p, b);
 	lv_obj_add_flag(p, LV_OBJ_FLAG_IGNORE_LAYOUT | LV_OBJ_FLAG_USER_1);
@@ -608,15 +676,15 @@ static void sc_uncache(int i)
  * drop those further away, add those coming in (at most @max new ones per
  * call, so a fling does not stall on a burst of snapshots).
  */
-static void sc_fill(lv_obj_t *body, int max)
+static void sc_fill(lv_obj_t *body, int max, bool visible_only)
 {
 	uint32_t i, cnt;
 	lv_area_t bc, cc;
 	int32_t lo, hi, k;
 
 	lv_obj_get_coords(body, &bc);
-	lo = bc.y1 - H / 2;
-	hi = bc.y2 + H / 2;
+	lo = bc.y1 - (visible_only ? 0 : H / 2);
+	hi = bc.y2 + (visible_only ? 0 : H / 2);
 	for (k = sc.n - 1; k >= 0; k--) {
 		if (!lv_obj_is_valid(sc.pic[k])) {
 			sc_uncache(k);
@@ -657,10 +725,109 @@ static void sc_begin(lv_obj_t *body)
 		lv_timer_delete(sc.timer);
 		sc.timer = NULL;
 	}
+	pf_had = pf.owner == body ? pf.n : -1;
 	sc.owner = body;
-	sc_fill(body, SC_MAX);
+	/*
+	 * Only what is on screen now (prefetched pictures, mostly); the rows
+	 * just outside come one per frame as they near (LV_EVENT_SCROLL).
+	 */
+	sc_fill(body, SC_MAX, true);
+	if (pf.owner == body)
+		pf_clear();		/* the rest are not needed any more */
 	if (getenv("N72_FPS"))
-		fprintf(stderr, "scroll cache: %d pictures\n", sc.n);
+		fprintf(stderr, "scroll cache: %d pictures, %d prefetched before\n", sc.n, pf_had);
+}
+
+static lv_obj_t *pf_body_on(lv_obj_t *scr)
+{
+	for (int i = 0; i < pf_nbodies; i++)
+		if (lv_obj_get_screen(pf_bodies[i]) == scr)
+			return pf_bodies[i];
+	return NULL;
+}
+
+/* One picture per tick, while nothing moves and nobody touches. */
+static void pf_tick(lv_timer_t *t)
+{
+	lv_obj_t *body;
+	lv_area_t bc, cc;
+	uint32_t i, cnt;
+	int k;
+
+	LV_UNUSED(t);
+	if (screen_off || tr.scr || sc.owner || lv_display_get_inactive_time(NULL) < 300)
+		return;
+	body = pf_body_on(lv_screen_active());
+	if (body != pf.owner) {
+		pf_clear();
+		pf.owner = body;
+	}
+	if (!body || pf.n >= PF_MAX)
+		return;
+	lv_obj_update_layout(body);
+	lv_obj_get_coords(body, &bc);
+	cnt = lv_obj_get_child_count(body);
+	for (i = 0; i < cnt; i++) {
+		lv_obj_t *c = lv_obj_get_child(body, i);
+		lv_draw_buf_t *b;
+
+		if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) ||
+		    lv_obj_has_flag(c, LV_OBJ_FLAG_USER_1))
+			continue;
+		lv_obj_get_coords(c, &cc);
+		if (cc.y2 < bc.y1 || cc.y1 > bc.y2)
+			continue;
+		for (k = 0; k < pf.n; k++)
+			if (pf.child[k] == c)
+				break;
+		if (k < pf.n)
+			continue;
+		b = sc_picture(c);
+		if (b) {
+			pf.child[pf.n] = c;
+			pf.buf[pf.n++] = b;
+		}
+		return;
+	}
+}
+
+/*
+ * Something on screen is being redrawn: a prefetched row there no longer
+ * matches its picture. Not while a finger is down: that is a pressed
+ * highlight, which goes again before the scroll takes the picture.
+ */
+static void pf_invalidated(lv_event_t *e)
+{
+	const lv_area_t *a = lv_event_get_param(e);
+	lv_area_t cc, x;
+	int i;
+
+	lv_indev_t *in;
+
+	if (!pf.n || !a)
+		return;
+	for (in = lv_indev_get_next(NULL); in; in = lv_indev_get_next(in))
+		if (lv_indev_get_type(in) == LV_INDEV_TYPE_POINTER &&
+		    lv_indev_get_state(in) == LV_INDEV_STATE_PRESSED)
+			return;
+	for (i = pf.n - 1; i >= 0; i--) {
+		if (!lv_obj_is_valid(pf.child[i])) {
+			pf_drop(i);
+			continue;
+		}
+		lv_obj_get_coords(pf.child[i], &cc);
+		if (lv_area_intersect(&x, &cc, a))
+			pf_drop(i);
+	}
+}
+
+static void pf_init(void)
+{
+	if (getenv("N72_NO_SCROLL_CACHE") || getenv("N72_NO_PREFETCH"))
+		return;
+	lv_display_add_event_cb(lv_display_get_default(), pf_invalidated,
+				LV_EVENT_INVALIDATE_AREA, NULL);
+	lv_timer_create(pf_tick, 150, NULL);
 }
 
 static void sc_event(lv_event_t *e)
@@ -677,7 +844,7 @@ static void sc_event(lv_event_t *e)
 	case LV_EVENT_SCROLL:
 		sc.last_move = lv_tick_get();
 		if (sc.owner == body)
-			sc_fill(body, 1);	/* children coming into view: one picture a frame */
+			sc_fill(body, 1, false);	/* children coming into view: one picture a frame */
 		break;
 	case LV_EVENT_SCROLL_BEGIN:
 		sc.last_move = lv_tick_get();
@@ -701,6 +868,11 @@ static void sc_event(lv_event_t *e)
 	case LV_EVENT_DELETE:	/* the pictures go with the page */
 		if (sc.owner == body)
 			sc_restore(false);
+		if (pf.owner == body)
+			pf_clear();
+		for (int i = 0; i < pf_nbodies; i++)
+			if (pf_bodies[i] == body)
+				pf_bodies[i] = pf_bodies[--pf_nbodies];
 		if (sc.timer) {
 			lv_timer_delete(sc.timer);
 			sc.timer = NULL;
@@ -713,6 +885,8 @@ static void sc_event(lv_event_t *e)
 
 static void scroll_cached(lv_obj_t *body)
 {
+	if (pf_nbodies < PF_BODIES)
+		pf_bodies[pf_nbodies++] = body;
 	lv_obj_add_event_cb(body, sc_event, LV_EVENT_SCROLL_BEGIN, NULL);
 	lv_obj_add_event_cb(body, sc_event, LV_EVENT_SCROLL_END, NULL);
 	lv_obj_add_event_cb(body, sc_event, LV_EVENT_SCROLL, NULL);
@@ -2239,6 +2413,7 @@ static void open_sound(lv_event_t *e)
 
 static void sound_ui_init(void)
 {
+	pf_init();
 	snd_init(conf.vol, conf.spk);
 	lv_timer_create(jack_check, 200, NULL);
 }
