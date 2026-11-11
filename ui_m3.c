@@ -641,6 +641,8 @@ static struct {
 	uint32_t last_move;
 } sc;
 
+static void pf_give(lv_obj_t *owner, lv_obj_t *c, lv_draw_buf_t *b);
+
 static void sc_restore(bool delete_pics)
 {
 	int i;
@@ -650,8 +652,7 @@ static void sc_restore(bool delete_pics)
 			lv_obj_delete(sc.pic[i]);
 		if (lv_obj_is_valid(sc.live[i]))
 			lv_obj_set_style_opa_layered(sc.live[i], LV_OPA_COVER, 0);
-		lv_image_cache_drop(sc.buf[i]);
-		lv_draw_buf_destroy(sc.buf[i]);
+		pf_give(delete_pics ? sc.owner : NULL, sc.live[i], sc.buf[i]);
 	}
 	sc.n = 0;
 	sc.bytes = 0;
@@ -684,14 +685,23 @@ static void sc_settle(lv_timer_t *t)
  * render them (a 35-57 ms hitch on Settings). Kept out of sight; a row that
  * is redrawn meanwhile loses its picture (see pf_invalidated).
  */
-#define PREF_MAX		16
+#define PREF_MAX		40
+#define PREF_BUDGET	(2 * 1024 * 1024)	/* bytes */
 
 static struct {
 	lv_obj_t *owner;
 	lv_obj_t *child[PREF_MAX];
 	lv_draw_buf_t *buf[PREF_MAX];
+	long bytes;
 	int n;
 } pf;
+
+static void pf_child_deleted(lv_event_t *e);
+
+static long pf_size(const lv_draw_buf_t *b)
+{
+	return (long)b->header.stride * b->header.h;
+}
 
 /*
  * Fling acceleration, as on iOS: a flick in the same direction soon after
@@ -747,6 +757,9 @@ static int pf_had;		/* (statistics) */
 
 static void pf_drop(int i)
 {
+	if (lv_obj_is_valid(pf.child[i]))
+		lv_obj_remove_event_cb(pf.child[i], pf_child_deleted);
+	pf.bytes -= pf_size(pf.buf[i]);
 	lv_draw_buf_destroy(pf.buf[i]);
 	pf.n--;
 	pf.child[i] = pf.child[pf.n];
@@ -770,6 +783,8 @@ static lv_draw_buf_t *pf_take(lv_obj_t *c)
 		if (pf.child[i] != c)
 			continue;
 		b = pf.buf[i];
+		lv_obj_remove_event_cb(c, pf_child_deleted);
+		pf.bytes -= pf_size(b);
 		pf.n--;
 		pf.child[i] = pf.child[pf.n];
 		pf.buf[i] = pf.buf[pf.n];
@@ -778,11 +793,96 @@ static lv_draw_buf_t *pf_take(lv_obj_t *c)
 	return NULL;
 }
 
-/* A scroll picture of @c: rendered, in GPU memory, flattened onto the page. */
+/* The MBX copies at most 1024 lines (a taller picture came out blank below). */
+#define SC_MAX_H	1024
+
+/*
+ * The units a page scrolls as pictures: its children, except those taller
+ * than the screen (a long list card), which are drawn live. Measured on
+ * Wi-Fi (24 rows): live 54-58 fps; one picture of the whole card came out
+ * blank below 1024 lines and took ~100 ms; pictures of each row cost more
+ * than they saved.
+ */
+#define SC_UNITS	32
+
+static int sc_units(lv_obj_t *body, lv_obj_t **u)
+{
+	uint32_t i, cnt;
+	int n = 0;
+
+	cnt = lv_obj_get_child_count(body);
+	for (i = 0; i < cnt && n < SC_UNITS; i++) {
+		lv_obj_t *c = lv_obj_get_child(body, i);
+
+		if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) ||
+		    lv_obj_has_flag(c, LV_OBJ_FLAG_USER_1) || lv_obj_get_height(c) > H)
+			continue;
+		u[n++] = c;
+	}
+	return n;
+}
+
+/* The colour a unit's picture is flattened onto: its parent's. */
+static lv_color_t sc_bg_of(lv_obj_t *c)
+{
+	lv_obj_t *p = lv_obj_get_parent(c);
+
+	if (p && lv_obj_get_style_bg_opa(p, 0) >= LV_OPA_COVER)
+		return lv_obj_get_style_bg_color(p, 0);
+	return M.surface;
+}
+
+/* A prefetched row went (a list rebuilt): its picture with it. */
+static void pf_child_deleted(lv_event_t *e)
+{
+	lv_obj_t *c = lv_event_get_current_target(e);
+
+	for (int i = 0; i < pf.n; i++)
+		if (pf.child[i] == c) {
+			lv_draw_buf_destroy(pf.buf[i]);
+			pf.n--;
+			pf.child[i] = pf.child[pf.n];
+			pf.buf[i] = pf.buf[pf.n];
+			break;
+		}
+	pf.bytes = 0;
+	for (int i = 0; i < pf.n; i++)
+		pf.bytes += pf_size(pf.buf[i]);
+}
+
+/* A scroll picture no longer shown: keep it for the next scroll if it fits. */
+static void pf_give(lv_obj_t *owner, lv_obj_t *c, lv_draw_buf_t *b)
+{
+	lv_image_cache_drop(b);
+	if (owner && pf.owner == owner && lv_obj_is_valid(c) && pf.n < PREF_MAX &&
+	    pf.bytes + pf_size(b) <= PREF_BUDGET) {
+		pf.child[pf.n] = c;
+		pf.buf[pf.n++] = b;
+		pf.bytes += pf_size(b);
+		lv_obj_add_event_cb(c, pf_child_deleted, LV_EVENT_DELETE, NULL);
+		return;
+	}
+	lv_draw_buf_destroy(b);
+}
+
+/* A label changed: the prefetched picture of the row holding it is stale. */
+static void pf_label_changed(lv_obj_t *lbl)
+{
+	for (int i = pf.n - 1; i >= 0; i--)
+		for (lv_obj_t *o = lbl; o; o = lv_obj_get_parent(o))
+			if (o == pf.child[i]) {
+				pf_drop(i);
+				break;
+			}
+}
+
+/* A scroll picture of @c: rendered, in GPU memory, flattened onto what is behind. */
 static lv_draw_buf_t *sc_picture(lv_obj_t *c)
 {
 	lv_draw_buf_t *b, *flat;
 
+	if (lv_obj_get_height(c) + 2 * lv_obj_get_ext_draw_size(c) > SC_MAX_H)
+		return NULL;
 	b = lv_snapshot_take(c, LV_COLOR_FORMAT_ARGB8888);
 	if (!b)
 		return NULL;
@@ -792,7 +892,7 @@ static lv_draw_buf_t *sc_picture(lv_obj_t *c)
 	 * pictures instead of blending them (a third of the memory traffic,
 	 * and the GPU is memory bound).
 	 */
-	flat = mbx_gpu_flatten(b, M.surface);
+	flat = mbx_gpu_flatten(b, sc_bg_of(c));
 	if (flat) {
 		lv_draw_buf_destroy(b);
 		b = flat;
@@ -822,11 +922,29 @@ static bool sc_cache_child(lv_obj_t *body, lv_obj_t *c)
 		b = sc_picture(c);
 	if (!b)
 		return false;
+	/*
+	 * Always a child of @body, even for a row of a list card: a child
+	 * added to the card would make it lay out all its rows again (their
+	 * labels too: 50-90 ms on Wi-Fi). Placed from the row's screen
+	 * position, in @body's scrolled content coordinates.
+	 */
 	p = lv_image_create(body);
 	lv_image_set_src(p, b);
 	lv_obj_add_flag(p, LV_OBJ_FLAG_IGNORE_LAYOUT | LV_OBJ_FLAG_USER_1);
 	lv_obj_remove_flag(p, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLL_ON_FOCUS);
-	lv_obj_set_pos(p, lv_obj_get_x(c) - ext, lv_obj_get_y(c) - ext);
+	if (lv_obj_get_parent(c) == body) {
+		lv_obj_set_pos(p, lv_obj_get_x(c) - ext, lv_obj_get_y(c) - ext);
+	} else {
+		lv_area_t bc, cc;
+		int32_t bw = lv_obj_get_style_border_width(body, 0);
+
+		lv_obj_get_coords(body, &bc);
+		lv_obj_get_coords(c, &cc);
+		lv_obj_set_pos(p, cc.x1 - ext - bc.x1 - bw - lv_obj_get_style_pad_left(body, 0) +
+				  lv_obj_get_scroll_x(body),
+			       cc.y1 - ext - bc.y1 - bw - lv_obj_get_style_pad_top(body, 0) +
+				  lv_obj_get_scroll_y(body));
+	}
 	lv_obj_set_style_opa_layered(c, LV_OPA_TRANSP, 0);
 	sc.live[sc.n] = c;
 	sc.pic[sc.n] = p;
@@ -846,8 +964,7 @@ static void sc_uncache(int i)
 		lv_obj_delete(sc.pic[i]);
 	if (lv_obj_is_valid(sc.live[i]))
 		lv_obj_set_style_opa_layered(sc.live[i], LV_OPA_COVER, 0);
-	lv_image_cache_drop(sc.buf[i]);
-	lv_draw_buf_destroy(sc.buf[i]);
+	pf_give(sc.owner, sc.live[i], sc.buf[i]);
 	sc.bytes -= sc.size[i];
 	sc.n--;
 	sc.live[i] = sc.live[sc.n];
@@ -863,6 +980,7 @@ static void sc_uncache(int i)
  */
 static void sc_fill(lv_obj_t *body, int max, bool visible_only)
 {
+	lv_obj_t *units[SC_UNITS];
 	uint32_t i, cnt;
 	lv_area_t bc, cc;
 	int32_t lo, hi, k;
@@ -879,15 +997,11 @@ static void sc_fill(lv_obj_t *body, int max, bool visible_only)
 		if (cc.y2 < lo - H || cc.y1 > hi + H)
 			sc_uncache(k);
 	}
-	/* counted after the drops above: each picture is a child of @body too */
-	cnt = lv_obj_get_child_count(body);
+	/* listed after the drops above (pictures are children too, flagged USER_1) */
+	cnt = sc_units(body, units);
 	for (i = 0; i < cnt && max > 0; i++) {
-		lv_obj_t *c = lv_obj_get_child(body, i);
+		lv_obj_t *c = units[i];
 
-		if (!c)
-			break;
-		if (lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) || lv_obj_has_flag(c, LV_OBJ_FLAG_USER_1))
-			continue;
 		lv_obj_get_coords(c, &cc);
 		if (cc.y2 < lo || cc.y1 > hi)
 			continue;
@@ -897,7 +1011,7 @@ static void sc_fill(lv_obj_t *body, int max, bool visible_only)
 		if (k < sc.n)
 			continue;
 		if (!sc_cache_child(body, c))
-			break;
+			continue;	/* (too tall, or no memory: drawn live) */
 		max--;
 	}
 }
@@ -917,8 +1031,6 @@ static void sc_begin(lv_obj_t *body)
 	 * just outside come one per frame as they near (LV_EVENT_SCROLL).
 	 */
 	sc_fill(body, SC_MAX, true);
-	if (pf.owner == body)
-		pf_clear();		/* the rest are not needed any more */
 	if (getenv("N72_FPS"))
 		fprintf(stderr, "scroll cache: %d pictures, %d prefetched before\n", sc.n, pf_had);
 }
@@ -934,9 +1046,11 @@ static lv_obj_t *pf_body_on(lv_obj_t *scr)
 /* One picture per tick, while nothing moves and nobody touches. */
 static void pf_tick(lv_timer_t *t)
 {
-	lv_obj_t *body;
+	lv_obj_t *body, *units[SC_UNITS], *best = NULL;
 	lv_area_t bc, cc;
 	uint32_t i, cnt;
+	int32_t best_d = INT32_MAX, d;
+	lv_draw_buf_t *b;
 	int k;
 
 	LV_UNUSED(t);
@@ -947,33 +1061,33 @@ static void pf_tick(lv_timer_t *t)
 		pf_clear();
 		pf.owner = body;
 	}
-	if (!body || pf.n >= PREF_MAX)
+	if (!body || pf.n >= PREF_MAX || pf.bytes >= PREF_BUDGET)
 		return;
 	lv_obj_update_layout(body);
 	lv_obj_get_coords(body, &bc);
-	cnt = lv_obj_get_child_count(body);
+	cnt = sc_units(body, units);
+	/* the row nearest the view that has no picture yet: on screen first */
 	for (i = 0; i < cnt; i++) {
-		lv_obj_t *c = lv_obj_get_child(body, i);
-		lv_draw_buf_t *b;
+		lv_obj_t *c = units[i];
 
-		if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN) ||
-		    lv_obj_has_flag(c, LV_OBJ_FLAG_USER_1))
-			continue;
 		lv_obj_get_coords(c, &cc);
-		if (cc.y2 < bc.y1 || cc.y1 > bc.y2)
+		d = cc.y2 < bc.y1 ? bc.y1 - cc.y2 : cc.y1 > bc.y2 ? cc.y1 - bc.y2 : 0;
+		if (d >= best_d || d > 2 * H)
 			continue;
 		for (k = 0; k < pf.n; k++)
 			if (pf.child[k] == c)
 				break;
-		if (k < pf.n)
+		if (k < pf.n || lv_obj_get_height(c) + 2 * lv_obj_get_ext_draw_size(c) > SC_MAX_H)
 			continue;
-		b = sc_picture(c);
-		if (b) {
-			pf.child[pf.n] = c;
-			pf.buf[pf.n++] = b;
-		}
-		return;
+		best = c;
+		best_d = d;
 	}
+	if (!best || !(b = sc_picture(best)))
+		return;
+	pf.child[pf.n] = best;
+	pf.buf[pf.n++] = b;
+	pf.bytes += pf_size(b);
+	lv_obj_add_event_cb(best, pf_child_deleted, LV_EVENT_DELETE, NULL);
 }
 
 /*
@@ -1015,7 +1129,7 @@ static void pf_init(void)
 		return;
 	lv_display_add_event_cb(lv_display_get_default(), pf_invalidated,
 				LV_EVENT_INVALIDATE_AREA, NULL);
-	lv_timer_create(pf_tick, 150, NULL);
+	lv_timer_create(pf_tick, 80, NULL);
 }
 
 static void sc_event(lv_event_t *e)
@@ -1310,6 +1424,7 @@ static void label_set_if_changed(lv_obj_t *lbl, const char *text)
 	if (!cur || strcmp(cur, text)) {
 		lv_label_set_text(lbl, text);
 		bp_changed(lv_obj_get_screen(lbl));
+		pf_label_changed(lbl);
 	}
 }
 
@@ -1874,9 +1989,26 @@ static void wifi_forget_cb(lv_event_t *e)
 	job_run(cmd, wifi_page, wifi_cmd_done, NULL);
 }
 
+/* saved networks first (the list is cut at 24), then by signal */
 static int net_cmp(const void *a, const void *b)
 {
-	return ((const struct wifi_net *)b)->signal - ((const struct wifi_net *)a)->signal;
+	const struct wifi_net *x = a, *y = b;
+
+	if (x->saved != y->saved)
+		return y->saved - x->saved;
+	return y->signal - x->signal;
+}
+
+static void wifi_page_refresh(void);
+
+/* what the list shows now (names, signal bands, flags), "" after a (re)open */
+static char wifi_last_sig[24 * 72];
+
+/* a list update put off while it scrolled */
+static void wifi_relist_cb(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	wifi_page_refresh();
 }
 
 /* scan_results lines: bssid freq signal flags ssid; list_networks: id ssid bssid flags */
@@ -1934,10 +2066,40 @@ static void wifi_lists_done(const char *out, void *ud)
 
 	if (!wifi_list || !lv_obj_is_valid(wifi_list))
 		return;
+	/*
+	 * Rebuilding 24 rows takes ~80 ms: not while the list is in use
+	 * (scrolling, or touched in the last 1.5 s: try again shortly), and
+	 * not at all when nothing shown has changed. The first fill is at once.
+	 */
+	{
+		char sig[sizeof(wifi_last_sig)];
+		size_t o = 0;
+
+		if ((sc.owner && lv_obj_get_screen(sc.owner) == lv_obj_get_screen(wifi_list)) ||
+		    (wifi_last_sig[0] && lv_display_get_inactive_time(NULL) < 1500)) {
+			lv_timer_t *t = lv_timer_create(wifi_relist_cb, 600, NULL);
+
+			lv_timer_set_repeat_count(t, 1);
+			return;
+		}
+		sig[0] = 0;
+		for (i = 0; i < n_nets && i < 24 && o < sizeof(sig) - 80; i++)
+			o += snprintf(sig + o, sizeof(sig) - o, "%s|%d%d%d%d;", nets[i].ssid,
+				      nets[i].signal > -55 ? 3 : nets[i].signal > -67 ? 2 :
+				      nets[i].signal > -78 ? 1 : 0, nets[i].secure, nets[i].saved,
+				      !strcmp(nets[i].ssid, wifi_ssid) && wifi_up);
+		if (!strcmp(sig, wifi_last_sig) && n_nets) {
+			if (wifi_scan_btn_lbl && lv_obj_is_valid(wifi_scan_btn_lbl))
+				lv_label_set_text(wifi_scan_btn_lbl, "Scan");
+			return;
+		}
+		memcpy(wifi_last_sig, sig, sizeof(sig));
+	}
 	lv_obj_clean(wifi_list);
 	if (!n_nets)
 		m3_label(wifi_list, "No networks found yet", &lv_font_montserrat_14, M.on_surface_v);
-	for (i = 0; i < n_nets; i++) {
+	/* the strongest 24 (sorted): more is only slower to build and scroll */
+	for (i = 0; i < n_nets && i < 24; i++) {
 		struct wifi_net *n = &nets[i];
 		char sub[48];
 		const char *bars = n->signal > -55 ? "Excellent" : n->signal > -67 ? "Good" :
@@ -2010,6 +2172,7 @@ static void open_wifi(lv_event_t *e)
 	lv_label_set_long_mode(wifi_state_lbl, LV_LABEL_LONG_WRAP);
 
 	m3_section(body, "Networks");
+	wifi_last_sig[0] = 0;
 	wifi_list = lv_obj_create(body);
 	plain(wifi_list);
 	lv_obj_set_width(wifi_list, lv_pct(100));
@@ -2461,7 +2624,7 @@ static void open_about(lv_event_t *e)
  * Volume keys change the sound volume and show a pop-up on the top layer;
  * the jack decides between earphones and speaker (audio.c).
  */
-static lv_obj_t *vol_hud, *vol_hud_bar, *vol_hud_icon, *vol_hud_txt;
+static lv_obj_t *vol_hud, *vol_hud_slider, *vol_hud_icon;
 static lv_timer_t *vol_hud_timer;
 static lv_obj_t *snd_page, *snd_slider, *snd_val, *snd_out_lbl, *set_snd_sub;
 
@@ -2484,12 +2647,44 @@ static void snd_summary(char *buf, size_t len)
 		snprintf(buf, len, "%d%%, %s", conf.vol, snd_output_name());
 }
 
+static void vol_hud_opa(void *obj, int32_t v)
+{
+	lv_obj_set_style_opa(obj, v, 0);
+}
+
+static void vol_hud_gone(lv_anim_t *a)
+{
+	lv_obj_add_flag(a->var, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Material motion: fade in 150 ms, out 150 ms. */
+static void vol_hud_fade(bool in)
+{
+	lv_anim_t a;
+
+	lv_anim_delete(vol_hud, vol_hud_opa);
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, vol_hud);
+	lv_anim_set_exec_cb(&a, vol_hud_opa);
+	lv_anim_set_values(&a, lv_obj_get_style_opa(vol_hud, 0), in ? LV_OPA_COVER : LV_OPA_TRANSP);
+	lv_anim_set_duration(&a, 150);
+	lv_anim_set_path_cb(&a, in ? lv_anim_path_ease_out : lv_anim_path_ease_in);
+	if (!in)
+		lv_anim_set_completed_cb(&a, vol_hud_gone);
+	lv_anim_start(&a);
+}
+
 static void vol_hud_hide(lv_timer_t *t)
 {
 	LV_UNUSED(t);
-	if (vol_hud)
-		lv_obj_add_flag(vol_hud, LV_OBJ_FLAG_HIDDEN);
 	vol_hud_timer = NULL;
+	if (vol_hud && lv_obj_has_state(vol_hud_slider, LV_STATE_PRESSED)) {
+		vol_hud_timer = lv_timer_create(vol_hud_hide, 1500, NULL);	/* still held */
+		lv_timer_set_repeat_count(vol_hud_timer, 1);
+		return;
+	}
+	if (vol_hud)
+		vol_hud_fade(false);
 }
 
 static void snd_refresh_ui(void)
@@ -2497,10 +2692,10 @@ static void snd_refresh_ui(void)
 	char buf[64];
 
 	if (vol_hud && !lv_obj_has_flag(vol_hud, LV_OBJ_FLAG_HIDDEN)) {
-		lv_bar_set_value(vol_hud_bar, conf.vol, LV_ANIM_OFF);
-		lv_label_set_text(vol_hud_icon, !conf.vol ? LV_SYMBOL_MUTE :
-				  conf.vol < 50 ? LV_SYMBOL_VOLUME_MID : LV_SYMBOL_VOLUME_MAX);
-		lv_label_set_text(vol_hud_txt, jack_in ? "Earphones" : conf.spk ? "Speaker" : "Earphones");
+		if (!lv_obj_has_state(vol_hud_slider, LV_STATE_PRESSED))
+			lv_slider_set_value(vol_hud_slider, conf.vol, LV_ANIM_OFF);
+		label_set_if_changed(vol_hud_icon, !conf.vol ? LV_SYMBOL_MUTE :
+				     conf.vol < 50 ? LV_SYMBOL_VOLUME_MID : LV_SYMBOL_VOLUME_MAX);
 	}
 	if (snd_page && lv_obj_is_valid(snd_page)) {
 		lv_slider_set_value(snd_slider, conf.vol, LV_ANIM_OFF);
@@ -2514,42 +2709,55 @@ static void snd_refresh_ui(void)
 	}
 }
 
+static void volume_set(int pct, bool hud);
+static void vol_hud_show(void);
+
+static void vol_hud_slider_cb(lv_event_t *e)
+{
+	volume_set(lv_slider_get_value(lv_event_get_target(e)), false);
+	vol_hud_show();		/* keeps it up while dragged */
+}
+
+/*
+ * The volume pop-up: the brightness control's look (a full-width pill in
+ * surface container highest, the icon, a slider), raised over the page by
+ * a shadow, below the status bar. The slider can be dragged too.
+ */
 static void vol_hud_show(void)
 {
 	if (!vol_hud) {
-		lv_obj_t *row;
-
 		vol_hud = lv_obj_create(lv_layer_top());
 		plain(vol_hud);
-		lv_obj_set_size(vol_hud, 260, 64);
-		lv_obj_align(vol_hud, LV_ALIGN_TOP_MID, 0, 34);
-		lv_obj_set_style_radius(vol_hud, 32, 0);
-		lv_obj_set_style_bg_color(vol_hud, M.surface_c_high, 0);
+		lv_obj_set_size(vol_hud, W - 24, 56);
+		lv_obj_align(vol_hud, LV_ALIGN_TOP_MID, 0, 36);
+		lv_obj_set_style_radius(vol_hud, LV_RADIUS_CIRCLE, 0);
+		lv_obj_set_style_bg_color(vol_hud, M.surface_c_highest, 0);
 		lv_obj_set_style_bg_opa(vol_hud, LV_OPA_COVER, 0);
-		lv_obj_set_style_shadow_width(vol_hud, 18, 0);
-		lv_obj_set_style_shadow_opa(vol_hud, LV_OPA_40, 0);
-		lv_obj_set_style_pad_hor(vol_hud, 20, 0);
-		lv_obj_set_style_pad_ver(vol_hud, 8, 0);
-		lv_obj_remove_flag(vol_hud, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-		lv_obj_set_flex_flow(vol_hud, LV_FLEX_FLOW_COLUMN);
-		lv_obj_set_flex_align(vol_hud, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-		lv_obj_set_style_pad_row(vol_hud, 4, 0);
-		row = lv_obj_create(vol_hud);
-		plain(row);
-		lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-		lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-		lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-		lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-		lv_obj_set_style_pad_column(row, 10, 0);
-		vol_hud_icon = m3_label(row, LV_SYMBOL_VOLUME_MAX, &lv_font_montserrat_20, M.primary);
-		vol_hud_txt = m3_label(row, "", &lv_font_montserrat_14, M.on_surface_v);
-		vol_hud_bar = lv_bar_create(vol_hud);
-		lv_obj_set_size(vol_hud_bar, lv_pct(100), 8);
-		lv_bar_set_range(vol_hud_bar, 0, 100);
-		lv_obj_set_style_bg_color(vol_hud_bar, M.surface_c_highest, 0);
-		lv_obj_set_style_bg_color(vol_hud_bar, M.primary, LV_PART_INDICATOR);
+		lv_obj_set_style_shadow_width(vol_hud, 16, 0);
+		lv_obj_set_style_shadow_offset_y(vol_hud, 4, 0);
+		lv_obj_set_style_shadow_opa(vol_hud, LV_OPA_30, 0);
+		lv_obj_set_style_pad_hor(vol_hud, 18, 0);
+		lv_obj_set_style_opa(vol_hud, LV_OPA_TRANSP, 0);
+		lv_obj_remove_flag(vol_hud, LV_OBJ_FLAG_SCROLLABLE);
+		lv_obj_set_flex_flow(vol_hud, LV_FLEX_FLOW_ROW);
+		lv_obj_set_flex_align(vol_hud, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+				      LV_FLEX_ALIGN_CENTER);
+		lv_obj_set_style_pad_column(vol_hud, 14, 0);
+		vol_hud_icon = m3_label(vol_hud, LV_SYMBOL_VOLUME_MAX, &lv_font_montserrat_16,
+					M.on_surface_v);
+		lv_obj_set_width(vol_hud_icon, 20);
+		vol_hud_slider = lv_slider_create(vol_hud);
+		lv_obj_set_flex_grow(vol_hud_slider, 1);
+		lv_slider_set_range(vol_hud_slider, 0, 100);
+		lv_obj_add_event_cb(vol_hud_slider, vol_hud_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+		lv_obj_remove_flag(vol_hud_slider, LV_OBJ_FLAG_GESTURE_BUBBLE);
+		lv_obj_add_flag(vol_hud, LV_OBJ_FLAG_HIDDEN);
 	}
-	lv_obj_remove_flag(vol_hud, LV_OBJ_FLAG_HIDDEN);
+	if (lv_obj_has_flag(vol_hud, LV_OBJ_FLAG_HIDDEN) ||
+	    lv_anim_get(vol_hud, vol_hud_opa)) {
+		lv_obj_remove_flag(vol_hud, LV_OBJ_FLAG_HIDDEN);
+		vol_hud_fade(true);
+	}
 	lv_obj_move_foreground(vol_hud);
 	snd_refresh_ui();
 	if (vol_hud_timer)
@@ -2881,7 +3089,7 @@ static void ui_reopen(void)
 		shade_set(true, false);
 	else if (!strcmp(p, "paint"))
 		open_paint(NULL);
-	else if (strcmp(p, "logs") && strcmp(p, "about"))
+	else if (strcmp(p, "logs") && strcmp(p, "about") && strcmp(p, "volume"))
 		open_settings(NULL);
 	if (!strcmp(p, "display"))
 		open_display(NULL);
@@ -2895,6 +3103,8 @@ static void ui_reopen(void)
 		open_about(NULL);
 	else if (!strcmp(p, "logs"))
 		open_logs(NULL);
+	else if (!strcmp(p, "volume"))	/* (screenshots of the volume pop-up) */
+		vol_hud_show();
 	unsetenv("N72_UI_OPEN");
 }
 
