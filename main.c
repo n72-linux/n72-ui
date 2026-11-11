@@ -158,7 +158,7 @@ static void fps_frame(void)
 			int i;
 
 			fprintf(stderr, "  per frame: GPU fills %.1f (rounded %.1f) blends %.1f layers %.1f; "
-				"CPU fills radius %.1f small %.1f; GPU ioctl ms: sync %.1f submit %.1f 3d %.1f, vblank wait %.1f; tasks",
+				"CPU fills radius %.1f small %.1f; GPU ioctl ms: sync %.1f submit %.1f 3d %.1f, vblank wait %.1f; fill skipped %.0f kpx; tasks",
 				(g->fills - fps_g0.fills) / (double)fps_n,
 				(g->fill_corners - fps_g0.fill_corners) / (double)fps_n,
 				(g->blends - fps_g0.blends) / (double)fps_n,
@@ -168,7 +168,8 @@ static void fps_frame(void)
 				(g->sync_us - fps_g0.sync_us) / 1000 / fps_n,
 				(g->submit_us - fps_g0.submit_us) / 1000 / fps_n,
 				(g->blit3d_us - fps_g0.blit3d_us) / 1000 / fps_n,
-				(g->flip_us - fps_g0.flip_us) / 1000 / fps_n);
+				(g->flip_us - fps_g0.flip_us) / 1000 / fps_n,
+				(double)(g->trim_px - fps_g0.trim_px) / 1000 / fps_n);
 			for (i = 0; i < 16; i++)
 				if (g->seen[i] != fps_g0.seen[i])
 					fprintf(stderr, " %d:%.1f", i, (g->seen[i] - fps_g0.seen[i]) / (double)fps_n);

@@ -429,22 +429,164 @@ static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 	return 1;
 }
 
-/* One opaque rectangle (in screen coordinates) on the 2D engine. */
-static void gpu_rect(lv_layer_t *layer, const lv_area_t *clip, const lv_area_t *r,
+/*
+ * Opaque rectangles (in screen coordinates) on the 2D engine, as one job:
+ * rect_add() queues them, rect_flush() drops the CPU's lines over their
+ * rows and submits the lot. A job is an ioctl, an interrupt and a wake-up,
+ * so three bands of a rounded fill or the pieces of a trimmed background
+ * are much cheaper together.
+ */
+#define RECT_BATCH	16
+static uint32_t rect_words[RECT_BATCH * 16];
+static int rect_n;
+static lv_area_t rect_rows;		/* union, in buffer coordinates */
+static lv_draw_buf_t *rect_buf;
+
+static void rect_flush(void)
+{
+	if (!rect_n)
+		return;
+	buf_invalidate(rect_buf, &rect_rows);	/* drop CPU lines over the area */
+	submit(rect_words, rect_n);
+	rect_n = 0;
+}
+
+static void rect_add(lv_layer_t *layer, const lv_area_t *clip, const lv_area_t *r,
 		     lv_color_t color)
 {
 	lv_draw_buf_t *b = layer->draw_buf;
-	uint32_t w[16];
 	lv_area_t a;
 
 	if (!lv_area_intersect(&a, r, clip))
 		return;
 	lv_area_move(&a, -layer->buf_area.x1, -layer->buf_area.y1);
-	buf_invalidate(b, &a);			/* drop CPU lines over the area */
-	submit(w, put_fill(w, gpu_addr(b->data), b->header.stride,
+	if (rect_n && (rect_buf != b || rect_n > (int)(sizeof(rect_words) / 4) - 16))
+		rect_flush();
+	if (!rect_n) {
+		rect_buf = b;
+		rect_rows = a;
+	} else {
+		rect_rows.y1 = LV_MIN(rect_rows.y1, a.y1);
+		rect_rows.y2 = LV_MAX(rect_rows.y2, a.y2);
+	}
+	rect_n += put_fill(rect_words + rect_n, gpu_addr(b->data), b->header.stride,
 			   0xff000000 | lv_color_to_u32(color),
-			   a.x1, a.y1, lv_area_get_width(&a), lv_area_get_height(&a)));
+			   a.x1, a.y1, lv_area_get_width(&a), lv_area_get_height(&a));
 	mbx_gpu_stats.fills++;
+}
+
+/*
+ * What a later task in the same layer is certain to overwrite, every pixel:
+ * the body of an opaque fill (between its rounded corners), or an opaque
+ * picture copied 1:1, each within its own clip area. False: nothing certain.
+ */
+static bool image_ok(const lv_draw_task_t *t);
+
+static bool task_covers(const lv_draw_task_t *u, lv_area_t *out)
+{
+	lv_area_t core = u->area;
+
+	if (u->type == LV_DRAW_TASK_TYPE_FILL) {
+		const lv_draw_fill_dsc_t *d = u->draw_dsc;
+		int32_t r = LV_MIN(d->radius, LV_MIN(lv_area_get_width(&core), lv_area_get_height(&core)) / 2);
+
+		if (d->opa < LV_OPA_MAX || d->grad.dir != LV_GRAD_DIR_NONE)
+			return false;
+		if (r > 0) {		/* the full-width band between the corners */
+			core.y1 += r;
+			core.y2 -= r;
+		}
+	} else if (u->type == LV_DRAW_TASK_TYPE_IMAGE) {
+		const lv_draw_image_dsc_t *d = u->draw_dsc;
+		const lv_image_dsc_t *img = d->src;
+
+		if (d->opa < LV_OPA_MAX || !image_ok(u) || img->header.cf != LV_COLOR_FORMAT_XRGB8888 ||
+		    !lv_area_intersect(&core, &u->area, &d->image_area))
+			return false;
+	} else {
+		return false;
+	}
+	if (core.y2 < core.y1 || core.x2 < core.x1)
+		return false;
+	return lv_area_intersect(out, &core, &u->clip_area);
+}
+
+/*
+ * A plain opaque fill, less what later tasks cover anyway: a page's
+ * background under its cards or their scroll pictures is most of the
+ * screen, filled only to be overwritten (the GPU is memory bound: ~1.3 ms
+ * for a screen). The pieces left go out as one job.
+ */
+#define TRIM_RECTS	12
+#define TRIM_MIN_PX	(64 * 32)	/* smaller covers are not worth a split */
+
+static void gpu_fill_trimmed(lv_draw_unit_t *unit, lv_layer_t *layer, const lv_draw_task_t *t,
+			     const lv_area_t *clip, lv_color_t color)
+{
+	lv_area_t rects[TRIM_RECTS], next[TRIM_RECTS], cov, x;
+	const lv_draw_task_t *u;
+	int n = 1, i, m;
+	int32_t px = 0;
+
+	if (!lv_area_intersect(&rects[0], &t->area, clip))
+		return;
+	for (u = t->next; u; u = u->next) {
+		if (!task_covers(u, &cov) || lv_area_get_size(&cov) < TRIM_MIN_PX)
+			continue;
+		m = 0;
+		for (i = 0; i < n; i++) {
+			const lv_area_t *r = &rects[i];
+
+			if (!lv_area_intersect(&x, r, &cov)) {
+				if (m >= TRIM_RECTS)
+					goto full;
+				next[m++] = *r;
+				continue;
+			}
+			/* r minus x: bands above and below, strips left and right */
+			if (m + 4 > TRIM_RECTS)
+				goto full;
+			if (x.y1 > r->y1)
+				next[m++] = (lv_area_t){ r->x1, r->y1, r->x2, x.y1 - 1 };
+			if (x.y2 < r->y2)
+				next[m++] = (lv_area_t){ r->x1, x.y2 + 1, r->x2, r->y2 };
+			if (x.x1 > r->x1)
+				next[m++] = (lv_area_t){ r->x1, x.y1, x.x1 - 1, x.y2 };
+			if (x.x2 < r->x2)
+				next[m++] = (lv_area_t){ x.x2 + 1, x.y1, r->x2, x.y2 };
+		}
+		memcpy(rects, next, m * sizeof(rects[0]));
+		n = m;
+		continue;
+full:		/* no room to split further: keep what there is */
+		break;
+	}
+	for (i = 0; i < n; i++)
+		px += lv_area_get_size(&rects[i]);
+	mbx_gpu_stats.trim_px += lv_area_get_size(&t->area) - px;
+	if (px < 16384) {
+		/* little left (margins round a card): not worth a GPU job */
+		for (i = 0; i < n; i++) {
+			unit->clip_area = &rects[i];
+			lv_draw_sw_fill(unit, t->draw_dsc, &t->area);
+		}
+		unit->clip_area = clip;
+		return;
+	}
+	for (i = 0; i < n; i++)
+		rect_add(layer, clip, &rects[i], color);
+	rect_flush();
+}
+
+/* Is @t a fill worth holding back for look-ahead (see mbx_dispatch)? */
+static bool trim_candidate(const lv_draw_task_t *t)
+{
+	const lv_draw_fill_dsc_t *d = t->draw_dsc;
+	lv_area_t a;
+
+	return t->type == LV_DRAW_TASK_TYPE_FILL && d->opa >= LV_OPA_MAX && d->radius == 0 &&
+	       d->grad.dir == LV_GRAD_DIR_NONE && lv_area_intersect(&a, &t->area, &t->clip_area) &&
+	       lv_area_get_size(&a) >= 320 * 120;
 }
 
 static void mbx_fill(lv_draw_unit_t *u, lv_draw_task_t *t)
@@ -465,7 +607,7 @@ static void mbx_fill(lv_draw_unit_t *u, lv_draw_task_t *t)
 		return;
 	}
 	if (r <= 0) {
-		gpu_rect(layer, clip, c, d->color);
+		gpu_fill_trimmed(u, layer, t, clip, d->color);
 		return;
 	}
 	/*
@@ -475,14 +617,15 @@ static void mbx_fill(lv_draw_unit_t *u, lv_draw_task_t *t)
 	 */
 	band = (lv_area_t){ c->x1, c->y1 + r, c->x2, c->y2 - r };
 	if (band.y2 >= band.y1)
-		gpu_rect(layer, clip, &band, d->color);
+		rect_add(layer, clip, &band, d->color);
 	band = (lv_area_t){ c->x1 + r, c->y1, c->x2 - r, c->y1 + r - 1 };
 	if (band.x2 >= band.x1) {
-		gpu_rect(layer, clip, &band, d->color);
+		rect_add(layer, clip, &band, d->color);
 		band.y1 = c->y2 - r + 1;
 		band.y2 = c->y2;
-		gpu_rect(layer, clip, &band, d->color);
+		rect_add(layer, clip, &band, d->color);
 	}
+	rect_flush();
 	gpu_wait(last_seq);
 	last_seq = 0;
 	for (i = 0; i < 4; i++) {
@@ -894,8 +1037,14 @@ static bool mbx_label(lv_draw_unit_t *u, lv_draw_task_t *t)
 	return true;
 }
 
+static lv_layer_t *defer_layer;		/* a fill is held back in this layer */
+static lv_draw_task_t *defer_t, *defer_tail;
+static int trim_on = -1;
+
 static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 {
+	if (trim_on < 0)
+		trim_on = !getenv("N72_NO_TRIM");
 	lv_draw_task_t *t;
 
 	if (async_dbg < 0)
@@ -933,6 +1082,30 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 		return LV_DRAW_UNIT_IDLE;
 	if (!lv_draw_layer_alloc_buf(layer))
 		return LV_DRAW_UNIT_IDLE;
+
+	/*
+	 * LVGL (without an OS) dispatches after every task it creates, so a
+	 * page's background fill would run before the cards over it exist as
+	 * tasks. A large plain fill is held back instead: everything over it
+	 * waits for it and queues up, and it runs, trimmed by what follows
+	 * (gpu_fill_trimmed), once a dispatch comes with no new task behind
+	 * it, i.e. from LVGL's wait loop at the end of the area. One at a time.
+	 */
+	if (trim_on && trim_candidate(t) && (!defer_layer || defer_layer == layer)) {
+		lv_draw_task_t *tail = t;
+
+		while (tail->next)
+			tail = tail->next;
+		if (defer_layer != layer || defer_t != t || defer_tail != tail) {
+			defer_layer = layer;
+			defer_t = t;
+			defer_tail = tail;
+			lv_draw_dispatch_request();	/* so the wait loop comes back */
+			return LV_DRAW_UNIT_IDLE;
+		}
+	}
+	if (defer_layer == layer)
+		defer_layer = NULL;
 
 	t->state = LV_DRAW_TASK_STATE_IN_PROGRESS;
 	u->target_layer = layer;

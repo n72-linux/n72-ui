@@ -13,6 +13,7 @@ struct mbx_gpu_stats {
 	unsigned long async_done;	/* tasks finished asynchronously */
 	unsigned long long sync_bytes;
 	unsigned long seen[16];	/* draw tasks evaluated, by type */
+	unsigned long long trim_px;	/* fill pixels skipped: covered by later tasks */
 };
 extern struct mbx_gpu_stats mbx_gpu_stats;
 
