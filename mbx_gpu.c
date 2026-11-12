@@ -384,6 +384,8 @@ static bool first_over(const lv_draw_task_t *t)
 	return u == t;
 }
 
+static bool transparent;		/* (mbx_gpu_set_transparent) */
+
 static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 {
 	const lv_draw_dsc_base_t *base = t->draw_dsc;
@@ -442,7 +444,20 @@ static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 		    !layer_ok(t, (const lv_layer_t *)d->src))
 			return 0;
 	} else if (t->type == LV_DRAW_TASK_TYPE_IMAGE) {
-		if (dcf != LV_COLOR_FORMAT_XRGB8888 || size < 4096 || !image_ok(t))
+		const lv_draw_image_dsc_t *d = t->draw_dsc;
+
+		if (size < 4096 || !image_ok(t))
+			return 0;
+		/*
+		 * Transparent mode: a premultiplied picture at full opacity
+		 * (the shade over an application) is copied as it is, and the
+		 * flush leaves its area alone (mbx_image_premul).
+		 */
+		if (dcf == LV_COLOR_FORMAT_ARGB8888 &&
+		    (!transparent || d->opa < LV_OPA_MAX ||
+		     !(((const lv_image_dsc_t *)d->src)->header.flags & LV_IMAGE_FLAGS_PREMULTIPLIED)))
+			return 0;
+		if (dcf != LV_COLOR_FORMAT_XRGB8888 && dcf != LV_COLOR_FORMAT_ARGB8888)
 			return 0;
 	} else if (t->type == LV_DRAW_TASK_TYPE_LABEL) {
 		if (gtext < 0)
@@ -828,9 +843,53 @@ static void mbx_layer(lv_draw_unit_t *u, lv_draw_task_t *t)
 }
 
 /* Draw a pool-resident image 1:1 (a snapshot, during transitions). */
+/*
+ * A premultiplied picture onto the transparent display: the 2D engine's
+ * exact copy (alpha and all), and the flush told not to premultiply it
+ * again. What it covers is replaced, not blended (fine for the shade:
+ * only its rounded corners' edge pixels lose what was under them).
+ */
+static bool mbx_image_premul(lv_draw_unit_t *u, lv_draw_task_t *t, lv_draw_buf_t *sb)
+{
+	lv_draw_image_dsc_t *d = t->draw_dsc;
+	lv_layer_t *layer = u->target_layer;
+	lv_draw_buf_t *b = layer->draw_buf;
+	lv_area_t a, sa, da;
+	uint32_t w[16];
+
+	if (!lv_area_intersect(&a, &t->area, u->clip_area))
+		return true;
+	if (!in_pool(b->data) || !in_pool(sb->data))
+		return false;
+	sa = a;
+	lv_area_move(&sa, -d->image_area.x1, -d->image_area.y1);
+	da = a;
+	lv_area_move(&da, -layer->buf_area.x1, -layer->buf_area.y1);
+	buf_invalidate(b, &da);
+	if (rect_n)
+		rect_flush();
+	submit(w, put_copy(w, gpu_addr(b->data), b->header.stride, gpu_addr(sb->data),
+			   sb->header.stride, sa.x1, sa.y1, da.x1, da.y1,
+			   lv_area_get_width(&a), lv_area_get_height(&a)));
+	gpu_wait(last_seq);
+	last_seq = 0;
+	if (b->data == lv_display_get_default()->buf_1->data && pm_skip_n < PM_SKIP_MAX &&
+	    !later_over(t, &a))
+		pm_skip[pm_skip_n++] = a;	/* (screen = buffer coordinates here) */
+	mbx_gpu_stats.layers++;
+	return true;
+}
+
 static void mbx_image(lv_draw_unit_t *u, lv_draw_task_t *t)
 {
 	lv_draw_image_dsc_t *d = t->draw_dsc;
+
+	if (u->target_layer->draw_buf->header.cf == LV_COLOR_FORMAT_ARGB8888) {
+		if (!mbx_image_premul(u, t, (lv_draw_buf_t *)d->src))
+			lv_draw_sw_image(u, d, &t->area);
+		mbx_gpu_stats.images++;
+		return;
+	}
 
 	/* the CPU does not write snapshots after taking them: no clean */
 	if (!gpu_copy(u, t, (lv_draw_buf_t *)d->src, d->image_area.x1, d->image_area.y1,
@@ -2462,4 +2521,23 @@ lv_draw_buf_t *mbx_gpu_turn_buf(const lv_draw_buf_t *src, int deg)
 	gpu_wait(last_seq);
 	last_seq = 0;
 	return b;
+}
+
+/*
+ * @b (ARGB8888, straight alpha) premultiplied in place, written out for
+ * the GPU, and flagged so: the transparent display copies it as it is.
+ */
+void mbx_gpu_premultiply_buf(lv_draw_buf_t *b)
+{
+	lv_area_t all;
+	uint32_t y;
+
+	if (!b || b->header.cf != LV_COLOR_FORMAT_ARGB8888)
+		return;
+	for (y = 0; y < b->header.h; y++)
+		premultiply_span((uint32_t *)(b->data + y * b->header.stride), b->header.w);
+	lv_area_set(&all, 0, 0, b->header.w - 1, b->header.h - 1);
+	if (in_pool(b->data))
+		buf_clean(b, &all);
+	b->header.flags |= LV_IMAGE_FLAGS_PREMULTIPLIED;
 }

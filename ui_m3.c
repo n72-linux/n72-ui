@@ -2914,8 +2914,16 @@ static void sd_set(int32_t y)
 		lv_obj_set_height(sd.scrim, H - top);
 		lv_obj_set_style_bg_opa(sd.scrim, sd_scrim_opa(sd.y), 0);
 	} else {
+		/*
+		 * Over an application (the launcher draws with alpha, on the
+		 * CPU): the scrim at one opacity, so that a frame redraws only
+		 * the strip the shade moves through. Following the shade, it
+		 * changed the whole screen every frame: drawn and premultiplied
+		 * whole, 18-23 ms a frame (31-38 fps) over a video.
+		 */
 		lv_obj_set_y(shade, sd.y);
-		lv_obj_set_style_bg_opa(scrim, sd_scrim_opa(sd.y), 0);
+		if (lv_obj_get_style_bg_opa(scrim, 0) != LV_OPA_50)
+			lv_obj_set_style_bg_opa(scrim, LV_OPA_50, 0);	/* (as settled) */
 	}
 }
 
@@ -3069,6 +3077,21 @@ static bool sd_begin(bool touch)
 		tr_free(&sd.home_pic);
 	fg = shade_pic_get();
 	sd.fg_cached = fg != NULL;
+	if (fg && !home && !page) {
+		/*
+		 * Over an application: a premultiplied copy, which the GPU
+		 * copies into the transparent frame as it is (the straight
+		 * one cost a CPU blend and a premultiply of its whole area
+		 * every frame: 17-23 ms, 30-47 fps over a video).
+		 */
+		lv_draw_buf_t *pm = lv_draw_buf_dup(fg);
+
+		if (pm) {
+			mbx_gpu_premultiply_buf(pm);
+			fg = pm;
+			sd.fg_cached = false;	/* (freed with the drag) */
+		}
+	}
 	if (fg && (bg || !home)) {
 		sd.sbg = bg;
 		sd.sfg = fg;

@@ -55,5 +55,7 @@ bool mbx_gpu_set_rotation(int deg);
 int mbx_gpu_rotation(void);
 /* a picture turned a quarter (90 or 270, as the screen), by the GPU */
 lv_draw_buf_t *mbx_gpu_turn_buf(const lv_draw_buf_t *src, int deg);
+/* straight alpha to premultiplied, in place; flags the picture so */
+void mbx_gpu_premultiply_buf(lv_draw_buf_t *b);
 
 #endif
