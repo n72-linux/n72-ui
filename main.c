@@ -557,6 +557,42 @@ static void screen_set(bool on)
 }
 
 #include "audio.c"
+/*
+ * More file descriptors for the main loop's poll(): events instead of
+ * timers that look (the headphone jack, a file in /run changing, BlueZ's
+ * D-Bus signals). Each has a callback, run when it is readable.
+ */
+#define NWATCH 6
+static struct { int fd; void (*cb)(int fd); } watch[NWATCH];
+static int nwatch;
+
+static void ui_watch(int fd, void (*cb)(int fd))
+{
+	int i;
+
+	for (i = 0; i < nwatch; i++)
+		if (watch[i].fd == fd) {
+			watch[i].cb = cb;
+			return;
+		}
+	if (fd >= 0 && nwatch < NWATCH) {
+		watch[nwatch].fd = fd;
+		watch[nwatch].cb = cb;
+		nwatch++;
+	}
+}
+
+static void ui_unwatch(int fd)
+{
+	int i;
+
+	for (i = 0; i < nwatch; i++)
+		if (watch[i].fd == fd) {
+			watch[i] = watch[--nwatch];
+			return;
+		}
+}
+
 #include "ui_m3.c"
 
 /*
@@ -1742,11 +1778,12 @@ int main(int argc, char **argv)
 	notify_fd = mbx_gpu_notify_fd();
 	refr_timer = lv_display_get_refr_timer(lv_display_get_default());
 	for (;;) {
-		struct pollfd pf[3] = {
+		struct pollfd pf[3 + NWATCH] = {
 			{ .fd = touch_wait_fd, .events = POLLIN },
 			{ .fd = keys_fd, .events = POLLIN },
 			{ .fd = notify_fd, .events = POLLIN },
 		};
+		int nw = nwatch, w;
 		uint64_t th0;
 		uint32_t idle;
 
@@ -1770,7 +1807,15 @@ int main(int argc, char **argv)
 		if (fps_on && mono_us() - th0 > 30000)
 			fprintf(stderr, "timers: %.1f ms\n", (mono_us() - th0) / 1000.0);
 
-		if (poll(pf, 3, LV_MIN(idle, LV_DEF_REFR_PERIOD)) > 0) {
+		for (w = 0; w < nw; w++) {
+			pf[3 + w].fd = watch[w].fd;
+			pf[3 + w].events = POLLIN;
+		}
+		if (poll(pf, 3 + nw, LV_MIN(idle, LV_DEF_REFR_PERIOD)) > 0) {
+			for (w = 0; w < nw; w++)
+				if ((pf[3 + w].revents & (POLLIN | POLLHUP | POLLERR)) &&
+				    w < nwatch && watch[w].fd == pf[3 + w].fd)
+					watch[w].cb(pf[3 + w].fd);
 			if ((pf[0].revents & POLLIN) && rt_uinput >= 0) {
 				lat_read_us = mono_us();
 				rt_feed(touch_wait_fd, touch_indev);	/* reads LVGL's side */

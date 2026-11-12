@@ -24,6 +24,7 @@
 #include <sys/wait.h>
 #include <sys/un.h>
 #include <sys/statvfs.h>
+#include <sys/inotify.h>
 
 extern char **environ;
 
@@ -5639,18 +5640,6 @@ static void bt_scan_cb(lv_event_t *e)
 	job_run("bluetoothctl --timeout 8 scan on", bt_page, bt_cmd_done, NULL);
 }
 
-static void bt_page_tick(lv_timer_t *t)
-{
-	LV_UNUSED(t);
-	if (!screen_off && bt_page && lv_screen_active() == bt_page)
-		bt_page_refresh();
-}
-
-static void bt_page_gone(lv_event_t *e)
-{
-	lv_timer_delete(lv_event_get_user_data(e));
-}
-
 static void open_bt(lv_event_t *e)
 {
 	nav_mark(open_bt, NULL);
@@ -5694,13 +5683,7 @@ static void open_bt(lv_event_t *e)
 	bt_list_sig[0] = 0;
 	push(bt_page);
 	bt_page_refresh();
-	{
-		/* live while the page is up: connections come and go by
-		 * themselves (a speaker switched on or off) */
-		lv_timer_t *t = lv_timer_create(bt_page_tick, 3000, NULL);
-
-		lv_obj_add_event_cb(bt_page, bt_page_gone, LV_EVENT_DELETE, t);
-	}
+	/* (live: BlueZ's signals read it again, bz_ev) */
 }
 
 /* --------------------------------------------------- a Bluetooth device */
@@ -5759,18 +5742,6 @@ static void btd_refresh(void)
 		 "grep 'dev_%s/a2dpsrc/sink$' | head -1); [ -n \"$p\" ] && bluealsa-cli info \"$p\"",
 		 btd_mac, und);
 	job_run(cmd, btd_page, btd_info_done, NULL);
-}
-
-static void btd_tick(lv_timer_t *t)
-{
-	LV_UNUSED(t);
-	if (!screen_off && btd_page && lv_screen_active() == btd_page)
-		btd_refresh();
-}
-
-static void btd_gone(lv_event_t *e)
-{
-	lv_timer_delete(lv_event_get_user_data(e));
 }
 
 static void btd_cmd_done(const char *out, void *ud)
@@ -5889,12 +5860,7 @@ static void open_bt_dev(lv_event_t *e)
 
 	btd_connected = connected;
 	push(btd_page);
-	btd_refresh();
-	{
-		lv_timer_t *t = lv_timer_create(btd_tick, 2000, NULL);
-
-		lv_obj_add_event_cb(btd_page, btd_gone, LV_EVENT_DELETE, t);
-	}
+	btd_refresh();		/* (then on BlueZ's signals, bz_ev) */
 }
 
 static void open_bt_dev_cb(lv_event_t *e)
@@ -6763,12 +6729,62 @@ static void open_sound(lv_event_t *e)
 	push(scr);
 }
 
+/* The jack's switch events (its input device): earphones in or out. */
+static void jack_ev(int fd)
+{
+	LV_UNUSED(fd);
+	if (!jack_poll())
+		return;
+	snd_apply_output(conf.spk);
+	vol_hud_show();
+}
+
+/* /run changed: n72-audio-route's file (a Bluetooth sound device came or went). */
+static void run_ev(int fd)
+{
+	char buf[1024] __attribute__((aligned(__alignof__(struct inotify_event))));
+	bool ours = false;
+	ssize_t n;
+
+	while ((n = read(fd, buf, sizeof(buf))) > 0) {
+		char *p = buf;
+
+		while (p < buf + n) {
+			struct inotify_event *ev = (struct inotify_event *)p;
+
+			if (ev->len && !strcmp(ev->name, "n72-audio"))
+				ours = true;
+			p += sizeof(*ev) + ev->len;
+		}
+	}
+	if (ours && bta_check()) {
+		snd_refresh_ui();
+		net_ui_sync();	/* the Bluetooth tile and row: the device's name or "On" */
+	}
+}
+
+/*
+ * Events, not looking every 200 ms: the jack's input device, and an
+ * inotify watch on /run (n72-audio-route writes /run/n72-audio by a
+ * rename and removes it), both in the main loop's poll().
+ */
 static void sound_ui_init(void)
 {
+	int ino;
+
 	pf_init();
 	glide_init();
 	snd_init(conf.vol, conf.spk);
-	lv_timer_create(jack_check, 200, NULL);
+	if (jack_fd >= 0)
+		ui_watch(jack_fd, jack_ev);
+	ino = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+	if (ino >= 0 && inotify_add_watch(ino, "/run", IN_CREATE | IN_DELETE | IN_CLOSE_WRITE |
+					  IN_MOVED_TO | IN_MOVED_FROM) >= 0)
+		ui_watch(ino, run_ev);
+	else
+		lv_timer_create(jack_check, 200, NULL);	/* (no inotify: look) */
+	if (bta_check())
+		snd_refresh_ui();
 }
 
 static void open_settings(lv_event_t *e)
@@ -8175,6 +8191,84 @@ static void vc_stop(void)
 	video_rot = -1;
 }
 
+/*
+ * BlueZ's D-Bus signals (a device connecting or going, the adapter on or
+ * off, a device found in a scan) through dbus-monitor, read in the main
+ * loop: the Bluetooth views are read again when something changed, at
+ * most once a second (a scan sends many), instead of every 2-3 s.
+ */
+static int bz_fd = -1;
+static pid_t bz_pid;
+static lv_timer_t *bz_timer;
+static uint32_t bz_last;
+
+static void bz_start(lv_timer_t *t);
+
+static void bz_changed(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	bz_timer = NULL;
+	bz_last = lv_tick_get();
+	job_run("bluetoothctl show", NULL, bt_show_done, NULL);	/* on or off */
+	if (bt_page && lv_obj_is_valid(bt_page))
+		bt_page_refresh();
+	if (btd_page && lv_obj_is_valid(btd_page))
+		btd_refresh();
+}
+
+static void bz_ev(int fd)
+{
+	char buf[2048];
+	ssize_t n;
+	bool any = false;
+
+	while ((n = read(fd, buf, sizeof(buf))) > 0)
+		any = true;
+	if (n == 0) {
+		/* dbus-monitor ended (the bus restarted?): again in a while */
+		ui_unwatch(fd);
+		close(fd);
+		bz_fd = -1;
+		waitpid(bz_pid, NULL, WNOHANG);
+		lv_timer_t *r = lv_timer_create(bz_start, 5000, NULL);
+
+		lv_timer_set_repeat_count(r, 1);
+		return;
+	}
+	if (any && !bz_timer) {
+		uint32_t since = lv_tick_elaps(bz_last);
+
+		bz_timer = lv_timer_create(bz_changed, since >= 1000 ? 250 : 1250 - since, NULL);
+		lv_timer_set_repeat_count(bz_timer, 1);
+	}
+}
+
+static void bz_start(lv_timer_t *t)
+{
+	char *const argv[] = { "dbus-monitor", "--system", "type='signal',sender='org.bluez'",
+			       NULL };
+	posix_spawn_file_actions_t fa;
+	int p[2];
+
+	LV_UNUSED(t);
+	if (bz_fd >= 0 || !have_tool("dbus-monitor") || pipe2(p, O_CLOEXEC))
+		return;
+	fcntl(p[0], F_SETFL, O_NONBLOCK);	/* (ours only: dbus-monitor writes and waits) */
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, p[1], 1);
+	posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+	if (posix_spawnp(&bz_pid, "dbus-monitor", &fa, NULL, argv, environ)) {
+		close(p[0]);
+		p[0] = -1;
+	}
+	posix_spawn_file_actions_destroy(&fa);
+	close(p[1]);
+	if (p[0] < 0)
+		return;
+	bz_fd = p[0];
+	ui_watch(bz_fd, bz_ev);
+}
+
 /* The settings kept on the flash, applied once at start. */
 static void ui_apply_saved(void)
 {
@@ -8187,4 +8281,5 @@ static void ui_apply_saved(void)
 	if (conf.bt == 0 && have_tool("bluetoothctl"))
 		job_run(BT_OFF_CMD, NULL, bt_set_done, NULL);
 	lv_timer_create(bt_auto_tick, 30000, NULL);	/* Connect automatically */
+	bz_start(NULL);		/* BlueZ's signals: the Bluetooth views follow */
 }
