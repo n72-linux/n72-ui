@@ -1268,9 +1268,41 @@ static uint32_t flush_words[16 * 64];
 static int flush_n;
 static bool flipping;
 
+/*
+ * A turned screen (mbx_gpu_set_rotation): LVGL draws the upright picture
+ * (lw x lh) into lbuf, which keeps it from frame to frame as a scan-out
+ * buffer would, and each flush GPU-copies the areas it drew, turned, into
+ * the scan-out buffer of the frame. The scan-out buffers' bookkeeping
+ * (history, catch-up) stays in panel coordinates.
+ */
+static int rot_deg;
+static uint8_t *lbuf;
+static uint32_t lstride;
+
+static uint32_t draw_stride(void)
+{
+	return rot_deg ? lstride : fb.stride;
+}
+
+/* An area of the upright picture to where it lies on the panel. */
+static void to_panel(const lv_area_t *a, lv_area_t *o)
+{
+	int32_t lw = fb.height, lh = fb.width;	/* turned: the upright picture's size */
+
+	if (rot_deg == 90) {
+		o->x1 = a->y1; o->x2 = a->y2;
+		o->y1 = lw - 1 - a->x2; o->y2 = lw - 1 - a->x1;
+	} else if (rot_deg == 270) {
+		o->x1 = lh - 1 - a->y2; o->x2 = lh - 1 - a->y1;
+		o->y1 = a->x1; o->y2 = a->x2;
+	} else {
+		*o = *a;
+	}
+}
+
 static void clean_rows(uint8_t *buf, const lv_area_t *a)
 {
-	sync_range(buf + a->y1 * fb.stride, lv_area_get_height(a) * fb.stride, MBX_SYNC_CLEAN);
+	sync_range(buf + a->y1 * draw_stride(), lv_area_get_height(a) * draw_stride(), MBX_SYNC_CLEAN);
 }
 
 /*
@@ -1394,9 +1426,15 @@ static bool covered(const lv_area_t *a, lv_display_t *d)
 {
 	uint32_t i;
 
-	for (i = 0; i < d->inv_p; i++)
-		if (!d->inv_area_joined[i] && lv_area_is_in(a, &d->inv_areas[i], 0))
+	for (i = 0; i < d->inv_p; i++) {
+		lv_area_t p;
+
+		if (d->inv_area_joined[i])
+			continue;
+		to_panel(&d->inv_areas[i], &p);
+		if (lv_area_is_in(a, &p, 0))
 			return true;
+	}
 	return false;
 }
 
@@ -1474,7 +1512,7 @@ static void render_start_cb(lv_event_t *e)
 			flush_n = 0;
 		}
 	}
-	d->buf_1->data = scan[dr];
+	d->buf_1->data = rot_deg ? lbuf : scan[dr];
 	cur_n = 0;
 	cur_all = false;
 	pm_skip_n = 0;
@@ -1498,7 +1536,21 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 		fprintf(stderr, "flush: premultiply %.1f ms, clean %.1f ms (%d rows)\n",
 			(dbg_t1 - dbg_t0) / 1000.0, (gpu_now_us() - dbg_t1) / 1000.0,
 			(int)lv_area_get_height(area));
-	if (cur_n < HIST_AREAS)
+	if (rot_deg) {
+		uint32_t cw[48];
+		lv_area_t pa;
+		int n = mbx_cmd_copy_turn(cw, fb.stride, lstride, area->x1, area->y1,
+					  lv_area_get_width(area), lv_area_get_height(area),
+					  rot_deg, fb.height, fb.width);
+
+		to_panel(area, &pa);
+		if (blit3d(8, gpu_addr(scan[st_drawing]), gpu_addr(lbuf), cw, n))
+			fprintf(stderr, "n72-ui: turned copy failed\n");
+		if (cur_n < HIST_AREAS)
+			cur_areas[cur_n++] = pa;
+		else
+			cur_all = true;
+	} else if (cur_n < HIST_AREAS)
 		cur_areas[cur_n++] = *area;
 	else
 		cur_all = true;
@@ -1962,14 +2014,18 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void)
 
 	if (mbx < 0)
 		return NULL;
-	b = lv_draw_buf_create(fb.width, fb.height, LV_COLOR_FORMAT_XRGB8888, 0);
-	if (!b)
-		return NULL;
-	if (!in_pool(b->data) || (b->header.stride & 31) || (gpu_addr(b->data) & 127)) {
-		lv_draw_buf_destroy(b);
-		return NULL;
+	{
+		uint32_t gw = rot_deg ? fb.height : fb.width, gh = rot_deg ? fb.width : fb.height;
+
+		b = lv_draw_buf_create(gw, gh, LV_COLOR_FORMAT_XRGB8888, 0);
+		if (!b)
+			return NULL;
+		if (!in_pool(b->data) || (b->header.stride & 31) || (gpu_addr(b->data) & 127)) {
+			lv_draw_buf_destroy(b);
+			return NULL;
+		}
+		lv_area_set(&all, 0, 0, gw - 1, gh - 1);
 	}
-	lv_area_set(&all, 0, 0, fb.width - 1, fb.height - 1);
 	/*
 	 * No wait for the display: the newest finished frame (st_latest) is
 	 * complete once its flush is (flush_flip waits for the GPU), and only
@@ -1982,13 +2038,15 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void)
 	{
 		/* the 3D copy: ~3 ms a screen against the 2D engine's ~8 */
 		uint32_t w3[48];
-		uint32_t src = gpu_addr(flipping ? scan[st_latest] : disp_buf);
-		int n = mbx_cmd_copy(w3, 0, b->header.stride, fb.stride, 0, 0, 0, 0,
-				     fb.width, fb.height, LV_OPA_COVER);
+		/* turned: lbuf has the newest frame, upright */
+		uint32_t src = gpu_addr(rot_deg ? lbuf : flipping ? scan[st_latest] : disp_buf);
+		uint32_t ss = draw_stride();
+		int n = mbx_cmd_copy(w3, 0, b->header.stride, ss, 0, 0, 0, 0,
+				     b->header.w, b->header.h, LV_OPA_COVER);
 
 		if (blit3d(8, gpu_addr(b->data), src, w3, n)) {
 			submit(w, put_copy(w, gpu_addr(b->data), b->header.stride, src,
-					   fb.stride, 0, 0, 0, 0, fb.width, fb.height));
+					   ss, 0, 0, 0, 0, b->header.w, b->header.h));
 			gpu_wait(last_seq);
 			last_seq = 0;
 		}
@@ -2070,7 +2128,7 @@ static void premultiply(uint8_t *px_map, const lv_area_t *a)
 	int32_t y;
 
 	for (y = a->y1; y <= a->y2; y++) {
-		uint32_t *row = (uint32_t *)(px_map + y * fb.stride);
+		uint32_t *row = (uint32_t *)(px_map + y * draw_stride());
 		int32_t x = a->x1;
 
 		while (x <= a->x2) {
@@ -2142,4 +2200,52 @@ const uint8_t *mbx_gpu_scan(int i, int *is_front)
 	flip_wait();
 	*is_front = i == st_front;
 	return scan[i];
+}
+
+/*
+ * Turn the screen: 0, 90 or 270 (LVGL's rotation; LVGL turns the pointer).
+ * Only with page flipping. The screen must be redrawn whole afterwards
+ * (the caller's new layout does that). False if it cannot turn.
+ */
+bool mbx_gpu_set_rotation(int deg)
+{
+	lv_display_t *d = lv_display_get_default();
+	uint32_t size = fb.stride * fb.height;
+	int i;
+
+	if (deg == rot_deg)
+		return true;
+	if (!flipping || mbx < 0 || (deg != 0 && deg != 90 && deg != 270))
+		return false;
+	if (deg && !lbuf) {
+		lstride = buf_width_to_stride(fb.height, LV_COLOR_FORMAT_XRGB8888);
+		lbuf = pool_alloc(lstride * fb.width);
+		if (!lbuf)
+			return false;
+	}
+	flip_wait();
+	gpu_wait(flush_seq);
+	flush_seq = 0;
+	/* the GPU writes the scan-out buffers now (or the CPU again): no
+	 * cache lines of the other way may be written back over them */
+	for (i = 0; i < NSCAN; i++)
+		sync_range(scan[i], size, MBX_SYNC_FLUSH);
+	if (lbuf)
+		sync_range(lbuf, lstride * fb.width, MBX_SYNC_FLUSH);
+	rot_deg = deg;
+	lv_display_set_rotation(d, deg == 90 ? LV_DISPLAY_ROTATION_90 :
+			        deg == 270 ? LV_DISPLAY_ROTATION_270 : LV_DISPLAY_ROTATION_0);
+	lv_display_set_buffers(d, deg ? lbuf : scan[st_latest >= 0 ? st_latest : 0], NULL,
+			       deg ? lstride * fb.width : size, LV_DISPLAY_RENDER_MODE_DIRECT);
+	pthread_mutex_lock(&flip_mx);
+	for (i = 0; i < NSCAN; i++)
+		buf_frame[i] = -1;	/* every buffer: the whole screen anew */
+	pthread_mutex_unlock(&flip_mx);
+	lv_obj_invalidate(lv_screen_active());
+	return true;
+}
+
+int mbx_gpu_rotation(void)
+{
+	return rot_deg;
 }

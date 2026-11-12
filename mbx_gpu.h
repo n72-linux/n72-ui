@@ -50,5 +50,8 @@ void mbx_gpu_set_transparent(bool on);
 void mbx_gpu_handoff(void);
 /* True when the launcher has the display's layer 1 (KMS n72-clcd-shell). */
 bool mbx_gpu_on_shell_layer(void);
+/* turn the screen (LVGL's rotation 0, 90, 270); false if it cannot */
+bool mbx_gpu_set_rotation(int deg);
+int mbx_gpu_rotation(void);
 
 #endif

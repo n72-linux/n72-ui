@@ -136,4 +136,59 @@ static inline int mbx_cmd_copy(uint32_t *p, int blend, uint32_t dstride, uint32_
 	return 48;
 }
 
+/*
+ * Type 8 copy with a quarter turn, for a turned screen: the area (lx, ly,
+ * w x h) of the upright picture LVGL draws (lw x lh) to where it lies on
+ * the panel, as LVGL turns its pointer input. In continuous coordinates,
+ * 90: panel (X, Y) = (ly, lw - lx); 270: (lh - ly, lx). Point sampling at
+ * pixel centres, so the copy is exact.
+ */
+static inline int mbx_cmd_copy_turn(uint32_t *p, uint32_t dstride, uint32_t sstride,
+				    int lx, int ly, int w, int h, int rot, int lw, int lh)
+{
+	uint32_t spx = sstride / 4, right = lx + w, bottom = ly + h;
+	int tlw, tlh, i, X0, Y0, X1, Y1, k;
+	float tw, th, vx[4], vy[4];
+
+	if (spx > 8 && !(spx & (spx - 1)))
+		right = spx;
+	tlw = mbx_log2_ceil8(right);
+	tlh = mbx_log2_ceil8(bottom);
+	tw = (float)(1u << tlw);
+	th = (float)(1u << tlh);
+	if (rot == 90) {
+		X0 = ly; X1 = ly + h; Y0 = lw - (lx + w); Y1 = lw - lx;
+	} else {
+		X0 = lh - (ly + h); X1 = lh - ly; Y0 = lx; Y1 = lx + w;
+	}
+	mbx_cmd_dst(p, dstride, X0, Y0, X1, Y1);
+	p[10] = 0;
+	p[11] = tlw - 3;
+	p[12] = tlh - 3;
+	p[13] = 0x18000;
+	p[14] = spx;
+	/* the quad's corners as mbx_cmd_copy orders them */
+	vx[0] = X0; vy[0] = Y1; vx[1] = X0; vy[1] = Y0;
+	vx[2] = X1; vy[2] = Y1; vx[3] = X1; vy[3] = Y0;
+	for (k = 0; k < 4; k++) {
+		float u, v;
+
+		if (rot == 90) {
+			u = lw - vy[k]; v = vx[k];
+		} else {
+			u = vy[k]; v = lh - vx[k];
+		}
+		p[15 + 2 * k] = mbx_f(vx[k]);
+		p[16 + 2 * k] = mbx_f(vy[k]);
+		p[23 + 2 * k] = mbx_f(u / tw);
+		p[24 + 2 * k] = mbx_f(v / th);
+	}
+	p[31] = 0;
+	p[32] = 0xffffffff;
+	p[33] = 0;
+	for (i = 34; i < 38; i++)
+		p[i] = 0x3f800000;
+	return 38;
+}
+
 #endif

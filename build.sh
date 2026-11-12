@@ -13,7 +13,7 @@ CC=${CROSS}gcc
 PG=
 # PROFILE=1: gprof build (n72-ui-build-prof/, not stripped; gmon.out on a clean exit, e.g. --bench)
 [ "$PROFILE" = 1 ] && { OUT="$ROOT/n72-ui-build-prof"; PG=-pg; }
-CFLAGS="$PG -O2 -idirafter $ROOT/linux-build-alpine/usr/include -idirafter $ROOT/linux-s5l87xx/include/uapi -mcpu=arm1176jzf-s -mfpu=vfpv2 -mfloat-abi=hard -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src -I$ROOT/n72-gles/include"
+CFLAGS="$PG -O2 -g -idirafter $ROOT/linux-build-alpine/usr/include -idirafter $ROOT/linux-s5l87xx/include/uapi -mcpu=arm1176jzf-s -mfpu=vfpv2 -mfloat-abi=hard -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src -I$ROOT/n72-gles/include"
 mkdir -p "$OUT/obj"
 # objects from another compiler or other flags (the old armel build) are not reused
 if [ "$(cat "$OUT/obj/.flags" 2>/dev/null)" != "$CC $CFLAGS" ]; then

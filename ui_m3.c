@@ -20,10 +20,22 @@
 #include "lvgl/src/core/lv_obj_draw_private.h"	/* lv_obj_get_ext_draw_size() */
 #include "lvgl/src/misc/lv_area_private.h"	/* lv_area_intersect() */
 #include <sys/wait.h>
+#include <sys/un.h>
 
 extern char **environ;
 
 static bool system_sleep(void);
+
+/* turning and the video controls (at the end) */
+static int ui_rot, video_rot;
+static char *app_cmd;		/* the running application's command */
+static lv_obj_t *home_apps;
+#define QS_COLS (W > H ? 3 : 2)	/* quick-settings tiles a row */
+static bool app_is_video(void);
+static bool cmd_is_video(const char *cmd);
+static bool ui_turn(int rot);
+static void vc_start(void);
+static void vc_stop(void);
 
 /* ------------------------------------------------------------ settings */
 
@@ -40,7 +52,8 @@ static struct {
 	int vol;		/* sound volume, 0..100 % (0 = mute) */
 	bool spk;		/* speaker when no earphones are plugged */
 	bool wake_plug;		/* the screen comes on when the cable goes in or out */
-} conf = { true, 0, 120, 60, true, true };
+	bool autorot;		/* the screen turns with the iPod (quick settings) */
+} conf = { true, 0, 120, 60, true, true, false };
 
 static const struct { const char *name; uint16_t hue; uint8_t sat; } accents[] = {
 	{ "Violet", 265, 48 }, { "Blue", 215, 60 }, { "Teal", 178, 55 },
@@ -73,6 +86,8 @@ static void conf_load(void)
 			conf.spk = v;
 		else if (sscanf(line, "plug=%d", &v) == 1)
 			conf.wake_plug = v;
+		else if (sscanf(line, "rot=%d", &v) == 1)
+			conf.autorot = v;
 	}
 	fclose(f);
 }
@@ -83,8 +98,8 @@ static void conf_save(void)
 
 	if (!f)
 		return;
-	fprintf(f, "dark=%d\naccent=%d\nidle=%d\nvol=%d\nspk=%d\nplug=%d\n", conf.dark,
-		conf.accent, conf.idle_s, conf.vol, conf.spk, conf.wake_plug);
+	fprintf(f, "dark=%d\naccent=%d\nidle=%d\nvol=%d\nspk=%d\nplug=%d\nrot=%d\n", conf.dark,
+		conf.accent, conf.idle_s, conf.vol, conf.spk, conf.wake_plug, conf.autorot);
 	fclose(f);
 }
 
@@ -1631,10 +1646,35 @@ static void obj_rest(lv_obj_t *t)
 static lv_obj_t *push_quiet_scr;	/* set: push() only records the page */
 static bool push_quiet;
 
+/*
+ * How each page on the stack was opened, so that a turn of the screen can
+ * build them all again at the new size (ui_turn): the opener, or the
+ * folder of a Files page. Each opener marks itself; push() files it.
+ * A page with neither (the Wi-Fi password) keeps the screen as it is.
+ */
+static struct nav_re {
+	void (*open)(lv_event_t *);
+	char *dir;
+} nav_re[NAV_MAX], nav_cur;
+
+static void nav_mark(void (*open)(lv_event_t *), const char *dir)
+{
+	free(nav_cur.dir);
+	nav_cur.open = open;
+	nav_cur.dir = dir ? strdup(dir) : NULL;
+}
+
 static void push(lv_obj_t *scr)
 {
-	if (nav_n < NAV_MAX)
+	if (nav_n < NAV_MAX) {
+		free(nav_re[nav_n].dir);
+		nav_re[nav_n] = nav_cur;
 		nav[nav_n++] = scr;
+	} else {
+		free(nav_cur.dir);
+	}
+	nav_cur.open = NULL;
+	nav_cur.dir = NULL;
 	if (push_quiet) {
 		push_quiet_scr = scr;	/* the card animation shows it */
 		return;
@@ -2149,7 +2189,9 @@ static lv_obj_t *qs_tile(lv_obj_t *parent, const char *icon, const char *title,
 	lv_obj_t *t = lv_obj_create(parent), *col;
 
 	plain(t);
-	lv_obj_set_size(t, (W - 2 * STATUS_PAD - 8) / 2, 64);	/* two, 8 apart */
+	int32_t tw = (W - 2 * STATUS_PAD - 8 * (QS_COLS - 1)) / QS_COLS;	/* 8 apart */
+
+	lv_obj_set_size(t, tw, 64);
 	lv_obj_set_style_radius(t, 20, 0);
 	lv_obj_set_style_bg_opa(t, LV_OPA_COVER, 0);
 	lv_obj_set_style_pad_hor(t, 14, 0);
@@ -2163,13 +2205,13 @@ static lv_obj_t *qs_tile(lv_obj_t *parent, const char *icon, const char *title,
 	plain(col);
 	lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_pad_all(col, 0, 0);
-	lv_obj_set_size(col, 82, LV_SIZE_CONTENT);
+	lv_obj_set_size(col, tw - 28 - 20 - 10, LV_SIZE_CONTENT);	/* (padding, icon, gap) */
 	lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
 	lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 	m3_label(col, title, &lv_font_montserrat_14, M.on_surface);
 	*sub = m3_label(col, "", &lv_font_montserrat_12, M.on_surface_v);
 	lv_label_set_long_mode(*sub, LV_LABEL_LONG_DOT);
-	lv_obj_set_size(*sub, 82, 16);
+	lv_obj_set_size(*sub, tw - 28 - 20 - 10, 16);
 	lv_obj_add_event_cb(t, cb, LV_EVENT_CLICKED, NULL);
 	return t;
 }
@@ -2215,7 +2257,9 @@ static void home_bright_cb(lv_event_t *e)
 
 /* ------------------------------------------------- quick settings shade */
 
-#define SHADE_H 312
+/* 312 upright (two tiles a row, two rows), 240 turned (three in one row) */
+static int32_t shade_h = 312;
+#define SHADE_H shade_h
 
 static void shade_closed(void)
 {
@@ -2362,6 +2406,29 @@ static void qs_settings_cb(lv_event_t *e)
 	qs_to_page(open_settings);
 }
 
+static lv_obj_t *qs_rot, *qs_rot_sub;
+static void rot_conf_changed(void);
+
+/* The Auto-rotate tile: on, it says which way the screen is now. */
+static void qs_rot_sync(void)
+{
+	if (!qs_rot)
+		return;
+	qs_style(qs_rot, conf.autorot);
+	label_set_if_changed(qs_rot_sub, !conf.autorot ? "Portrait" :
+			     W > H ? "On, landscape" : "On");
+	shade_changed(qs_rot);
+}
+
+static void qs_rot_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	conf.autorot = !conf.autorot;
+	conf_save();
+	qs_rot_sync();
+	rot_conf_changed();
+}
+
 static void build_shade(void)
 {
 	lv_obj_t *row, *h;
@@ -2411,22 +2478,36 @@ static void build_shade(void)
 	date_lbl = m3_label(shade, "", &lv_font_montserrat_16, M.primary);
 	lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, STATUS_PAD + 4, 84);
 
-	row = lv_obj_create(shade);
-	plain(row);
-	lv_obj_set_size(row, W - 2 * STATUS_PAD, 64);
-	lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 128);
-	lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-	lv_obj_set_style_pad_all(row, 0, 0);
-	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-	qs_wifi = qs_tile(row, LV_SYMBOL_WIFI, "Wi-Fi", &qs_wifi_sub, qs_open_wifi);
-	qs_bt = qs_tile(row, LV_SYMBOL_BLUETOOTH, "Bluetooth", &qs_bt_sub, qs_open_bt);
+	/* the tiles: a grid, QS_COLS a row, 8 apart */
+	{
+		int rows = (3 + QS_COLS - 1) / QS_COLS;
+		int32_t th = rows * 64 + (rows - 1) * 8;
+
+		row = lv_obj_create(shade);
+		plain(row);
+		lv_obj_set_size(row, W - 2 * STATUS_PAD, th);
+		lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 128);
+		lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+		lv_obj_set_style_pad_all(row, 0, 0);
+		lv_obj_set_style_pad_column(row, 8, 0);
+		lv_obj_set_style_pad_row(row, 8, 0);
+		lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+		lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW_WRAP);
+		lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+		qs_wifi = qs_tile(row, LV_SYMBOL_WIFI, "Wi-Fi", &qs_wifi_sub, qs_open_wifi);
+		qs_bt = qs_tile(row, LV_SYMBOL_BLUETOOTH, "Bluetooth", &qs_bt_sub, qs_open_bt);
+		qs_rot = qs_tile(row, LV_SYMBOL_REFRESH, "Auto-rotate", &qs_rot_sub, qs_rot_cb);
+		qs_rot_sync();
+		/* the slider 12 below; the handle 52 below it */
+		shade_h = 128 + th + 12 + 56 + 52;
+		lv_obj_set_height(shade, shade_h);
+		lv_obj_set_y(shade, -shade_h);
+	}
 
 	row = lv_obj_create(shade);
 	plain(row);
 	lv_obj_set_size(row, W - 2 * STATUS_PAD, 56);
-	lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 204);
+	lv_obj_align(row, LV_ALIGN_TOP_MID, 0, shade_h - 52 - 56);
 	lv_obj_set_style_bg_color(row, M.surface_c_highest, 0);
 	lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
 	lv_obj_set_style_radius(row, LV_RADIUS_CIRCLE, 0);
@@ -2678,6 +2759,8 @@ static bool ui_wants_touch(int x, int y)
 {
 	if (locked || app_pid <= 0 || lv_screen_active() != app_scr)
 		return true;
+	if (app_is_video())
+		return true;		/* the player has no touch input: its controls */
 	if (shade_open || y < APP_EDGE_H)
 		return true;
 	if (app_bar_shown && y < APP_BAR_H)
@@ -3983,6 +4066,7 @@ static bool page_home_over_app(void)
 /* Back to home (the application is gone, or going). */
 static void app_home_ui(void)
 {
+	vc_stop();
 	shade_set(false, false);
 	app_bar_set(false);
 	if (app_bar) {
@@ -4051,6 +4135,7 @@ static void app_closed(void)
 	sd_settle_now();
 
 	app_pid = 0;
+	vc_stop();
 	if (app_timer) {
 		lv_timer_delete(app_timer);
 		app_timer = NULL;
@@ -4072,8 +4157,13 @@ static void app_poll(lv_timer_t *t)
 	int st;
 
 	LV_UNUSED(t);
-	if (app_pid > 0 && waitpid(app_pid, &st, WNOHANG) == app_pid)
+	if (app_pid > 0 && waitpid(app_pid, &st, WNOHANG) == app_pid) {
+		if (WIFSIGNALED(st) || (WIFEXITED(st) && WEXITSTATUS(st)))
+			fprintf(stderr, "n72-ui: application ended: %s %d\n",
+				WIFSIGNALED(st) ? "signal" : "exit status",
+				WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
 		app_closed();
+	}
 }
 
 static void app_kill_cb(lv_timer_t *t)
@@ -4154,9 +4244,28 @@ static void za_spawn_cb(lv_timer_t *t)
 static void app_launch_cb(lv_event_t *e)
 {
 	const char *cmd = lv_event_get_user_data(e);
+	lv_obj_t *tile = lv_event_get_current_target(e);
 
 	if (app_pid != 0 || za.phase || !mbx_gpu_on_shell_layer())
 		return;
+	free(app_cmd);
+	app_cmd = strdup(cmd ? cmd : "");
+	if (!app_cmd)
+		return;
+	cmd = app_cmd;		/* (the row's copy goes with its page in a turn) */
+	if (ui_rot && !cmd_is_video(cmd)) {
+		/* applications draw for an upright panel: turn first, and
+		 * find the tile again in the new home */
+		int idx = lv_obj_get_parent(tile) == home_apps ? (int)lv_obj_get_index(tile) : -1;
+
+		if (idx < 0 || !ui_turn(0))
+			return;
+		tile = lv_obj_get_child(home_apps, idx);
+		if (!tile)
+			return;
+	}
+	if (cmd_is_video(cmd))
+		vc_start();
 	if (!app_scr) {
 		/* nothing on it: transparent, the application shows */
 		app_scr = lv_obj_create(NULL);
@@ -4172,7 +4281,7 @@ static void app_launch_cb(lv_event_t *e)
 	shade_set(false, false);
 
 	/* home as it is now, for the grow (and the close) */
-	za.tile = lv_event_get_current_target(e);
+	za.tile = tile;
 	{
 		/* the tile back to rest at once, not by its transition: adding
 		 * a style ends an object's transitions */
@@ -4514,6 +4623,7 @@ static void files_dir_cb(lv_event_t *e)
 
 static void files_open_dir(const char *path)
 {
+	nav_mark(NULL, path);
 	const char *title = !strcmp(path, FILES_ROOT) ? "Files" : strrchr(path, '/') + 1;
 	struct fent *v = calloc(FILES_MAX, sizeof(*v));
 	lv_obj_t *scr, *body, *c, *row;
@@ -4619,6 +4729,8 @@ static void open_files(lv_event_t *e)
 	files_open_dir(FILES_ROOT);
 }
 
+#include "ui_youtube.c"	/* YouTube: search, a video's page, Play/Listen */
+
 static void open_paint(lv_event_t *e);
 
 /* An idle moment: the picture of the shade made ready before the next drag. */
@@ -4633,6 +4745,9 @@ static void shade_pic_warm(lv_timer_t *t)
 		return;
 	shade_pic_get();
 }
+
+static lv_obj_t *home_apps;		/* the tile grid */
+static lv_timer_t *shade_warm_timer;
 
 static void build_home(void)
 {
@@ -4678,7 +4793,7 @@ static void build_home(void)
 	}
 
 	/* apps: a launcher grid, four to a row, the whole width */
-	apps = lv_obj_create(home_scr);
+	apps = home_apps = lv_obj_create(home_scr);
 	plain(apps);
 	lv_obj_set_size(apps, W - 16, H - 172);
 	lv_obj_set_pos(apps, 8, 172);
@@ -4695,6 +4810,8 @@ static void build_home(void)
 	page_tile_anim(apps, open_paint);
 	app_tile(apps, LV_SYMBOL_DIRECTORY, "Files", M.secondary_c, M.on_secondary_c, open_files);
 	page_tile_anim(apps, open_files);
+	app_tile(apps, LV_SYMBOL_PLAY, "YouTube", M.tertiary_c, M.on_tertiary_c, open_youtube);
+	page_tile_anim(apps, open_youtube);
 	app_tiles(apps);
 
 	build_shade();
@@ -4702,9 +4819,10 @@ static void build_home(void)
 
 	status_refresh(true);
 	home_timer = lv_timer_create(home_update, 2000, NULL);
-	lv_timer_create(shade_pic_warm, 1000, NULL);
+	shade_warm_timer = lv_timer_create(shade_pic_warm, 1000, NULL);
 	home_update(NULL);
-	lv_screen_load(home_scr);
+	if (app_pid <= 0)	/* (a turn over an application keeps it) */
+		lv_screen_load(home_scr);
 	/* (ui_reopen: main, once the sound card is known) */
 }
 
@@ -4777,6 +4895,7 @@ static void pw_done_cb(lv_event_t *e)
 
 static void wifi_ask_password(const char *ssid)
 {
+	nav_mark(NULL, NULL);	/* (not reopened by a turn) */
 	lv_obj_t *body, *kb;
 
 	snprintf(pw_ssid, sizeof(pw_ssid), "%s", ssid);
@@ -4999,6 +5118,7 @@ static void wifi_switch_cb(lv_event_t *e)
 
 static void open_wifi(lv_event_t *e)
 {
+	nav_mark(open_wifi, NULL);
 	lv_obj_t *body, *c, *b;
 
 	LV_UNUSED(e);
@@ -5220,6 +5340,7 @@ static void bt_scan_cb(lv_event_t *e)
 
 static void open_bt(lv_event_t *e)
 {
+	nav_mark(open_bt, NULL);
 	lv_obj_t *body, *c, *b;
 
 	LV_UNUSED(e);
@@ -5313,6 +5434,7 @@ static void plug_cb(lv_event_t *e)
 
 static void open_display(lv_event_t *e)
 {
+	nav_mark(open_display, NULL);
 	static const char *const theme_map[] = { "Dark", "Light", "" };
 	lv_obj_t *scr, *body, *c, *s, *bm, *row, *dd;
 	unsigned int i;
@@ -5427,6 +5549,7 @@ static void power_do(lv_event_t *e)
 
 static void open_power(lv_event_t *e)
 {
+	nav_mark(open_power, NULL);
 	lv_obj_t *scr, *body;
 
 	LV_UNUSED(e);
@@ -5506,6 +5629,7 @@ static void about_delete_cb(lv_event_t *e)
 
 static void open_about(lv_event_t *e)
 {
+	nav_mark(open_about, NULL);
 	static const char *const titles[] = { "Device", "Kernel", "Uptime", "Memory",
 		"Battery", "Network", "NAND" };
 	lv_obj_t *scr, *body, *c;
@@ -5827,6 +5951,7 @@ static void snd_test_cb(lv_event_t *e)
 
 static void open_sound(lv_event_t *e)
 {
+	nav_mark(open_sound, NULL);
 	lv_obj_t *scr, *body, *c, *row, *sw;
 
 	LV_UNUSED(e);
@@ -5874,6 +5999,7 @@ static void sound_ui_init(void)
 
 static void open_settings(lv_event_t *e)
 {
+	nav_mark(open_settings, NULL);
 	lv_obj_t *scr, *body, *c;
 	char sub[80];
 
@@ -6046,6 +6172,7 @@ static void logs_delete_cb(lv_event_t *e)
 
 static void open_logs(lv_event_t *e)
 {
+	nav_mark(open_logs, NULL);
 	lv_obj_t *scr, *body;
 
 	LV_UNUSED(e);
@@ -6187,6 +6314,7 @@ static void paint_delete_cb(lv_event_t *e)
 
 static void open_paint(lv_event_t *e)
 {
+	nav_mark(open_paint, NULL);
 	lv_obj_t *scr, *body, *btn;
 
 	LV_UNUSED(e);
@@ -6215,4 +6343,695 @@ static void open_paint(lv_event_t *e)
 	lv_obj_add_event_cb(btn, paint_clear_cb, LV_EVENT_CLICKED, NULL);
 	lv_obj_center(m3_label(btn, LV_SYMBOL_TRASH, &lv_font_montserrat_16, M.on_secondary_c));
 	push(scr);
+}
+
+/* ------------------------------------------------------------ turning */
+
+/*
+ * The screen turns with the iPod when Auto-rotate is on (quick settings):
+ * the accelerometer (lis3lv02d, read from sysfs a few times a second while
+ * the screen is on) says which way is down; once a new way has held for
+ * ROT_HOLD_MS the UI turns. LVGL draws the turned picture upright and the
+ * GPU turns it onto the panel as it copies it (mbx_gpu.c: no cost); the
+ * screens are built again at the new size (ui_turn), the pages on the
+ * stack reopened. A video turns with it (the player turns its pictures).
+ *
+ * Upright only: Paint, the Wi-Fi password, the lock screen (it stays as
+ * the screen was), applications other than the video player (they draw
+ * on layer 0 for an upright panel).
+ *
+ * Gravity on the iPod as the driver reports it (iOS's convention): upright
+ * y < 0; on the right side (home button left) x > 0: LVGL's 90 (its 90
+ * puts the picture's top at the panel's left edge); on the left side
+ * x < 0: 270. Upside down is not used.
+ */
+#define ROT_POS "/sys/devices/platform/lis3lv02d/position"
+#define ROT_G 550		/* mg along an axis to count as down */
+#define ROT_HOLD_MS 450
+
+static int ui_rot;			/* the screen's turn now */
+static int rot_seen = -1;		/* the way the iPod is held, -1 unknown */
+static uint32_t rot_seen_ms;
+static lv_timer_t *rot_timer;
+static int video_rot = -1;		/* the player's controls asked for this (-1: follow) */
+
+static bool app_is_video(void);
+static void vc_turned(void);
+
+/* The way the iPod is held: 0, 90, 270; -1 flat or upside down. */
+static int rot_read(void)
+{
+	char buf[64];
+	int fd = open(ROT_POS, O_RDONLY | O_CLOEXEC), x, y, z;
+	ssize_t n;
+
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	buf[n] = 0;
+	if (sscanf(buf, "(%d,%d,%d)", &x, &y, &z) != 3)
+		return -1;
+	if (y < -ROT_G && -y > LV_ABS(x))
+		return 0;
+	if (x > ROT_G && x > LV_ABS(y))
+		return 90;
+	if (x < -ROT_G && -x > LV_ABS(y))
+		return 270;
+	return -1;
+}
+
+/* Rebuild what is shown at the new size; false if it could not turn. */
+static bool ui_turn(int rot)
+{
+	struct nav_re re[NAV_MAX];
+	lv_obj_t *tmp = NULL, *active = lv_screen_active();
+	bool over_app = app_pid > 0 && active == app_scr;
+	int n = nav_n, from_idx = -2, i;
+
+	if (rot == ui_rot)
+		return true;
+	for (i = 0; i < n; i++) {
+		if (!nav_re[i].open && !nav_re[i].dir)
+			return false;		/* a page that cannot be reopened */
+		if (launch_from == nav[i])
+			from_idx = i;
+	}
+	if (launch_from == home_scr)
+		from_idx = -1;
+	if (!mbx_gpu_set_rotation(rot))
+		return false;
+	ui_rot = rot;
+	ui_w = lv_display_get_horizontal_resolution(NULL);
+	ui_h = lv_display_get_vertical_resolution(NULL);
+
+	/* everything goes: the pages, home (the shade with it), the bars */
+	memcpy(re, nav_re, sizeof(re));
+	memset(nav_re, 0, sizeof(nav_re));	/* (re owns the folders now) */
+	if (!over_app) {
+		tmp = lv_obj_create(NULL);
+		lv_screen_load(tmp);
+	}
+	if (shade && lv_obj_is_valid(shade))
+		lv_obj_delete(shade);
+	if (scrim && lv_obj_is_valid(scrim))
+		lv_obj_delete(scrim);
+	shade = scrim = NULL;
+	shade_open = false;
+	tr_free(&shade_pic);
+	shade_pic_dirty = true;
+	sd_free_pics();
+	tr_free(&sd.home_pic);
+	if (app_bar_timer) {
+		lv_timer_delete(app_bar_timer);
+		app_bar_timer = NULL;
+	}
+	if (app_bar) {
+		lv_obj_delete(app_bar);
+		app_bar = NULL;
+		app_bar_shown = false;
+	}
+	lv_obj_remove_event_cb(lv_layer_top(), app_gesture_cb);
+	if (vol_hud_timer) {
+		lv_timer_delete(vol_hud_timer);
+		vol_hud_timer = NULL;
+	}
+	if (vol_hud) {
+		lv_obj_delete(vol_hud);
+		vol_hud = NULL;
+	}
+	if (lock_scr && !locked) {
+		lv_obj_delete(lock_scr);
+		lock_scr = NULL;
+	}
+	for (i = n - 1; i >= 0; i--)
+		lv_obj_delete(nav[i]);
+	nav_n = 0;
+	lv_obj_delete(home_scr);
+	home_scr = NULL;
+	if (home_timer) {
+		lv_timer_delete(home_timer);
+		home_timer = NULL;
+	}
+	if (shade_warm_timer) {
+		lv_timer_delete(shade_warm_timer);
+		shade_warm_timer = NULL;
+	}
+	/* the picture of where an application was launched, and its tile */
+	za.tile = NULL;
+	tr_free(&za.home);
+
+	build_home();
+	if (app_pid > 0) {
+		app_bar_build();
+		lv_obj_set_parent(scrim, lv_layer_top());
+		lv_obj_set_parent(shade, lv_layer_top());
+	}
+	push_quiet = true;
+	for (i = 0; i < n; i++) {
+		if (re[i].open)
+			re[i].open(NULL);
+		else
+			files_open_dir(re[i].dir);
+		free(re[i].dir);
+	}
+	push_quiet = false;
+	push_quiet_scr = NULL;
+	launch_from = from_idx == -1 ? home_scr : from_idx >= 0 && from_idx < nav_n ?
+		      nav[from_idx] : NULL;
+	if (over_app) {
+		lv_obj_invalidate(app_scr);
+	} else {
+		lv_screen_load(nav_n ? nav[nav_n - 1] : home_scr);
+		lv_obj_delete(tmp);
+	}
+	lv_obj_invalidate(lv_layer_top());
+	net_ui_sync();
+	status_refresh(true);
+	qs_rot_sync();
+	vc_turned();
+	return true;
+}
+
+/* The turn the screen should have now. */
+static int rot_wanted(void)
+{
+	lv_obj_t *a = lv_screen_active();
+
+	if (app_pid > 0 && a == app_scr) {
+		if (!app_is_video())
+			return 0;
+		if (video_rot >= 0)
+			return video_rot;
+	}
+	if (!conf.autorot)
+		return 0;
+	return rot_seen >= 0 ? rot_seen : ui_rot;
+}
+
+/* Whether the UI may be rebuilt now (nothing moving, nothing held). */
+static bool rot_can_turn(void)
+{
+	lv_obj_t *a = lv_screen_active();
+	int i;
+
+	if (screen_off || locked || za.phase || tr.scr || sd.on || sd.scr || shade_open ||
+	    page_over_app || lv_anim_count_running() ||
+	    (touch_indev && lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
+		return false;
+	if (app_pid != 0 && !(app_pid > 0 && a == app_scr && app_is_video()))
+		return false;		/* an application starting, or not the player */
+	for (i = 0; i < nav_n; i++)
+		if (nav_re[i].open == open_paint)
+			return false;
+	return a == home_scr || (nav_n && a == nav[nav_n - 1]) || (app_pid > 0 && a == app_scr);
+}
+
+static void rot_poll(lv_timer_t *t)
+{
+	int r, want;
+
+	LV_UNUSED(t);
+	if (screen_off || locked)
+		return;
+	if (conf.autorot || (app_pid > 0 && app_is_video())) {
+		r = rot_read();
+		if (r >= 0 && r != rot_seen) {
+			rot_seen = r;
+			rot_seen_ms = lv_tick_get();
+		}
+		if (lv_tick_elaps(rot_seen_ms) < ROT_HOLD_MS)
+			return;
+	}
+	want = rot_wanted();
+	if (want != ui_rot && rot_can_turn())
+		ui_turn(want);
+}
+
+static void rot_conf_changed(void)
+{
+	rot_seen = conf.autorot ? rot_read() : -1;
+	rot_seen_ms = 0;
+}
+
+static void rot_init(void)
+{
+	rot_timer = lv_timer_create(rot_poll, 200, NULL);
+	if (conf.autorot)
+		rot_seen = rot_read();
+}
+
+/* Upright now, for something that only works upright (an application). */
+static void ui_upright(void)
+{
+	if (ui_rot)
+		ui_turn(0);
+}
+
+/* ---------------------------------------------------- video controls */
+
+/*
+ * Over the video player (n72-player, started as n72-video FILE) the
+ * launcher shows its controls on layer 1, Material 3 style: a scrim, the
+ * title with Back and a turn button at the top, the play/pause button
+ * (filled, primary) between the two skip buttons in the middle, and the
+ * time with a slider at the bottom. A tap shows or hides them; playing,
+ * they go after VC_HIDE_MS. Commands and the state go over the player's
+ * socket "@n72-player" (datagrams; see n72-player.c).
+ */
+#define VC_HIDE_MS 3000
+#define VC_FADE_MS 150
+
+
+static struct {
+	lv_obj_t *root, *ui, *title, *play_sym, *slider, *pos, *dur, *rot_lbl;
+	lv_timer_t *poll, *hide;
+	int sock;
+	bool up;			/* the player has answered */
+	bool shown, playing, dragging;
+	int64_t pos_ms, dur_ms;
+	int prot;			/* the player's turn */
+	uint32_t quiet_ms;		/* after a command: the state may lag */
+	char name[128];
+} vc = { .sock = -1, .prot = -1 };
+
+static bool cmd_is_video(const char *cmd)
+{
+	return cmd && (!strncmp(cmd, "n72-video", 9) || !strncmp(cmd, "n72-player", 10));
+}
+
+static bool app_is_video(void)
+{
+	return app_pid > 0 && cmd_is_video(app_cmd);
+}
+
+/* A video playing in front: the screen stays on (main.c, idle_check). */
+static bool video_playing(void)
+{
+	return app_is_video() && vc.up && vc.playing && lv_screen_active() == app_scr;
+}
+
+static void vc_send(const char *m)
+{
+	struct sockaddr_un a = { .sun_family = AF_UNIX };
+	socklen_t l = offsetof(struct sockaddr_un, sun_path) + 1 + strlen("n72-player");
+
+	if (vc.sock < 0)
+		return;
+	memcpy(a.sun_path + 1, "n72-player", strlen("n72-player"));
+	sendto(vc.sock, m, strlen(m), MSG_DONTWAIT, (struct sockaddr *)&a, l);
+}
+
+static void vc_fmt(char *b, size_t n, int64_t ms)
+{
+	long t = ms < 0 ? 0 : (long)(ms / 1000);
+
+	if (t >= 3600)
+		snprintf(b, n, "%ld:%02ld:%02ld", t / 3600, t / 60 % 60, t % 60);
+	else
+		snprintf(b, n, "%ld:%02ld", t / 60, t % 60);
+}
+
+static void vc_show(bool on);
+
+static void vc_hide_cb(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	vc.hide = NULL;
+	if (vc.playing && !vc.dragging)
+		vc_show(false);
+}
+
+/* Playing and shown: hide in a while (again from now). */
+static void vc_hide_later(void)
+{
+	if (vc.hide) {
+		lv_timer_delete(vc.hide);
+		vc.hide = NULL;
+	}
+	if (!vc.shown || !vc.playing || vc.dragging)
+		return;
+	vc.hide = lv_timer_create(vc_hide_cb, VC_HIDE_MS, NULL);
+	lv_timer_set_repeat_count(vc.hide, 1);
+}
+
+static void vc_opa_exec(void *o, int32_t v)
+{
+	lv_obj_set_style_opa(o, (lv_opa_t)v, 0);
+}
+
+static void vc_fade_done(lv_anim_t *a)
+{
+	if (!vc.shown)
+		lv_obj_add_flag(a->var, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_remove_local_style_prop(a->var, LV_STYLE_OPA, 0);	/* no layer at rest */
+}
+
+static void vc_show(bool on)
+{
+	lv_anim_t a;
+
+	if (!vc.ui)
+		return;
+	vc.shown = on;
+	lv_anim_delete(vc.ui, vc_opa_exec);
+	if (on)
+		lv_obj_remove_flag(vc.ui, LV_OBJ_FLAG_HIDDEN);
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, vc.ui);
+	lv_anim_set_exec_cb(&a, vc_opa_exec);
+	lv_anim_set_values(&a, on ? LV_OPA_TRANSP : LV_OPA_COVER, on ? LV_OPA_COVER : LV_OPA_TRANSP);
+	lv_anim_set_duration(&a, VC_FADE_MS);
+	lv_anim_set_path_cb(&a, on ? lv_anim_path_ease_out : lv_anim_path_ease_in);
+	lv_anim_set_completed_cb(&a, vc_fade_done);
+	lv_anim_start(&a);
+	vc_hide_later();
+}
+
+static void vc_update(void)
+{
+	char b[24];
+
+	if (!vc.ui)
+		return;
+	label_set_if_changed(vc.play_sym, vc.playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+	label_set_if_changed(vc.title, vc.name);
+	if (!vc.dragging) {
+		vc_fmt(b, sizeof(b), vc.pos_ms);
+		label_set_if_changed(vc.pos, b);
+		if (vc.dur_ms > 0) {
+			lv_slider_set_range(vc.slider, 0, (int32_t)(vc.dur_ms / 100));
+			lv_slider_set_value(vc.slider, (int32_t)(vc.pos_ms / 100), LV_ANIM_OFF);
+		}
+	}
+	vc_fmt(b, sizeof(b), vc.dur_ms);
+	label_set_if_changed(vc.dur, vc.dur_ms > 0 ? b : "");
+}
+
+static void vc_build(void);
+
+/* The player's state, a few times a second. */
+static void vc_poll(lv_timer_t *t)
+{
+	char buf[256], st[16];
+	long long pos, dur;
+	int r;
+	ssize_t n;
+
+	LV_UNUSED(t);
+	while ((n = recv(vc.sock, buf, sizeof(buf) - 1, MSG_DONTWAIT)) > 0) {
+		buf[n] = 0;
+		if (sscanf(buf, "%15s %lld %lld %d", st, &pos, &dur, &r) != 4)
+			continue;
+		if (!vc.up) {
+			const char *nl = strchr(buf, '\n');
+
+			vc.up = true;
+			snprintf(vc.name, sizeof(vc.name), "%s", nl ? nl + 1 : "");
+			vc.playing = !strcmp(st, "playing");
+			vc_build();
+			vc_show(true);		/* a moment at the start */
+		}
+		vc.prot = r;
+		if (lv_tick_elaps(vc.quiet_ms) < 700)
+			continue;		/* (a command's effect not in yet) */
+		if (vc.playing != !strcmp(st, "playing")) {
+			vc.playing = !strcmp(st, "playing");
+			vc_hide_later();
+		}
+		vc.pos_ms = pos;
+		vc.dur_ms = dur;
+	}
+	if (vc.up && vc.prot != ui_rot) {
+		snprintf(buf, sizeof(buf), "rot %d", ui_rot);
+		vc_send(buf);
+		vc.prot = ui_rot;
+	}
+	vc_update();
+	vc_send("status");
+}
+
+static void vc_quiet(void)
+{
+	vc.quiet_ms = lv_tick_get();
+}
+
+static void vc_tap_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	vc_show(!vc.shown);
+}
+
+static void vc_play_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	vc_send("toggle");
+	vc.playing = !vc.playing;
+	vc_quiet();
+	vc_update();
+	vc_hide_later();
+}
+
+static void vc_skip_cb(lv_event_t *e)
+{
+	int d = (int)(intptr_t)lv_event_get_user_data(e);
+	char m[32];
+
+	snprintf(m, sizeof(m), "skip %d", d);
+	vc_send(m);
+	vc.pos_ms = LV_CLAMP(0, vc.pos_ms + d, vc.dur_ms > 0 ? vc.dur_ms : vc.pos_ms + d);
+	vc_quiet();
+	vc_update();
+	vc_hide_later();
+}
+
+static void vc_slider_cb(lv_event_t *e)
+{
+	lv_event_code_t c = lv_event_get_code(e);
+	char b[24];
+
+	if (c == LV_EVENT_PRESSED) {
+		vc.dragging = true;
+		vc_hide_later();	/* (stops it) */
+	} else if (c == LV_EVENT_VALUE_CHANGED) {
+		vc_fmt(b, sizeof(b), (int64_t)lv_slider_get_value(vc.slider) * 100);
+		label_set_if_changed(vc.pos, b);
+	} else if (c == LV_EVENT_RELEASED || c == LV_EVENT_PRESS_LOST) {
+		char m[32];
+
+		vc.dragging = false;
+		vc.pos_ms = (int64_t)lv_slider_get_value(vc.slider) * 100;
+		snprintf(m, sizeof(m), "seek %lld", (long long)vc.pos_ms);
+		vc_send(m);
+		vc_quiet();
+		vc_hide_later();
+	}
+}
+
+static void vc_back_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	app_end();		/* back to where it was started (Files) */
+}
+
+/* The turn button: landscape for this video, or back upright. */
+static void vc_rot_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	video_rot = ui_rot ? 0 : 90;
+	if (conf.autorot && rot_seen > 0 && !ui_rot)
+		video_rot = rot_seen;	/* (held sideways already: that way) */
+	vc_hide_later();
+}
+
+/* A round icon button: transparent, white, a state layer when pressed. */
+static lv_obj_t *vc_icon_btn(lv_obj_t *parent, const char *sym, int32_t size,
+			     const lv_font_t *font, lv_event_cb_t cb, void *ud)
+{
+	lv_obj_t *b = lv_button_create(parent), *l;
+
+	plain(b);
+	lv_obj_set_size(b, size, size);
+	lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_bg_color(b, lv_color_white(), 0);
+	lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_bg_opa(b, LV_OPA_20, LV_STATE_PRESSED);	/* (M3: 12 % over video reads too faint) */
+	lv_obj_set_style_shadow_width(b, 0, 0);
+	l = m3_label(b, sym, font, lv_color_white());
+	lv_obj_center(l);
+	lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+	return b;
+}
+
+static void vc_build(void)
+{
+	lv_obj_t *o, *row, *b, *col;
+	bool land = W > H;
+
+	if (vc.root || !app_scr)
+		return;
+	/* the whole screen takes taps: on the video, they show and hide */
+	vc.root = lv_obj_create(app_scr);
+	lv_obj_remove_style_all(vc.root);
+	lv_obj_set_size(vc.root, W, H);
+	lv_obj_remove_flag(vc.root, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_add_flag(vc.root, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_add_event_cb(vc.root, vc_tap_cb, LV_EVENT_CLICKED, NULL);
+
+	vc.ui = lv_obj_create(vc.root);
+	lv_obj_remove_style_all(vc.ui);
+	lv_obj_set_size(vc.ui, W, H);
+	lv_obj_set_style_bg_color(vc.ui, lv_color_black(), 0);
+	lv_obj_set_style_bg_opa(vc.ui, LV_OPA_40, 0);	/* the scrim */
+	lv_obj_remove_flag(vc.ui, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_add_flag(vc.ui, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+	lv_obj_add_event_cb(vc.ui, vc_tap_cb, LV_EVENT_CLICKED, NULL);
+
+	/* top: Back, the title, the turn button */
+	row = lv_obj_create(vc.ui);
+	lv_obj_remove_style_all(row);
+	lv_obj_set_size(row, W - 16, 56);
+	lv_obj_set_pos(row, 8, 4);
+	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_column(row, 4, 0);
+	vc_icon_btn(row, LV_SYMBOL_LEFT, 48, &lv_font_montserrat_20, vc_back_cb, NULL);
+	vc.title = m3_label(row, vc.name, &lv_font_montserrat_16, lv_color_white());
+	lv_label_set_long_mode(vc.title, LV_LABEL_LONG_DOT);
+	lv_obj_set_flex_grow(vc.title, 1);
+	b = vc_icon_btn(row, LV_SYMBOL_REFRESH, 48, &lv_font_montserrat_20, vc_rot_cb, NULL);
+	vc.rot_lbl = lv_obj_get_child(b, 0);
+
+	/* middle: back 10 s, play/pause, on 10 s */
+	row = lv_obj_create(vc.ui);
+	lv_obj_remove_style_all(row);
+	lv_obj_set_size(row, 264, 96);
+	lv_obj_align(row, LV_ALIGN_CENTER, 0, land ? 0 : -8);
+	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	for (int k = 0; k < 3; k++) {
+		if (k == 1) {
+			/* filled: M3's emphasis for the main action */
+			b = lv_button_create(row);
+			plain(b);
+			lv_obj_set_size(b, 80, 80);
+			lv_obj_set_style_radius(b, 28, 0);	/* (M3 large FAB shape) */
+			lv_obj_set_style_bg_color(b, M.primary_c, 0);
+			lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+			lv_obj_set_style_shadow_width(b, 0, 0);
+			lv_obj_set_style_transform_scale(b, 240, LV_STATE_PRESSED);
+			vc.play_sym = m3_label(b, vc.playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY,
+					       &lv_font_montserrat_28, M.on_primary_c);
+			lv_obj_center(vc.play_sym);
+			lv_obj_add_event_cb(b, vc_play_cb, LV_EVENT_CLICKED, NULL);
+			continue;
+		}
+		b = vc_icon_btn(row, "", 64, &lv_font_montserrat_20, vc_skip_cb,
+				(void *)(intptr_t)(k ? 10000 : -10000));
+		lv_obj_delete(lv_obj_get_child(b, 0));
+		col = lv_obj_create(b);
+		lv_obj_remove_style_all(col);
+		lv_obj_set_size(col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+		lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+		lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+		lv_obj_set_style_pad_row(col, 0, 0);
+		lv_obj_center(col);
+		m3_label(col, k ? LV_SYMBOL_NEXT : LV_SYMBOL_PREV, &lv_font_montserrat_20, lv_color_white());
+		m3_label(col, "10", &lv_font_montserrat_12, lv_color_white());
+	}
+
+	/* bottom: the time and the slider (M3: primary active track, a
+	 * light inactive one over video) */
+	row = lv_obj_create(vc.ui);
+	lv_obj_remove_style_all(row);
+	lv_obj_set_size(row, W - 2 * STATUS_PAD, 64);
+	lv_obj_align(row, LV_ALIGN_BOTTOM_MID, 0, -8);
+	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	vc.pos = m3_label(row, "0:00", &lv_font_montserrat_12, lv_color_white());
+	lv_obj_align(vc.pos, LV_ALIGN_TOP_LEFT, 4, 4);
+	vc.dur = m3_label(row, "", &lv_font_montserrat_12, lv_color_hex(0xd0d0d0));
+	lv_obj_align(vc.dur, LV_ALIGN_TOP_RIGHT, -4, 4);
+	o = vc.slider = lv_slider_create(row);
+	lv_obj_set_size(o, lv_pct(100), 4);
+	lv_obj_align(o, LV_ALIGN_BOTTOM_MID, 0, -18);
+	lv_obj_set_style_bg_color(o, lv_color_white(), LV_PART_MAIN);
+	lv_obj_set_style_bg_opa(o, LV_OPA_40, LV_PART_MAIN);
+	lv_obj_set_style_radius(o, 2, LV_PART_MAIN);
+	lv_obj_set_style_bg_color(o, M.primary, LV_PART_INDICATOR);
+	lv_obj_set_style_bg_opa(o, LV_OPA_COVER, LV_PART_INDICATOR);
+	lv_obj_set_style_bg_color(o, M.primary, LV_PART_KNOB);
+	lv_obj_set_style_bg_opa(o, LV_OPA_COVER, LV_PART_KNOB);
+	lv_obj_set_style_pad_all(o, 6, LV_PART_KNOB);
+	lv_obj_set_style_shadow_width(o, 0, LV_PART_KNOB);
+	lv_obj_set_style_pad_all(o, 6, LV_PART_KNOB | LV_STATE_PRESSED);
+	lv_obj_set_ext_click_area(o, 16);
+	lv_obj_remove_flag(o, LV_OBJ_FLAG_GESTURE_BUBBLE);
+	lv_obj_add_event_cb(o, vc_slider_cb, LV_EVENT_PRESSED, NULL);
+	lv_obj_add_event_cb(o, vc_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	lv_obj_add_event_cb(o, vc_slider_cb, LV_EVENT_RELEASED, NULL);
+	lv_obj_add_event_cb(o, vc_slider_cb, LV_EVENT_PRESS_LOST, NULL);
+	vc_update();
+}
+
+/* Rebuilt at a new size, as it was. */
+static void vc_turned(void)
+{
+	bool shown = vc.shown;
+
+	if (!vc.root)
+		return;
+	lv_obj_delete(vc.root);
+	vc.root = vc.ui = NULL;
+	vc_build();
+	if (shown) {
+		lv_obj_remove_flag(vc.ui, LV_OBJ_FLAG_HIDDEN);
+		vc.shown = true;
+		vc_hide_later();
+	}
+}
+
+/* A video application is starting: listen for its player. */
+static void vc_start(void)
+{
+	struct sockaddr_un a = { .sun_family = AF_UNIX };
+
+	vc.up = vc.shown = vc.dragging = false;
+	vc.playing = true;
+	vc.pos_ms = vc.dur_ms = 0;
+	vc.prot = -1;
+	vc.name[0] = 0;
+	video_rot = -1;
+	if (vc.sock < 0) {
+		vc.sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+		/* an address of its own (autobind), for the answers */
+		if (vc.sock >= 0 && bind(vc.sock, (struct sockaddr *)&a, sizeof(sa_family_t))) {
+			close(vc.sock);
+			vc.sock = -1;
+		}
+	}
+	if (!vc.poll)
+		vc.poll = lv_timer_create(vc_poll, 250, NULL);
+	fprintf(stderr, "n72-ui: video controls for %s (socket %d)\n", app_cmd, vc.sock);
+}
+
+static void vc_stop(void)
+{
+	if (vc.poll) {
+		lv_timer_delete(vc.poll);
+		vc.poll = NULL;
+	}
+	if (vc.hide) {
+		lv_timer_delete(vc.hide);
+		vc.hide = NULL;
+	}
+	if (vc.root && lv_obj_is_valid(vc.root))
+		lv_obj_delete(vc.root);
+	vc.root = vc.ui = NULL;
+	vc.up = vc.shown = false;
+	video_rot = -1;
 }

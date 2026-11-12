@@ -58,10 +58,13 @@
 
 #include "lvgl/lvgl.h"
 #include "lvgl/src/indev/lv_indev_private.h"
+#include "lvgl/src/display/lv_display_private.h"
 #include "mbx_gpu.h"
 
-#define W 320
-#define H 480
+/* the screen as the UI lays it out: 320 x 480, or 480 x 320 turned */
+static int32_t ui_w = 320, ui_h = 480;
+#define W ui_w
+#define H ui_h
 
 static char *self_argv[4];
 static lv_obj_t *home_scr;
@@ -616,9 +619,26 @@ static lv_point_t rt_map(int x, int y)
 		x = y;
 		y = t;
 	}
-	p.x = rt_scale(x, rt_cal.min_x, rt_cal.max_x, lv_display_get_horizontal_resolution(d) - 1);
-	p.y = rt_scale(y, rt_cal.min_y, rt_cal.max_y, lv_display_get_vertical_resolution(d) - 1);
+	/* the panel's pixels: LVGL turns them itself for a turned screen */
+	p.x = rt_scale(x, rt_cal.min_x, rt_cal.max_x, d->hor_res - 1);
+	p.y = rt_scale(y, rt_cal.min_y, rt_cal.max_y, d->ver_res - 1);
 	return p;
+}
+
+/* A panel point where LVGL sees it (its rotation, as lv_indev turns it). */
+static lv_point_t rt_logical(lv_point_t p)
+{
+	lv_display_t *d = lv_display_get_default();
+	lv_point_t l = p;
+
+	if (d->rotation == LV_DISPLAY_ROTATION_90) {
+		l.x = d->ver_res - 1 - p.y;
+		l.y = p.x;
+	} else if (d->rotation == LV_DISPLAY_ROTATION_270) {
+		l.x = p.y;
+		l.y = d->hor_res - 1 - p.x;
+	}
+	return l;
 }
 
 static void rt_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
@@ -631,11 +651,11 @@ static void rt_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 /* A frame is complete (SYN_REPORT): route it. True if LVGL has news. */
 static bool rt_frame_done(void)
 {
-	lv_point_t p = rt_map(rt_raw_x, rt_raw_y);
+	lv_point_t p = rt_map(rt_raw_x, rt_raw_y), l = rt_logical(p);
 	bool news = false;
 
 	if (rt_owner == RT_NONE && rt_down)
-		rt_owner = app_pid > 0 && !ui_wants_touch(p.x, p.y) ? RT_APP : RT_UI;
+		rt_owner = app_pid > 0 && !ui_wants_touch(l.x, l.y) ? RT_APP : RT_UI;
 	if (rt_owner == RT_APP) {
 		if (write(rt_uinput, rt_frame, rt_n * sizeof(rt_frame[0])) < 0)
 			;
@@ -643,7 +663,7 @@ static bool rt_frame_done(void)
 		if (rt_down || rt_ui_touch) {
 			int ph = !rt_down ? 2 : rt_ui_touch ? 1 : 0;
 
-			if (ui_drag(ph, p.x, p.y) && !rt_claim) {
+			if (ui_drag(ph, l.x, l.y) && !rt_claim) {
 				/* the launcher's drag now (ui_drag has ended LVGL's press) */
 				rt_claim = true;
 			}
@@ -1203,6 +1223,10 @@ static void idle_check(lv_timer_t *t)
 	last_plug = plug;
 	if (screen_off)
 		return;
+	if (video_playing()) {		/* a video is watched, not idle */
+		lv_display_trigger_activity(NULL);
+		return;
+	}
 	if (locked && inactive >= LOCK_IDLE_MS) {
 		screen_dark();
 		return;
@@ -1492,7 +1516,7 @@ static int bench(void)
 
 /* ----------------------------------------------------------------- main */
 
-/* SIGUSR1: write what is on screen to /tmp/n72-shot.raw (XRGB8888, 320x480). */
+/* SIGUSR1: write what is on screen to /tmp/n72-shot.raw (32-bit pixels B,G,R,A, upright W x H; the size in /tmp/n72-shot.size). */
 static volatile sig_atomic_t shot_wanted;
 
 static void on_usr1(int sig)
@@ -1523,7 +1547,7 @@ static void shot_poll(lv_timer_t *t)
 			snprintf(name, sizeof(name), "/tmp/n72-scan%d%s.raw", i, fr ? "-front" : "");
 			f = p ? fopen(name, "w") : NULL;
 			if (f) {
-				fwrite(p, 4 * W, H, f);
+				fwrite(p, 4 * 320, 480, f);
 				fclose(f);
 			}
 		}
@@ -1537,13 +1561,47 @@ static void shot_poll(lv_timer_t *t)
 	if (!shot_wanted)
 		return;
 	shot_wanted = 0;
-	p = mbx_gpu_front(&stride);
+	{
+		/*
+		 * What the UI shows, upright as it lays it out (W x H, also
+		 * written to n72-shot.size): over an application, LVGL's own
+		 * rendering of its screen (the layer holds only the launcher's
+		 * things, premultiplied: the application and video layers are
+		 * not in it); otherwise a GPU copy of the newest frame.
+		 */
+		bool over_app = app_pid > 0 && lv_screen_active() == app_scr;
+		lv_draw_buf_t *b = over_app ? lv_snapshot_take(app_scr, LV_COLOR_FORMAT_ARGB8888)
+					    : mbx_gpu_grab_screen();
+
+		if (b) {
+			f = fopen("/tmp/n72-shot.raw.tmp", "w");
+			if (f) {
+				for (y = 0; y < (int)b->header.h; y++)
+					fwrite(b->data + y * b->header.stride, 4, b->header.w, f);
+				fclose(f);
+				f = fopen("/tmp/n72-shot.size", "w");
+				if (f) {
+					fprintf(f, "%u %u\n", (unsigned)b->header.w, (unsigned)b->header.h);
+					fclose(f);
+				}
+				rename("/tmp/n72-shot.raw.tmp", "/tmp/n72-shot.raw");
+			}
+			lv_draw_buf_destroy(b);
+			return;
+		}
+	}
+	p = mbx_gpu_front(&stride);	/* (no GPU copy: the panel's pixels) */
 	f = p ? fopen("/tmp/n72-shot.raw.tmp", "w") : NULL;
 	if (!f)
 		return;
-	for (y = 0; y < H; y++)
-		fwrite(p + y * stride, 4, W, f);
+	for (y = 0; y < 480; y++)
+		fwrite(p + y * stride, 4, 320, f);
 	fclose(f);
+	f = fopen("/tmp/n72-shot.size", "w");
+	if (f) {
+		fprintf(f, "320 480\n");
+		fclose(f);
+	}
 	rename("/tmp/n72-shot.raw.tmp", "/tmp/n72-shot.raw");
 }
 
@@ -1592,6 +1650,15 @@ int main(int argc, char **argv)
 	if (!disp) {
 		disp = lv_linux_fbdev_create();
 		lv_linux_fbdev_set_file(disp, fb ? fb : "/dev/fb0");
+	}
+	{
+		/* (N72_ROT=90|270: start turned, for tests) */
+		const char *r = getenv("N72_ROT");
+
+		if (r && (atoi(r) == 90 || atoi(r) == 270) && mbx_gpu_set_rotation(atoi(r))) {
+			ui_w = lv_display_get_horizontal_resolution(disp);
+			ui_h = lv_display_get_vertical_resolution(disp);
+		}
 	}
 	lv_theme_default_init(disp, lv_palette_main(LV_PALETTE_BLUE),
 			      lv_palette_main(LV_PALETTE_PINK), true,
@@ -1646,6 +1713,7 @@ int main(int argc, char **argv)
 	lv_timer_create(playback_check, 2000, NULL);
 
 	build_home();
+	rot_init();
 	drags_init();
 	sound_ui_init();
 	ui_reopen();		/* a page asked for at start (after a theme change) */
