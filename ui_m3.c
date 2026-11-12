@@ -4634,11 +4634,18 @@ static void bt_dev_cb(lv_event_t *e)
 	struct bt_dev *d = lv_event_get_user_data(e);
 	char cmd[200];
 
+	/*
+	 * Pairing needs an agent: bluetoothctl's own, without input or output
+	 * (headphones and speakers pair "just works"; one asking for a PIN
+	 * fails here). Audio devices connect only when bluez-alsa (bluealsa)
+	 * runs: it is what offers BlueZ the A2DP profile.
+	 */
 	if (d->paired)
-		snprintf(cmd, sizeof(cmd), "bluetoothctl connect %s", d->mac);
+		snprintf(cmd, sizeof(cmd), "bluetoothctl --timeout 20 connect %s", d->mac);
 	else
-		snprintf(cmd, sizeof(cmd), "bluetoothctl pair %s && bluetoothctl trust %s && "
-			 "bluetoothctl connect %s", d->mac, d->mac, d->mac);
+		snprintf(cmd, sizeof(cmd), "bluetoothctl --agent NoInputNoOutput --timeout 25 pair %s && "
+			 "bluetoothctl trust %s && bluetoothctl --timeout 20 connect %s",
+			 d->mac, d->mac, d->mac);
 	if (bt_state_lbl)
 		lv_label_set_text_fmt(bt_state_lbl, "Connecting to %s...", d->name);
 	job_run(cmd, bt_page, bt_cmd_done, NULL);
