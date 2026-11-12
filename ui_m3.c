@@ -14,6 +14,7 @@
 
 #include <math.h>
 #include <spawn.h>
+#include <sys/stat.h>
 #include "lvgl/src/indev/lv_indev_private.h"	/* the throw velocity */
 #include "lvgl/src/core/lv_obj_scroll_private.h"	/* lv_obj_scroll_by_raw() */
 #include "lvgl/src/core/lv_obj_draw_private.h"	/* lv_obj_get_ext_draw_size() */
@@ -5102,8 +5103,93 @@ static lv_obj_t *vol_hud, *vol_hud_slider, *vol_hud_icon;
 static lv_timer_t *vol_hud_timer;
 static lv_obj_t *snd_page, *snd_slider, *snd_val, *snd_out_lbl, *set_snd_sub;
 
+/*
+ * Bluetooth audio: while a speaker or headphones are connected,
+ * n72-audio-route (n72-base) makes them ALSA's default output and writes
+ * /run/n72-audio (pcm=, addr=, name=). The volume then goes to bluez-alsa
+ * (bluealsa-cli, 0..127), and the outputs show the device's name.
+ */
+#define BT_AUDIO_STATE	"/run/n72-audio"
+
+static struct {
+	bool on;
+	time_t mtime;
+	char pcm[128], name[64];
+	bool busy;		/* a volume command is running */
+	int sent, want;		/* last sent, wanted (0..100) */
+} bta = { .sent = -1 };
+
+static void bta_volume_done(const char *out, void *ud);
+
+static void bta_volume_send(void)
+{
+	char cmd[200];
+	int v;
+
+	if (!bta.on || bta.busy || bta.want == bta.sent)
+		return;
+	v = (bta.want * 127 + 50) / 100;
+	snprintf(cmd, sizeof(cmd), "bluealsa-cli volume %s %d %d", bta.pcm, v, v);
+	bta.busy = true;
+	bta.sent = bta.want;
+	job_run(cmd, NULL, bta_volume_done, NULL);
+}
+
+static void bta_volume_done(const char *out, void *ud)
+{
+	LV_UNUSED(out);
+	LV_UNUSED(ud);
+	bta.busy = false;
+	bta_volume_send();	/* the slider moved on meanwhile */
+}
+
+static void bta_volume(int pct)
+{
+	bta.want = pct;
+	bta_volume_send();
+}
+
+static void snd_refresh_ui(void);
+
+/* true when Bluetooth audio came or went */
+static bool bta_check(void)
+{
+	struct stat st;
+	bool on = stat(BT_AUDIO_STATE, &st) == 0;
+	FILE *f;
+	char line[192];
+
+	if (on == bta.on && (!on || st.st_mtime == bta.mtime))
+		return false;
+	bta.on = on;
+	bta.sent = -1;
+	if (!on)
+		return true;
+	bta.mtime = st.st_mtime;
+	bta.pcm[0] = bta.name[0] = 0;
+	f = fopen(BT_AUDIO_STATE, "r");
+	if (f) {
+		while (fgets(line, sizeof(line), f)) {
+			line[strcspn(line, "\n")] = 0;
+			if (!strncmp(line, "pcm=", 4))
+				snprintf(bta.pcm, sizeof(bta.pcm), "%s", line + 4);
+			else if (!strncmp(line, "name=", 5))
+				snprintf(bta.name, sizeof(bta.name), "%s", line + 5);
+		}
+		fclose(f);
+	}
+	if (!bta.pcm[0]) {
+		bta.on = false;
+		return true;
+	}
+	bta_volume(conf.vol);	/* the volume goes with you */
+	return true;
+}
+
 static const char *snd_output_name(void)
 {
+	if (bta.on)
+		return bta.name[0] ? bta.name : "Bluetooth";
 	if (!snd_present)
 		return "No sound card";
 	if (jack_in)
@@ -5113,7 +5199,7 @@ static const char *snd_output_name(void)
 
 static void snd_summary(char *buf, size_t len)
 {
-	if (!snd_present)
+	if (!snd_present && !bta.on)
 		snprintf(buf, len, "No sound card");
 	else if (!conf.vol)
 		snprintf(buf, len, "Muted, %s", snd_output_name());
@@ -5245,7 +5331,10 @@ static void vol_hud_show(void)
 static void volume_set(int pct, bool hud)
 {
 	conf.vol = pct < 0 ? 0 : pct > 100 ? 100 : pct;
-	snd_apply_volume(conf.vol);
+	if (bta.on)
+		bta_volume(conf.vol);
+	else
+		snd_apply_volume(conf.vol);
 	conf_save();
 	if (hud)
 		vol_hud_show();
@@ -5258,7 +5347,7 @@ static void volume_step(int dir)
 {
 	int v = conf.vol;
 
-	if (!snd_present)
+	if (!snd_present && !bta.on)
 		return;
 	v += dir * ((dir > 0 ? v : v - 1) >= 30 ? 6 : 3);
 	volume_set(v, true);
@@ -5267,6 +5356,8 @@ static void volume_step(int dir)
 static void jack_check(lv_timer_t *t)
 {
 	LV_UNUSED(t);
+	if (bta_check())
+		snd_refresh_ui();
 	if (!jack_poll())
 		return;
 	snd_apply_output(conf.spk);
@@ -5289,7 +5380,12 @@ static void snd_spk_cb(lv_event_t *e)
 static void snd_test_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
-	if (have_tool("n72tone"))
+	if (!have_tool("n72tone"))
+		return;
+	if (bta.on)	/* through ALSA's default: the Bluetooth device */
+		job_run("/usr/bin/n72tone -w -f 660 -a -12 -t 0.6 -r 48000 | "
+			"aplay -q -D default -f S16_LE -c 2 -r 48000", NULL, NULL, NULL);
+	else
 		job_run("/usr/bin/n72tone -f 660 -a -12 -t 0.6", NULL, NULL, NULL);
 }
 
