@@ -4093,9 +4093,14 @@ static bool page_home_over_app(void)
 }
 
 /* Back to home (the application is gone, or going). */
+static void ui_rebuild(bool load);
+static bool layout_stale;
+
 static void app_home_ui(void)
 {
 	vc_stop();
+	if (layout_stale)
+		ui_rebuild(false);	/* (turned over a video: home and pages now) */
 	shade_set(false, false);
 	app_bar_set(false);
 	if (app_bar) {
@@ -6509,47 +6514,18 @@ static void turn_fade_start(lv_draw_buf_t *old, int from, int to)
 }
 
 /* Rebuild what is shown at the new size; false if it could not turn. */
-static bool ui_turn(int rot)
+/*
+ * Home and the pages were built for another turn (a turn over a video
+ * rebuilt only what shows over it): built again before they are shown.
+ */
+static bool layout_stale;
+
+/* What lies over an application: the shade, the bar, the volume pop-up,
+ * the video controls; rebuilt at the current size. */
+static void ui_rebuild_overlays_free(void)
 {
-	lv_draw_buf_t *old_pic = NULL;
-	int from = ui_rot;
-	struct nav_re re[NAV_MAX];
-	lv_obj_t *tmp = NULL, *active = lv_screen_active();
-	bool over_app = app_pid > 0 && active == app_scr;
-	int n = nav_n, from_idx = -2, i;
+	int i;
 
-	if (rot == ui_rot)
-		return true;
-	for (i = 0; i < n; i++) {
-		if (!nav_re[i].open && !nav_re[i].dir)
-			return false;		/* a page that cannot be reopened */
-		if (launch_from == nav[i])
-			from_idx = i;
-	}
-	if (launch_from == home_scr)
-		from_idx = -1;
-	/* the screen as it is, for the crossfade (not over an application:
-	 * the layer holds only the launcher's own things there) */
-	if (!over_app) {
-		lv_refr_now(NULL);
-		old_pic = mbx_gpu_grab_screen();
-	}
-	if (!mbx_gpu_set_rotation(rot)) {
-		if (old_pic)
-			lv_draw_buf_destroy(old_pic);
-		return false;
-	}
-	ui_rot = rot;
-	ui_w = lv_display_get_horizontal_resolution(NULL);
-	ui_h = lv_display_get_vertical_resolution(NULL);
-
-	/* everything goes: the pages, home (the shade with it), the bars */
-	memcpy(re, nav_re, sizeof(re));
-	memset(nav_re, 0, sizeof(nav_re));	/* (re owns the folders now) */
-	if (!over_app) {
-		tmp = lv_obj_create(NULL);
-		lv_screen_load(tmp);
-	}
 	if (shade && lv_obj_is_valid(shade))
 		lv_obj_delete(shade);
 	if (scrim && lv_obj_is_valid(scrim))
@@ -6582,6 +6558,60 @@ static bool ui_turn(int rot)
 		lv_obj_delete(lock_scr);
 		lock_scr = NULL;
 	}
+	{
+		lv_obj_t **gone[] = {
+			&app_bar_time, &app_bar_batt, &app_bar_wifi, &app_bar_bt,
+			&clock_lbl, &date_lbl,
+			&qs_wifi, &qs_bt, &qs_wifi_sub, &qs_bt_sub, &qs_rot, &qs_rot_sub,
+			&home_bright, &qs_settings_btn, &vol_hud_slider, &vol_hud_icon,
+		};
+
+		for (i = 0; i < (int)(sizeof(gone) / sizeof(gone[0])); i++)
+			*gone[i] = NULL;
+	}
+	/* the card's way back: home's picture and the tile are another turn's */
+	za.tile = NULL;
+	tr_free(&za.home);
+}
+
+static void ui_rebuild_overlays(void)
+{
+	ui_rebuild_overlays_free();
+	build_shade();
+	if (app_pid > 0) {
+		app_bar_build();
+		lv_obj_set_parent(scrim, lv_layer_top());
+		lv_obj_set_parent(shade, lv_layer_top());
+	}
+	lv_obj_invalidate(lv_layer_top());
+	net_ui_sync();
+	qs_rot_sync();
+	vc_turned();
+}
+
+/*
+ * Everything at the current size: the pages, home (the shade with it), the
+ * bars. @load: show the page or home afterwards (else the screen showing,
+ * an application's, stays).
+ */
+static void ui_rebuild(bool load)
+{
+	struct nav_re re[NAV_MAX];
+	lv_obj_t *tmp = NULL;
+	int n = nav_n, from_idx = -2, i;
+
+	for (i = 0; i < n; i++)
+		if (launch_from == nav[i])
+			from_idx = i;
+	if (launch_from == home_scr)
+		from_idx = -1;
+	memcpy(re, nav_re, sizeof(re));
+	memset(nav_re, 0, sizeof(nav_re));	/* (re owns the folders now) */
+	if (load) {
+		tmp = lv_obj_create(NULL);
+		lv_screen_load(tmp);
+	}
+	ui_rebuild_overlays_free();
 	for (i = n - 1; i >= 0; i--)
 		lv_obj_delete(nav[i]);
 	nav_n = 0;
@@ -6599,21 +6629,14 @@ static bool ui_turn(int rot)
 	 * while the new ones are built: they skip what is NULL) */
 	{
 		lv_obj_t **gone[] = {
-			&app_bar_time, &app_bar_batt, &app_bar_wifi, &app_bar_bt,
 			&status_time, &status_wifi, &status_bt, &batt_lbl,
-			&clock_lbl, &date_lbl, &home_clock, &home_date, &home_batt, &home_net,
-			&qs_wifi, &qs_bt, &qs_wifi_sub, &qs_bt_sub, &qs_rot, &qs_rot_sub,
-			&home_bright, &qs_settings_btn, &settings_tile, &home_apps,
-			&vol_hud_slider, &vol_hud_icon,
+			&home_clock, &home_date, &home_batt, &home_net,
+			&settings_tile, &home_apps,
 		};
 
 		for (i = 0; i < (int)(sizeof(gone) / sizeof(gone[0])); i++)
 			*gone[i] = NULL;
 	}
-	/* the picture of where an application was launched, and its tile */
-	za.tile = NULL;
-	tr_free(&za.home);
-
 	build_home();
 	if (app_pid > 0) {
 		app_bar_build();
@@ -6632,9 +6655,7 @@ static bool ui_turn(int rot)
 	push_quiet_scr = NULL;
 	launch_from = from_idx == -1 ? home_scr : from_idx >= 0 && from_idx < nav_n ?
 		      nav[from_idx] : NULL;
-	if (over_app) {
-		lv_obj_invalidate(app_scr);
-	} else {
+	if (load) {
 		lv_screen_load(nav_n ? nav[nav_n - 1] : home_scr);
 		lv_obj_delete(tmp);
 	}
@@ -6643,7 +6664,51 @@ static bool ui_turn(int rot)
 	status_refresh(true);
 	qs_rot_sync();
 	vc_turned();
+	layout_stale = false;
+}
+
+/* Rebuild what is shown at the new size; false if it could not turn. */
+static bool ui_turn(int rot)
+{
+	lv_draw_buf_t *old_pic = NULL;
+	int from = ui_rot, i;
+	uint32_t t0 = lv_tick_get();
+	bool over_app = app_pid > 0 && lv_screen_active() == app_scr;
+
+	if (rot == ui_rot)
+		return true;
+	for (i = 0; i < nav_n; i++)
+		if (!nav_re[i].open && !nav_re[i].dir)
+			return false;		/* a page that cannot be reopened */
+	/* the screen as it is, for the crossfade (not over an application:
+	 * the layer holds only the launcher's own things there) */
+	if (!over_app) {
+		lv_refr_now(NULL);
+		old_pic = mbx_gpu_grab_screen();
+	}
+	if (!mbx_gpu_set_rotation(rot)) {
+		if (old_pic)
+			lv_draw_buf_destroy(old_pic);
+		return false;
+	}
+	ui_rot = rot;
+	ui_w = lv_display_get_horizontal_resolution(NULL);
+	ui_h = lv_display_get_vertical_resolution(NULL);
+	if (over_app) {
+		/*
+		 * Over a video only what shows: rebuilding home and the pages
+		 * too held the main thread 320-450 ms, and the player (below
+		 * the launcher) stalled: its sound ran dry. They follow when
+		 * the video ends (app_home_ui).
+		 */
+		ui_rebuild_overlays();
+		layout_stale = true;
+	} else {
+		ui_rebuild(true);
+	}
 	turn_fade_start(old_pic, from, rot);
+	fprintf(stderr, "n72-ui: turned %d -> %d in %u ms (%d pages%s)\n", from, rot,
+		(unsigned)lv_tick_elaps(t0), nav_n, over_app ? ", over an application" : "");
 	return true;
 }
 

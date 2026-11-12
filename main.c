@@ -1613,6 +1613,10 @@ static void restore_tty(void)
 
 static void on_signal(int sig)
 {
+	/* the application started goes with the launcher (else a video kept
+	 * playing, with nothing to stop it, after a restart) */
+	if (app_pid > 0)
+		kill(-app_pid, SIGTERM);
 	restore_tty();
 	signal(sig, SIG_DFL);
 	raise(sig);
