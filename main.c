@@ -786,33 +786,31 @@ static bool write_sleep_state(const char *state)
 }
 
 /*
- * Sleep until Power or Home wakes the system. On battery, suspend to RAM
- * when the kernel offers it (the SoC powers off); on USB power suspend to
- * idle, since the charger's events wake the PMU straight out of
- * hibernate (and plugging in should wake us anyway). N72_SLEEP=0 turns
- * sleep off, N72_SLEEP=freeze always uses suspend to idle. Returns false
- * when sleep is unavailable or refused, so the caller can fall back to
- * blanking the screen.
- */
-/*
- * What can tell a wake by the network from one by a person: how often the
- * Wi-Fi chip's wake line and the two buttons have interrupted, and whether
- * the cable is in.
+ * What tells a wake that wants the screen from any other: how often the
+ * two buttons have interrupted, the cable, and the alarm that was set.
  */
 struct wake_marks {
 	long wlan, home, power;
 	int wlan_irq, home_irq, power_irq;
-	bool usb;
+	bool usb;		/* the cable is in */
+	long alarm;		/* the RTC's wake alarm, seconds since 1970, or 0 */
 };
 
 static void wake_marks(struct wake_marks *m)
 {
 	char line[256];
-	FILE *f = fopen("/proc/interrupts", "r");
+	FILE *f;
 
 	memset(m, 0, sizeof(*m));
 	m->wlan_irq = m->home_irq = m->power_irq = -1;
 	m->usb = usb_powered();
+	f = fopen("/sys/class/rtc/rtc0/wakealarm", "r");
+	if (f) {
+		if (fscanf(f, "%ld", &m->alarm) != 1)
+			m->alarm = 0;
+		fclose(f);
+	}
+	f = fopen("/proc/interrupts", "r");
 	if (!f)
 		return;
 	while (fgets(line, sizeof(line), f)) {
@@ -857,51 +855,83 @@ static int wake_irq(void)
 }
 
 /*
- * Was it only the network? Wi-Fi stays associated in suspend to idle, and
- * a frame for this station wakes the system (so that it answers, and an
- * SSH login gets in). That is no reason to light the screen. Anything not
- * clearly the network counts as a person: a button's interrupt, the cable,
- * a wake the kernel cannot name.
+ * Is the screen wanted after this wake? For Power and Home, for the cable
+ * going in or out, and for an alarm somebody set (the RTC's wakealarm).
+ * Anything else that wakes the system (a frame for this station over
+ * Wi-Fi, which stays associated in suspend to idle so that an SSH login
+ * gets in; a firmware event) is served in the dark, and the system sleeps
+ * on. The signs of a button: the kernel names its interrupt as the one
+ * that woke it (suspend to idle), or its interrupt has counted up. A press
+ * seen a moment later lights the screen as well (dark_linger): after the
+ * deep sleep, where the wake comes through the boot loader, that is the
+ * only sign of a button there is.
  */
-static bool woke_for_network(const struct wake_marks *before)
+static bool woke_for_screen(const struct wake_marks *before)
 {
 	struct wake_marks now;
 	int irq = wake_irq();
 
 	wake_marks(&now);
-	if (now.home != before->home || now.power != before->power || now.usb != before->usb)
-		return false;
-	if (irq < 0 || irq == now.home_irq || irq == now.power_irq)
-		return false;
-	return now.wlan > before->wlan;
+	if (now.home != before->home || now.power != before->power)
+		return true;
+	if (irq >= 0 && (irq == now.home_irq || irq == now.power_irq))
+		return true;
+	if (now.usb != before->usb)
+		return true;
+	return before->alarm && time(NULL) >= before->alarm;
 }
 
-/* Is somebody logged in over SSH? (dropbear: the listener plus one per session) */
+/*
+ * Is somebody logged in over SSH, running something? dropbear forks one
+ * process per connection; a connection counts while that process has a
+ * child (the shell or the command). One left behind with nothing under it
+ * does not keep the system awake.
+ */
 static bool ssh_sessions(void)
 {
-	glob_t g;
+	struct { int pid, ppid; bool dropbear; } pr[256];
 	int n = 0;
+	glob_t g;
+	bool found = false;
 
-	if (glob("/proc/[0-9]*/comm", 0, NULL, &g))
+	if (glob("/proc/[0-9]*/stat", 0, NULL, &g))
 		return false;
-	for (size_t i = 0; i < g.gl_pathc && n < 2; i++) {
-		char buf[32] = "";
+	for (size_t i = 0; i < g.gl_pathc && n < 256; i++) {
+		char buf[256] = "", *comm, *end;
 		FILE *f = fopen(g.gl_pathv[i], "r");
 
 		if (!f)
 			continue;
-		if (fgets(buf, sizeof(buf), f) && !strncmp(buf, "dropbear", 8))
+		if (fgets(buf, sizeof(buf), f) && (comm = strchr(buf, '(')) &&
+		    (end = strrchr(buf, ')'))) {
+			pr[n].pid = atoi(buf);
+			pr[n].dropbear = end - comm == 9 && !strncmp(comm + 1, "dropbear", 8);
+			pr[n].ppid = 0;
+			sscanf(end + 1, " %*c %d", &pr[n].ppid);
 			n++;
+		}
 		fclose(f);
 	}
 	globfree(&g);
-	return n >= 2;
+	for (int i = 0; i < n && !found; i++) {
+		bool session = false;
+
+		if (!pr[i].dropbear)
+			continue;
+		for (int k = 0; k < n; k++)	/* its parent is the listener */
+			if (pr[k].pid == pr[i].ppid && pr[k].dropbear)
+				session = true;
+		for (int k = 0; k < n && session && !found; k++)
+			found = pr[k].ppid == pr[i].pid;
+	}
+	return found;
 }
 
 /*
- * Awake for the network, screen dark: stay up for a few seconds, and for
- * as long as an SSH session lasts, then sleep on. True: Power or Home was
- * pressed meanwhile, the screen is wanted.
+ * Awake but not for a person, screen dark: stay up for a few seconds, and
+ * for as long as an SSH session lasts, then sleep on. True: Power or Home
+ * was pressed (or is reported now, as the press that woke us): the screen
+ * is wanted.
  */
 static bool dark_linger(void)
 {
@@ -926,6 +956,17 @@ static bool dark_linger(void)
 	}
 }
 
+/*
+ * Sleep until Power or Home is pressed, the cable goes in or out, or a set
+ * alarm rings. On battery, suspend to RAM when the kernel offers it (the
+ * SoC powers off); on USB power suspend to idle, since the charger's
+ * events wake the PMU straight out of hibernate. Whatever else wakes the
+ * system is served with the screen dark, and the sleep goes on
+ * (woke_for_screen, dark_linger). N72_SLEEP=0 turns sleep
+ * off, N72_SLEEP=freeze always uses suspend to idle. Returns false when
+ * sleep is unavailable or refused, so the caller can fall back to
+ * blanking the screen.
+ */
 static bool system_sleep(void)
 {
 	const char *e = getenv("N72_SLEEP");
@@ -947,10 +988,7 @@ static bool system_sleep(void)
 			ok = write_sleep_state("freeze");
 		}
 		woke_us = mono_us();
-		/* out of the deep sleep nothing says what woke us: the screen */
-		if (!ok || deep || !woke_for_network(&before))
-			break;
-		if (dark_linger())
+		if (!ok || woke_for_screen(&before) || dark_linger())
 			break;
 	}
 
