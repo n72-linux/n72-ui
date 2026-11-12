@@ -1278,6 +1278,30 @@ static bool flipping;
 static int rot_deg;
 static uint8_t *lbuf;
 static uint32_t lstride;
+/*
+ * The display turns the layer itself (kms_can_turn): the scan-out buffers
+ * hold the upright picture (lw x lh, stride lstride) and LVGL draws
+ * straight into them, as when not turned; else (N72_GPUTURN=1, or a
+ * kernel without the plane's rotation) the GPU's turned copy from lbuf.
+ */
+static bool hw_turn;
+static int buf_rot[NSCAN];		/* the turn each buffer's frame was drawn for */
+static bool kms_can_turn;
+
+static uint32_t scan_stride(void)
+{
+	return rot_deg && hw_turn ? lstride : fb.stride;
+}
+
+static int32_t scan_w(void)
+{
+	return rot_deg && hw_turn ? (int32_t)fb.height : (int32_t)fb.width;
+}
+
+static int32_t scan_h(void)
+{
+	return rot_deg && hw_turn ? (int32_t)fb.width : (int32_t)fb.height;
+}
 
 static uint32_t draw_stride(void)
 {
@@ -1289,7 +1313,9 @@ static void to_panel(const lv_area_t *a, lv_area_t *o)
 {
 	int32_t lw = fb.height, lh = fb.width;	/* turned: the upright picture's size */
 
-	if (rot_deg == 90) {
+	if (hw_turn) {
+		*o = *a;
+	} else if (rot_deg == 90) {
 		o->x1 = a->y1; o->x2 = a->y2;
 		o->y1 = lw - 1 - a->x2; o->y2 = lw - 1 - a->x1;
 	} else if (rot_deg == 270) {
@@ -1442,27 +1468,27 @@ static bool covered(const lv_area_t *a, lv_display_t *d)
 static void sync_rect(int dst, int src, const lv_area_t *a)
 {
 	lv_area_t c;
-	lv_area_t all = { 0, 0, fb.width - 1, fb.height - 1 };
+	lv_area_t all = { 0, 0, scan_w() - 1, scan_h() - 1 };
+	uint32_t ss = scan_stride();
 
 	if (!lv_area_intersect(&c, a, &all))
 		return;
-	sync_range(scan[dst] + c.y1 * fb.stride, lv_area_get_height(&c) * fb.stride,
-		   MBX_SYNC_FLUSH);
+	sync_range(scan[dst] + c.y1 * ss, lv_area_get_height(&c) * ss, MBX_SYNC_FLUSH);
 	if (flush_n > (int)(sizeof(flush_words) / 4) - 16) {
 		submit(flush_words, flush_n);
 		gpu_wait(last_seq);
 		last_seq = 0;
 		flush_n = 0;
 	}
-	flush_n += put_copy(flush_words + flush_n, gpu_addr(scan[dst]), fb.stride,
-			    gpu_addr(scan[src]), fb.stride, c.x1, c.y1, c.x1, c.y1,
+	flush_n += put_copy(flush_words + flush_n, gpu_addr(scan[dst]), ss,
+			    gpu_addr(scan[src]), ss, c.x1, c.y1, c.x1, c.y1,
 			    lv_area_get_width(&c), lv_area_get_height(&c));
 }
 
 static void render_start_cb(lv_event_t *e)
 {
 	lv_display_t *d = lv_event_get_target(e);
-	lv_area_t all = { 0, 0, fb.width - 1, fb.height - 1 };
+	lv_area_t all = { 0, 0, scan_w() - 1, scan_h() - 1 };
 	int i, k, dr = -1, src;
 	long have, f;
 
@@ -1512,7 +1538,7 @@ static void render_start_cb(lv_event_t *e)
 			flush_n = 0;
 		}
 	}
-	d->buf_1->data = rot_deg ? lbuf : scan[dr];
+	d->buf_1->data = rot_deg && !hw_turn ? lbuf : scan[dr];
 	cur_n = 0;
 	cur_all = false;
 	pm_skip_n = 0;
@@ -1536,7 +1562,7 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 		fprintf(stderr, "flush: premultiply %.1f ms, clean %.1f ms (%d rows)\n",
 			(dbg_t1 - dbg_t0) / 1000.0, (gpu_now_us() - dbg_t1) / 1000.0,
 			(int)lv_area_get_height(area));
-	if (rot_deg) {
+	if (rot_deg && !hw_turn) {
 		uint32_t cw[48];
 		lv_area_t pa;
 		int n = mbx_cmd_copy_turn(cw, fb.stride, lstride, area->x1, area->y1,
@@ -1582,6 +1608,7 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 		pthread_mutex_lock(&flip_mx);
 		frame_no = n;
 		buf_frame[st_drawing] = n;
+		buf_rot[st_drawing] = hw_turn ? rot_deg : 0;
 		st_latest = st_drawing;
 		st_ready = st_drawing;		/* (replaces an older ready frame) */
 		st_drawing = -1;
@@ -1684,6 +1711,95 @@ static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
 static uint32_t kms_fb[NSCAN], kms_crtc;
 static uint32_t kms_handle[NSCAN];	/* the scan buffers' GEM handles on kms_fd */
 static bool kms_shell;
+
+/*
+ * A turned screen by the display (kernel n72-clcd: the plane's "rotation"):
+ * the scan-out buffers hold the upright picture, landscape, as frame
+ * buffers of their own (kms_fb_l), and a flip that changes the turn is an
+ * atomic commit of the buffer and the rotation together.
+ */
+static uint32_t kms_fb_l[NSCAN];
+static uint32_t kms_plane, kms_prop_rot, kms_prop_fb, kms_prop_sw, kms_prop_sh;
+static uint64_t kms_rot_cur;		/* the plane's rotation (DRM_MODE_ROTATE_*) */
+
+#define ROT_BITS(deg) ((deg) == 90 ? 2u : (deg) == 270 ? 8u : 1u)	/* DRM_MODE_ROTATE_* */
+
+/* The layer's plane and its properties; false if it cannot turn. */
+static bool kms_find_plane(int fd)
+{
+	struct drm_set_client_cap cap = { DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1 };
+	struct drm_set_client_cap acap = { DRM_CLIENT_CAP_ATOMIC, 1 };
+	struct drm_mode_get_plane_res pr = { 0 };
+	uint32_t planes[4];
+	unsigned int i, k;
+
+	if (ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap) || ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &acap))
+		return false;
+	pr.plane_id_ptr = (uintptr_t)planes;
+	pr.count_planes = 4;
+	if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &pr))
+		return false;
+	for (i = 0; i < pr.count_planes && i < 4; i++) {
+		struct drm_mode_obj_get_properties op = {
+			.obj_id = planes[i], .obj_type = DRM_MODE_OBJECT_PLANE,
+		};
+		uint32_t ids[24];
+		uint64_t vals[24];
+		uint32_t rot = 0, fbp = 0, sw = 0, sh = 0;
+		uint64_t rotv = 1, type = 0;
+
+		if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &op))
+			continue;
+		op.props_ptr = (uintptr_t)ids;
+		op.prop_values_ptr = (uintptr_t)vals;
+		if (op.count_props > 24)
+			op.count_props = 24;
+		if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &op))
+			continue;
+		for (k = 0; k < op.count_props; k++) {
+			struct drm_mode_get_property gp = { .prop_id = ids[k] };
+
+			if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &gp))
+				continue;
+			if (!strcmp(gp.name, "rotation")) {
+				rot = ids[k];
+				rotv = vals[k];
+			} else if (!strcmp(gp.name, "FB_ID")) {
+				fbp = ids[k];
+			} else if (!strcmp(gp.name, "SRC_W")) {
+				sw = ids[k];
+			} else if (!strcmp(gp.name, "SRC_H")) {
+				sh = ids[k];
+			} else if (!strcmp(gp.name, "type")) {
+				type = vals[k];
+			}
+		}
+		if (type != 1 /* primary */ || !rot || !fbp || !sw || !sh)
+			continue;
+		kms_prop_sw = sw;
+		kms_prop_sh = sh;
+		kms_plane = planes[i];
+		kms_prop_rot = rot;
+		kms_prop_fb = fbp;
+		kms_rot_cur = rotv;
+		return true;
+	}
+	return false;
+}
+
+/* Set the plane's rotation alone (the layer off, or the same size). */
+static bool kms_set_rot(int fd, uint64_t v)
+{
+	struct drm_mode_obj_set_property sp = {
+		.value = v, .prop_id = kms_prop_rot, .obj_id = kms_plane,
+		.obj_type = DRM_MODE_OBJECT_PLANE,
+	};
+
+	if (ioctl(fd, DRM_IOCTL_MODE_OBJ_SETPROPERTY, &sp))
+		return false;
+	kms_rot_cur = v;
+	return true;
+}
 
 /*
  * A restart (a theme change execs n72-ui again) hands the KMS file over:
@@ -1789,13 +1905,38 @@ static int kms_open(void)
 
 static void kms_flip(int r)
 {
+	uint64_t want = ROT_BITS(buf_rot[r]);
 	struct drm_mode_crtc_page_flip pf = {
-		.crtc_id = kms_crtc, .fb_id = kms_fb[r], .flags = DRM_MODE_PAGE_FLIP_EVENT,
+		.crtc_id = kms_crtc, .fb_id = buf_rot[r] ? kms_fb_l[r] : kms_fb[r],
+		.flags = DRM_MODE_PAGE_FLIP_EVENT,
 	};
 	struct pollfd p = { .fd = kms_fd, .events = POLLIN };
 	char buf[256];
 	int tries;
 
+	if (kms_can_turn && want != kms_rot_cur) {
+		/* the turn changes: the buffer, its size and the rotation in one
+		 * commit (the source rectangle must fit the new buffer) */
+		uint32_t objs[1] = { kms_plane }, counts[1] = { 4 };
+		uint32_t props[4] = { kms_prop_fb, kms_prop_rot, kms_prop_sw, kms_prop_sh };
+		uint64_t vals[4] = {
+			pf.fb_id, want,
+			(uint64_t)(buf_rot[r] ? fb.height : fb.width) << 16,
+			(uint64_t)(buf_rot[r] ? fb.width : fb.height) << 16,
+		};
+		struct drm_mode_atomic a = {
+			.flags = DRM_MODE_PAGE_FLIP_EVENT, .count_objs = 1,
+			.objs_ptr = (uintptr_t)objs, .count_props_ptr = (uintptr_t)counts,
+			.props_ptr = (uintptr_t)props, .prop_values_ptr = (uintptr_t)vals,
+		};
+
+		if (ioctl(kms_fd, DRM_IOCTL_MODE_ATOMIC, &a)) {
+			fprintf(stderr, "n72-ui: turning the layer: %s\n", strerror(errno));
+			return;
+		}
+		kms_rot_cur = want;
+		goto wait;
+	}
 	for (tries = 0; tries < 50; tries++) {
 		if (!ioctl(kms_fd, DRM_IOCTL_MODE_PAGE_FLIP, &pf))
 			break;
@@ -1803,6 +1944,7 @@ static void kms_flip(int r)
 			return;
 		usleep(2000);		/* a flip still pending (not expected) */
 	}
+wait:
 	if (poll(&p, 1, 200) > 0 && read(kms_fd, buf, sizeof(buf)) < 0)
 		;
 	if (handoff_n)
@@ -1866,6 +2008,27 @@ static bool kms_setup(void)
 		kms_handle[i] = ph.handle;
 	}
 	kms_crtc = crtcs[0];
+	/* the same buffers as landscape pictures, for the display to turn */
+	if (!getenv("N72_GPUTURN") && kms_find_plane(fd)) {
+		uint32_t ls = buf_width_to_stride(fb.height, LV_COLOR_FORMAT_XRGB8888);
+
+		kms_can_turn = ls * fb.width <= fb.stride * fb.height;
+		for (i = 0; i < NSCAN && kms_can_turn; i++) {
+			struct drm_mode_fb_cmd2 f = { 0 };
+
+			f.width = fb.height;
+			f.height = fb.width;
+			f.pixel_format = kms_shell ? 0x34325241 : 0x34325258;
+			f.handles[0] = kms_handle[i];
+			f.pitches[0] = ls;
+			if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &f))
+				kms_can_turn = false;
+			kms_fb_l[i] = f.fb_id;
+		}
+		/* a start after a turned run: upright first (the layer is off) */
+		if (kms_can_turn && !handed && kms_rot_cur != ROT_BITS(0))
+			kms_set_rot(fd, ROT_BITS(0));
+	}
 	if (handed) {
 		/* the layer stays on the old picture until the first flip */
 		kms_fd = fd;
@@ -2057,7 +2220,7 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void)
 		/* the 3D copy: ~3 ms a screen against the 2D engine's ~8 */
 		uint32_t w3[48];
 		/* turned: lbuf has the newest frame, upright */
-		uint32_t src = gpu_addr(rot_deg ? lbuf : flipping ? scan[st_latest] : disp_buf);
+		uint32_t src = gpu_addr(rot_deg && !hw_turn ? lbuf : flipping ? scan[st_latest] : disp_buf);
 		uint32_t ss = draw_stride();
 		int n = mbx_cmd_copy(w3, 0, b->header.stride, ss, 0, 0, 0, 0,
 				     b->header.w, b->header.h, LV_OPA_COVER);
@@ -2250,10 +2413,11 @@ bool mbx_gpu_set_rotation(int deg)
 		sync_range(scan[i], size, MBX_SYNC_FLUSH);
 	if (lbuf)
 		sync_range(lbuf, lstride * fb.width, MBX_SYNC_FLUSH);
+	hw_turn = kms_can_turn;		/* the display turns it, else the GPU */
 	rot_deg = deg;
 	lv_display_set_rotation(d, deg == 90 ? LV_DISPLAY_ROTATION_90 :
 			        deg == 270 ? LV_DISPLAY_ROTATION_270 : LV_DISPLAY_ROTATION_0);
-	lv_display_set_buffers(d, deg ? lbuf : scan[st_latest >= 0 ? st_latest : 0], NULL,
+	lv_display_set_buffers(d, deg && !hw_turn ? lbuf : scan[st_latest >= 0 ? st_latest : 0], NULL,
 			       deg ? lstride * fb.width : size, LV_DISPLAY_RENDER_MODE_DIRECT);
 	pthread_mutex_lock(&flip_mx);
 	for (i = 0; i < NSCAN; i++)
