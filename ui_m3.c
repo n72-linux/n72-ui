@@ -6685,8 +6685,10 @@ static void volume_step(int dir)
 static void jack_check(lv_timer_t *t)
 {
 	LV_UNUSED(t);
-	if (bta_check())
+	if (bta_check()) {
 		snd_refresh_ui();
+		net_ui_sync();	/* the Bluetooth tile and row: the device's name or "On" */
+	}
 	if (!jack_poll())
 		return;
 	snd_apply_output(conf.spk);
