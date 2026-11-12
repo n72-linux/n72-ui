@@ -716,16 +716,23 @@ static void on_crash(int sig, siginfo_t *si, void *ctx)
 	const ucontext_t *uc = ctx;
 	const struct sigcontext *mc = &uc->uc_mcontext;
 	const unsigned long *sp = (const unsigned long *)mc->arm_sp;
-	char buf[512];
-	int n, i;
+	char buf[1024];
+	int n, i, fd;
 
-	n = snprintf(buf, sizeof(buf), "n72-ui: signal %d at %p: pc %08lx lr %08lx sp %08lx\n  stack:",
-		     sig, si->si_addr, mc->arm_pc, mc->arm_lr, mc->arm_sp);
-	for (i = 0; i < 24 && n < (int)sizeof(buf) - 12; i++)
-		n += snprintf(buf + n, sizeof(buf) - n, " %08lx", sp[i]);
+	n = snprintf(buf, sizeof(buf), "n72-ui: signal %d at %p: pc %08lx lr %08lx sp %08lx r0 %08lx\n  stack:",
+		     sig, si->si_addr, mc->arm_pc, mc->arm_lr, mc->arm_sp, mc->arm_r0);
+	for (i = 0; i < 80 && n < (int)sizeof(buf) - 12; i++)
+		n += snprintf(buf + n, sizeof(buf) - n, "%s%08lx", i % 8 ? " " : "\n   ", sp[i]);
 	if (n < (int)sizeof(buf) - 1)
 		buf[n++] = '\n';
 	write(2, buf, n);
+	/* kept on the flash too: /tmp (the log) is gone after a reboot */
+	fd = open("/var/log/n72-ui-crash.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+	if (fd >= 0) {
+		write(fd, buf, n);
+		fsync(fd);
+		close(fd);
+	}
 	signal(sig, SIG_DFL);
 	raise(sig);
 }
