@@ -21,6 +21,7 @@
 #include <ctype.h>
 
 #define YT_DIR		"/root/.config/n72-yt"
+#define YT_SEP		" \xE2\x80\xA2 "		/* " • " */
 #define YT_CACHE	"/tmp/n72-yt"		/* n72-yt's default */
 #define YT_TW		112			/* list thumbnails, 16:9 */
 #define YT_TH		63
@@ -139,7 +140,7 @@ static void yt_vid_from(struct yt_vid *v, char **f, int n)
 	snprintf(v->chan, sizeof(v->chan), "%s", n > 2 ? f[2] : "");
 	snprintf(v->len, sizeof(v->len), "%s", n > 3 ? f[3] : "");
 	if (n > 5 && f[4][0] && f[5][0])
-		snprintf(v->meta, sizeof(v->meta), "%s * %s", f[4], f[5]);
+		snprintf(v->meta, sizeof(v->meta), "%s" YT_SEP "%s", f[4], f[5]);
 	else if (n > 4)
 		snprintf(v->meta, sizeof(v->meta), "%s", f[4][0] ? f[4] : n > 5 ? f[5] : "");
 }
@@ -355,6 +356,14 @@ static lv_obj_t *yt_state(lv_obj_t *parent, const char *icon, const char *head,
 
 static void yt_open_video(const struct yt_vid *v);
 
+/*
+ * What the search and video pages showed, kept past the pages themselves:
+ * a turn of the screen deletes every page and opens them again (ui_turn),
+ * through openers that take no arguments.
+ */
+static char yt_re_query[128];
+static struct yt_vid yt_re_vid;
+
 static void yt_row_cb(lv_event_t *e)
 {
 	yt_open_video(lv_event_get_user_data(e));
@@ -377,7 +386,7 @@ static lv_obj_t *yt_row(lv_obj_t *parent, const struct yt_vid *v, lv_obj_t **img
 	int lh = lv_font_get_line_height(&lv_font_montserrat_14);
 
 	plain(r);
-	lv_obj_set_size(r, lv_pct(100), YT_TH + 12);
+	lv_obj_set_size(r, lv_pct(100), YT_TH + 14);
 	lv_obj_set_style_bg_opa(r, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_bg_color(r, M.on_surface, LV_STATE_PRESSED);
 	lv_obj_set_style_bg_opa(r, LV_OPA_10, LV_STATE_PRESSED);
@@ -392,7 +401,8 @@ static lv_obj_t *yt_row(lv_obj_t *parent, const struct yt_vid *v, lv_obj_t **img
 	plain(col);
 	lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_pad_all(col, 0, 0);
-	lv_obj_set_height(col, YT_TH);
+	lv_obj_set_style_pad_row(col, 0, 0);
+	lv_obj_set_height(col, YT_TH + 4);
 	lv_obj_set_flex_grow(col, 1);
 	lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
 	lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
@@ -428,6 +438,8 @@ static lv_obj_t *yt_row(lv_obj_t *parent, const struct yt_vid *v, lv_obj_t **img
 static struct {
 	lv_obj_t *row[YT_PEND_MAX], *img[YT_PEND_MAX];
 	char id[YT_PEND_MAX][16];
+	bool asked[YT_PEND_MAX];	/* in a fetch that has ended */
+	bool in_job[YT_PEND_MAX];	/* in the fetch running now */
 	int n;
 	lv_obj_t *owner;	/* the body they are on */
 	lv_timer_t *retry;
@@ -442,36 +454,42 @@ static void yt_thumbs_retry(lv_timer_t *t)
 	yt_thumbs_apply();
 }
 
+/*
+ * Thumbnails that are in the cache go on their rows. A row drawn from a
+ * scroll picture just now waits (a timer looks again); one that a finished
+ * fetch did not bring (no thumbnail on YouTube's side) keeps its tint.
+ */
 static void yt_thumbs_apply(void)
 {
+	bool waiting = false;
 	int i, k = 0;
 
 	for (i = 0; i < yth.n; i++) {
-		if (!lv_obj_is_valid(yth.img[i]))
+		bool cached;
+
+		if (!lv_obj_is_valid(yth.img[i]) || lv_obj_get_user_data(yth.img[i]))
 			continue;
-		if (yt_row_cached(yth.row[i]) || !yt_thumb_load(yth.img[i], yth.id[i], YT_TW, YT_TH)) {
-			/* later (on a picture now), or not fetched yet */
+		cached = yt_row_cached(yth.row[i]);
+		if (!cached && yt_thumb_load(yth.img[i], yth.id[i], YT_TW, YT_TH))
+			continue;
+		if (!cached && yth.asked[i])
+			continue;	/* fetched and not there: give up on it */
+		waiting |= cached;
+		if (k != i) {
 			yth.row[k] = yth.row[i];
 			yth.img[k] = yth.img[i];
+			yth.asked[k] = yth.asked[i];
+			yth.in_job[k] = yth.in_job[i];
 			memcpy(yth.id[k], yth.id[i], sizeof(yth.id[k]));
-			k++;
 		}
+		k++;
 	}
 	yth.n = k;
-	if (yth.retry && (!k || yth.running)) {
+	if (waiting && !yth.retry) {
+		yth.retry = lv_timer_create(yt_thumbs_retry, 300, NULL);
+	} else if (!waiting && yth.retry) {
 		lv_timer_delete(yth.retry);
 		yth.retry = NULL;
-	}
-	/* some waited for a scroll to end: look again soon */
-	if (k && !yth.running && !yth.retry) {
-		bool waiting = false;
-
-		for (i = 0; i < k; i++)
-			waiting |= yt_row_cached(yth.row[i]);
-		if (waiting)
-			yth.retry = lv_timer_create(yt_thumbs_retry, 300, NULL);
-		else
-			yth.n = 0;	/* not on YouTube's servers: placeholders stay */
 	}
 }
 
@@ -482,6 +500,11 @@ static void yt_thumbs_done(const char *out, void *ud)
 	LV_UNUSED(out);
 	LV_UNUSED(ud);
 	yth.running = false;
+	for (int i = 0; i < yth.n; i++)
+		if (yth.in_job[i]) {
+			yth.in_job[i] = false;
+			yth.asked[i] = true;
+		}
 	yt_thumbs_apply();
 	yt_thumbs_fetch();	/* rows added meanwhile */
 }
@@ -495,11 +518,13 @@ static void yt_thumbs_fetch(void)
 
 	if (yth.running || !yth.n || !lv_obj_is_valid(yth.owner))
 		return;
-	yt_thumbs_apply();		/* (cached already: no download) */
+	yt_thumbs_apply();		/* (in the cache already: no download) */
 	o = snprintf(cmd, sizeof(cmd), "n72-yt thumbs %d %d", YT_TW, YT_TH);
 	for (i = 0; i < yth.n && o + 18 < sizeof(cmd); i++)
-		if (lv_obj_is_valid(yth.img[i]) && !lv_obj_get_user_data(yth.img[i])) {
+		if (!yth.asked[i] && lv_obj_is_valid(yth.img[i]) &&
+		    !lv_obj_get_user_data(yth.img[i])) {
 			o += snprintf(cmd + o, sizeof(cmd) - o, " %s", yth.id[i]);
+			yth.in_job[i] = true;
 			n++;
 		}
 	if (!n)
@@ -534,6 +559,8 @@ static void yt_thumbs_want(lv_obj_t *body, lv_obj_t *row, lv_obj_t *img, const c
 		return;
 	yth.row[yth.n] = row;
 	yth.img[yth.n] = img;
+	yth.asked[yth.n] = false;
+	yth.in_job[yth.n] = false;
 	snprintf(yth.id[yth.n], sizeof(yth.id[0]), "%s", id);
 	yth.n++;
 }
@@ -761,6 +788,7 @@ static void yt_search_run(const char *qtext)
 	char cmd[400], q[300];
 
 	snprintf(ys.query, sizeof(ys.query), "%s", qtext);
+	snprintf(yt_re_query, sizeof(yt_re_query), "%s", qtext);
 	yt_list_add(YT_DIR "/searches", ys.query, YT_RECENT_MAX);
 	ys.gen++;
 	ys.rows = 0;
@@ -788,12 +816,17 @@ static void yt_search_deleted(lv_event_t *e)
 }
 
 /* The search page: the field in the top bar, the keyboard, then results. */
+static void yt_reopen_search(lv_event_t *e);
+
 static void yt_open_search(const char *query)
 {
 	lv_obj_t *bar;
 
 	if (ys.scr)
 		return;			/* (one at a time) */
+	nav_mark(yt_reopen_search, NULL);	/* opened again when the screen turns */
+	if (query != yt_re_query)
+		snprintf(yt_re_query, sizeof(yt_re_query), "%s", query ? query : "");
 	ys.body = m3_page("", &ys.scr);
 	lv_obj_add_event_cb(ys.scr, yt_search_deleted, LV_EVENT_DELETE, NULL);
 	bar = lv_obj_get_child(ys.scr, 0);	/* m3_page's top bar */
@@ -841,6 +874,12 @@ static void yt_open_search(const char *query)
 		yt_kb_show(true);
 		push(ys.scr);
 	}
+}
+
+static void yt_reopen_search(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	yt_open_search(yt_re_query[0] ? yt_re_query : NULL);
 }
 
 /* ------------------------------------------------------------ video */
@@ -943,8 +982,8 @@ static void yt_resolved(const char *out, void *ud)
 				yt_duration(atoi(f[4]), len, sizeof(len));
 			if (f[1][0])
 				label_set_if_changed(yv.title, f[1]);
-			snprintf(meta, sizeof(meta), "%s%s%s * %s", f[2], f[2][0] ? "\n" : "",
-				 views[0] ? views : "", len);
+			snprintf(meta, sizeof(meta), "%s%s%s%s%s", f[2], f[2][0] ? "\n" : "",
+				 views, views[0] ? YT_SEP : "", len);
 			label_set_if_changed(yv.meta, meta);
 			have_info = true;
 		} else if (!strcmp(f[0], "D") && n >= 2) {
@@ -1136,6 +1175,12 @@ static lv_obj_t *yt_action(lv_obj_t *parent, const char *icon, const char *text,
 	return b;
 }
 
+static void yt_reopen_video(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	yt_open_video(&yt_re_vid);
+}
+
 static void yt_open_video(const struct yt_vid *v)
 {
 	lv_obj_t *c, *row;
@@ -1143,6 +1188,9 @@ static void yt_open_video(const struct yt_vid *v)
 
 	if (yv.scr || !yt_id_ok(v->id))
 		return;
+	nav_mark(yt_reopen_video, NULL);	/* opened again when the screen turns */
+	if (v != &yt_re_vid)
+		yt_re_vid = *v;
 	yv.v = *v;
 	yv.body = m3_page("", &yv.scr);
 	lv_obj_add_event_cb(yv.scr, yt_video_deleted, LV_EVENT_DELETE, NULL);
@@ -1232,9 +1280,14 @@ static lv_obj_t *yt_chip(lv_obj_t *parent, const char *text, lv_event_cb_t cb, v
 	lv_obj_set_style_pad_hor(b, 12, 0);
 	lv_obj_set_style_pad_ver(b, 0, 0);
 	lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
-	l = m3_label(b, text, &lv_font_montserrat_14, M.on_surface_v);
-	lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
-	lv_obj_set_style_max_width(l, W - 2 * STATUS_PAD - 32, 0);
+	{
+		char t[32];
+
+		snprintf(t, sizeof(t), "%s", text);
+		if (strlen(text) >= sizeof(t))
+			strcpy(t + sizeof(t) - 4, "...");
+		l = m3_label(b, t, &lv_font_montserrat_14, M.on_surface_v);
+	}
 	lv_obj_center(l);
 	lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
 	return b;
@@ -1364,6 +1417,7 @@ static void open_youtube(lv_event_t *e)
 	LV_UNUSED(e);
 	if (yh.scr)
 		return;
+	nav_mark(open_youtube, NULL);	/* reopened when the screen turns */
 	yt_conf_load();
 	yh.body = m3_page("YouTube", &yh.scr);
 	lv_obj_add_event_cb(yh.scr, yt_home_deleted, LV_EVENT_DELETE, NULL);
