@@ -16,6 +16,8 @@
 #include <spawn.h>
 #include "lvgl/src/indev/lv_indev_private.h"	/* the throw velocity */
 #include "lvgl/src/core/lv_obj_scroll_private.h"	/* lv_obj_scroll_by_raw() */
+#include "lvgl/src/core/lv_obj_draw_private.h"	/* lv_obj_get_ext_draw_size() */
+#include "lvgl/src/misc/lv_area_private.h"	/* lv_area_intersect() */
 #include <sys/wait.h>
 
 extern char **environ;
@@ -1740,9 +1742,32 @@ static void shq(const char *s, char *out, size_t len)
 	out[o] = 0;
 }
 
-static bool have_tool(const char *path)
+/* A program is installed: a path as given, a bare name looked up on PATH
+ * (the distribution decides between /sbin, /usr/sbin, /usr/bin, ...). */
+static bool have_tool(const char *name)
 {
-	return access(path, X_OK) == 0;
+	const char *path, *p;
+	char buf[256];
+
+	if (strchr(name, '/'))
+		return access(name, X_OK) == 0;
+	path = getenv("PATH");
+	if (!path || !*path)
+		path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+	for (p = path; *p; ) {
+		size_t n = strcspn(p, ":");
+		if (n && n + strlen(name) + 2 <= sizeof(buf)) {
+			memcpy(buf, p, n);
+			buf[n] = '/';
+			strcpy(buf + n + 1, name);
+			if (access(buf, X_OK) == 0)
+				return true;
+		}
+		p += n;
+		if (*p == ':')
+			p++;
+	}
+	return false;
 }
 
 /* -------------------------------------------------------- system state */
@@ -1859,9 +1884,9 @@ static void bt_show_done(const char *out, void *ud)
  */
 static void status_refresh(bool with_bt)
 {
-	if (have_tool("/usr/sbin/wpa_cli"))
+	if (have_tool("wpa_cli"))
 		job_run("wpa_cli -i wlan0 status", NULL, wifi_status_done, NULL);
-	if (with_bt && have_tool("/usr/bin/bluetoothctl"))
+	if (with_bt && have_tool("bluetoothctl"))
 		job_run("bluetoothctl show", NULL, bt_show_done, NULL);
 }
 
@@ -1971,9 +1996,9 @@ static void home_update(lv_timer_t *t)
 	if (set_wifi_sub && lv_obj_is_valid(set_wifi_sub))
 		label_set_if_changed(set_wifi_sub, wifi_up ? wifi_ssid : "Not connected");
 	if (set_bt_sub && lv_obj_is_valid(set_bt_sub))
-		label_set_if_changed(set_bt_sub, !have_tool("/usr/bin/bluetoothctl") ?
+		label_set_if_changed(set_bt_sub, !have_tool("bluetoothctl") ?
 				     "Not installed" : bt_powered ? "On" : "Off");
-	label_set_if_changed(qs_bt_sub, !have_tool("/usr/bin/bluetoothctl") ? "Unavailable" :
+	label_set_if_changed(qs_bt_sub, !have_tool("bluetoothctl") ? "Unavailable" :
 			     bt_powered ? "On" : "Off");
 	qs_style(qs_wifi, wifi_powered());
 	qs_style(qs_bt, bt_powered);
@@ -2148,7 +2173,7 @@ static void qs_open_wifi(lv_event_t *e)
 	bool on = !wifi_powered();
 
 	LV_UNUSED(e);
-	if (!have_tool("/usr/sbin/n72-wifi"))
+	if (!have_tool("n72-wifi"))
 		return;
 	qs_style(qs_wifi, on);
 	label_set_if_changed(qs_wifi_sub, on ? "Turning on..." : "Off");
@@ -2159,7 +2184,7 @@ static void qs_open_wifi(lv_event_t *e)
 static void qs_open_bt(lv_event_t *e)
 {
 	LV_UNUSED(e);
-	if (!have_tool("/usr/bin/bluetoothctl"))
+	if (!have_tool("bluetoothctl"))
 		return;
 	bt_set(!bt_powered);
 	qs_style(qs_bt, !bt_powered);
@@ -4379,7 +4404,7 @@ static void open_wifi(lv_event_t *e)
 	lv_obj_t *body, *c, *b;
 
 	LV_UNUSED(e);
-	if (!have_tool("/usr/sbin/wpa_cli")) {
+	if (!have_tool("wpa_cli")) {
 		body = m3_page("Wi-Fi", &wifi_page);
 		m3_note(m3_card(body, M.surface_c), "wpa_supplicant is not installed.");
 		push(wifi_page);
@@ -4562,7 +4587,7 @@ static void open_bt(lv_event_t *e)
 
 	LV_UNUSED(e);
 	body = m3_page("Bluetooth", &bt_page);
-	if (!have_tool("/usr/bin/bluetoothctl")) {
+	if (!have_tool("bluetoothctl")) {
 		c = m3_card(body, M.surface_c);
 		m3_note(c, "BlueZ (bluetoothctl) is not installed.");
 		push(bt_page);
@@ -5040,7 +5065,7 @@ static void snd_spk_cb(lv_event_t *e)
 static void snd_test_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
-	if (have_tool("/usr/bin/n72tone"))
+	if (have_tool("n72tone"))
 		job_run("/usr/bin/n72tone -f 660 -a -12 -t 0.6", NULL, NULL, NULL);
 }
 
@@ -5077,7 +5102,7 @@ static void open_sound(lv_event_t *e)
 		lv_obj_add_state(sw, LV_STATE_CHECKED);
 	lv_obj_add_event_cb(sw, snd_spk_cb, LV_EVENT_VALUE_CHANGED, NULL);
 	m3_note(body, "The volume keys change the volume everywhere (in Logs they scroll).");
-	if (have_tool("/usr/bin/n72tone"))
+	if (have_tool("n72tone"))
 		m3_button(body, "Test sound", false, snd_test_cb, NULL);
 	snd_refresh_ui();
 	push(scr);
@@ -5104,7 +5129,7 @@ static void open_settings(lv_event_t *e)
 	m3_row(c, LV_SYMBOL_WIFI, "Wi-Fi", wifi_up ? wifi_ssid : "Not connected",
 	       open_wifi, NULL, &set_wifi_sub);
 	m3_row(c, LV_SYMBOL_BLUETOOTH, "Bluetooth",
-	       !have_tool("/usr/bin/bluetoothctl") ? "Not installed" : bt_powered ? "On" : "Off",
+	       !have_tool("bluetoothctl") ? "Not installed" : bt_powered ? "On" : "Off",
 	       open_bt, NULL, &set_bt_sub);
 
 	c = m3_card(body, M.surface_c);
