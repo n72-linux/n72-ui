@@ -390,26 +390,103 @@ static void backlight_init(void)
 	}
 }
 
-/* Brightness in percent. */
+/*
+ * Brightness in percent: the user's setting (bl_user), which the fades
+ * below leave alone while they move the hardware's level.
+ */
+static int bl_user = -1;
+static int bl_fade_v;		/* the fade-in's animated variable */
+
+/* the user's level in the hardware's steps (rounded: percent -> raw -> percent is stable) */
+static int bl_user_raw(void);
+
+static void backlight_raw(int raw)
+{
+	char p[160];
+
+	if (!bl_dir[0])
+		return;
+	snprintf(p, sizeof(p), "%s/brightness", bl_dir);
+	write_int(p, LV_CLAMP(1, raw, bl_max));
+}
+
 static int backlight_get(void)
 {
 	char p[160];
 
 	if (!bl_dir[0])
 		return 100;
+	if (bl_user >= 0)
+		return bl_user;
 	snprintf(p, sizeof(p), "%s/brightness", bl_dir);
-	return read_int(p, bl_max) * 100 / bl_max;
+	bl_user = LV_CLAMP(5, (read_int(p, bl_max) * 100 + bl_max / 2) / bl_max, 100);
+	return bl_user;
+}
+
+static int bl_user_raw(void)
+{
+	return (backlight_get() * bl_max + 50) / 100;
 }
 
 static void backlight_set(int pct)
 {
-	char p[160];
-
 	if (!bl_dir[0])
 		return;
-	pct = LV_CLAMP(5, pct, 100);
-	snprintf(p, sizeof(p), "%s/brightness", bl_dir);
-	write_int(p, pct * bl_max / 100);
+	lv_anim_delete(&bl_fade_v, NULL);	/* the slider wins over a fade */
+	bl_user = LV_CLAMP(5, pct, 100);
+	backlight_raw(bl_user_raw());
+}
+
+/*
+ * Screen off and on with the backlight faded, not switched: down over
+ * ~160 ms before the panel goes off (the frame on it stays), up from
+ * nearly dark over BL_FADE_IN_MS once it is back. A level written while
+ * the backlight is off does not light it (the PMU driver reads 0 then), so
+ * the user's level goes back right after the panel is off. N72_FADE=0: no
+ * fades.
+ */
+#define BL_FADE_OUT_STEPS	8	/* 20 ms apart */
+#define BL_FADE_IN_MS		280
+
+static bool bl_fades(void)
+{
+	const char *e = getenv("N72_FADE");
+
+	return bl_dir[0] && !(e && !strcmp(e, "0"));
+}
+
+static void backlight_fade_out(void)
+{
+	int from = bl_user_raw(), i;
+
+	lv_anim_delete(&bl_fade_v, NULL);
+	for (i = 1; i <= BL_FADE_OUT_STEPS; i++) {
+		float r = 1.0f - (float)i / BL_FADE_OUT_STEPS;
+
+		backlight_raw((int)(from * r * r));	/* (the eye: about square law) */
+		usleep(20000);
+	}
+}
+
+static void bl_fade_exec(void *var, int32_t v)
+{
+	LV_UNUSED(var);
+	backlight_raw(v);
+}
+
+static void backlight_fade_in_start(void)
+{
+	lv_anim_t a;
+	int to = bl_user_raw();
+
+	lv_anim_delete(&bl_fade_v, NULL);
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, &bl_fade_v);
+	lv_anim_set_exec_cb(&a, bl_fade_exec);
+	lv_anim_set_values(&a, 1, to);
+	lv_anim_set_duration(&a, BL_FADE_IN_MS);
+	lv_anim_set_path_cb(&a, lv_anim_path_ease_in);	/* square law, as above */
+	lv_anim_start(&a);
 }
 
 static void backlight_power(bool on)
@@ -443,13 +520,24 @@ static void ui_lock(void);
 
 static void screen_set(bool on)
 {
+	bool fade;
+
 	if (!on && screen_off)
 		return;
+	fade = bl_fades() && screen_off == on;	/* only on a change (on again: no fade) */
 	screen_off = !on;
+	if (fade && !on)
+		backlight_fade_out();
+	else if (fade)
+		backlight_raw(1);	/* lit nearly dark, then faded up */
 	if (access(PANEL_POWER, W_OK) == 0)
 		write_int(PANEL_POWER, on);
 	else
 		backlight_power(on);
+	if (fade && !on)
+		backlight_raw(bl_user_raw());	/* (stays dark) */
+	else if (fade)
+		backlight_fade_in_start();
 	/* the lock screen goes up in the dark: it is what waking shows */
 	if (!on)
 		ui_lock();
@@ -883,7 +971,7 @@ static bool woke_for_screen(const struct wake_marks *before)
 		return true;
 	if (irq >= 0 && (irq == now.home_irq || irq == now.power_irq))
 		return true;
-	if (now.usb != before->usb)
+	if (now.usb != before->usb && conf.wake_plug)	/* Settings > Display */
 		return true;
 	return before->alarm && time(NULL) >= before->alarm;
 }
@@ -1075,17 +1163,53 @@ static void playback_check(lv_timer_t *t)
 }
 
 /* Sleep after a while without input, unless running from USB power. */
+/*
+ * The screen goes dark (locked): on USB power only the screen, on battery
+ * the system sleeps as well.
+ */
+static void screen_dark(void)
+{
+	if (usb_powered())
+		screen_set(false);
+	else
+		screen_off_or_sleep();
+	lv_display_trigger_activity(NULL);
+}
+
+#define LOCK_IDLE_MS	8000	/* the lock screen, not unlocked: dark again */
+
 static void idle_check(lv_timer_t *t)
 {
 	long idle_ms = conf.idle_s * 1000L;	/* Settings > Display */
+	uint32_t inactive = lv_display_get_inactive_time(NULL);
+	static int last_plug = -1;
+	int plug = usb_powered();
 
 	LV_UNUSED(t);
-	if (!idle_ms || screen_off || lv_display_get_inactive_time(NULL) < (uint32_t)idle_ms)
+	if (last_plug >= 0 && plug != last_plug) {
+		last_plug = plug;
+		if (screen_off && conf.wake_plug) {	/* Settings > Display */
+			screen_off_for_sound = false;
+			screen_set(true);
+			lv_display_trigger_activity(NULL);
+			return;
+		}
+		if (screen_off && !plug && !screen_off_for_sound) {
+			screen_off_or_sleep();	/* dark on USB, now on battery: sleep */
+			return;
+		}
+		lv_display_trigger_activity(NULL);
+	}
+	last_plug = plug;
+	if (screen_off)
 		return;
-	if (usb_powered())
+	if (locked && inactive >= LOCK_IDLE_MS) {
+		screen_dark();
 		return;
-	screen_off_or_sleep();
-	lv_display_trigger_activity(NULL);
+	}
+	if (!idle_ms || inactive < (uint32_t)idle_ms)
+		return;
+	screen_dark();
 }
 
 /* -------------------------------------------------------------- buttons */
@@ -1524,6 +1648,7 @@ int main(int argc, char **argv)
 	build_home();
 	drags_init();
 	sound_ui_init();
+	ui_reopen();		/* a page asked for at start (after a theme change) */
 	crash_handlers();
 	signal(SIGUSR1, on_usr1);
 	signal(SIGUSR2, on_usr2);

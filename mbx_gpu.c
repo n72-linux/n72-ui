@@ -1630,6 +1630,77 @@ static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
  * Without KMS (or N72_MBXFLIP=1) the MBX driver's own flip is used.
  */
 static uint32_t kms_fb[NSCAN], kms_crtc;
+static uint32_t kms_handle[NSCAN];	/* the scan buffers' GEM handles on kms_fd */
+static bool kms_shell;
+
+/*
+ * A restart (a theme change execs n72-ui again) hands the KMS file over:
+ * N72_KMS_HANDOFF="fd fb handle fb handle ..." names it and the old
+ * process's frame buffers. The new process keeps the layer as it is, so
+ * the old picture stays until its own first flip (the screen never shows
+ * layer 0 underneath), then frees the old buffers.
+ */
+#define HANDOFF_ENV	"N72_KMS_HANDOFF"
+static uint32_t handoff_fb[NSCAN], handoff_handle[NSCAN];
+static int handoff_n;
+
+void mbx_gpu_handoff(void)
+{
+	char buf[128];
+	int i, n;
+
+	if (kms_fd < 0)
+		return;
+	fcntl(kms_fd, F_SETFD, 0);	/* kept across exec */
+	n = snprintf(buf, sizeof(buf), "%d", kms_fd);
+	for (i = 0; i < NSCAN && n < (int)sizeof(buf) - 24; i++)
+		n += snprintf(buf + n, sizeof(buf) - n, " %u %u", kms_fb[i], kms_handle[i]);
+	setenv(HANDOFF_ENV, buf, 1);
+}
+
+/* the handed-over KMS file, if there is one and it is the layer we want */
+static int kms_take_handoff(void)
+{
+	const char *e = getenv(HANDOFF_ENV);
+	char name[32] = "";
+	struct drm_version v = { .name = name, .name_len = sizeof(name) - 1 };
+	int fd, i, off = 0, k;
+
+	if (!e)
+		return -1;
+	if (sscanf(e, "%d%n", &fd, &off) != 1 || fd < 0)
+		goto bad;
+	for (i = 0; i < NSCAN; i++) {
+		if (sscanf(e + off, "%u %u%n", &handoff_fb[i], &handoff_handle[i], &k) != 2)
+			break;
+		off += k;
+	}
+	handoff_n = i;
+	if (ioctl(fd, DRM_IOCTL_VERSION, &v) || strcmp(name, "n72-clcd-shell"))
+		goto bad;
+	fcntl(fd, F_SETFD, FD_CLOEXEC);
+	unsetenv(HANDOFF_ENV);
+	kms_shell = true;
+	return fd;
+bad:
+	handoff_n = 0;
+	unsetenv(HANDOFF_ENV);
+	return -1;
+}
+
+/* after the new process's first flip: the old buffers go */
+static void kms_drop_handoff(void)
+{
+	int i;
+
+	for (i = 0; i < handoff_n; i++) {
+		struct drm_gem_close gc = { .handle = handoff_handle[i] };
+
+		ioctl(kms_fd, DRM_IOCTL_MODE_RMFB, &handoff_fb[i]);
+		ioctl(kms_fd, DRM_IOCTL_GEM_CLOSE, &gc);
+	}
+	handoff_n = 0;
+}
 static bool kms_shell;		/* on the display's layer 1, over the applications */
 
 /*
@@ -1682,6 +1753,8 @@ static void kms_flip(int r)
 	}
 	if (poll(&p, 1, 200) > 0 && read(kms_fd, buf, sizeof(buf)) < 0)
 		;
+	if (handoff_n)
+		kms_drop_handoff();	/* (the old picture is off the layer now) */
 }
 
 static bool kms_setup(void)
@@ -1691,8 +1764,11 @@ static bool kms_setup(void)
 	struct drm_mode_get_connector conn = { 0 };
 	struct drm_mode_modeinfo modes[4];
 	struct drm_mode_crtc set = { 0 };
-	int i, fd = kms_open();
+	int i, fd = kms_take_handoff();
+	bool handed = fd >= 0;
 
+	if (!handed)
+		fd = kms_open();
 	if (fd < 0 || getenv("N72_MBXFLIP"))
 		goto fail;
 	ioctl(fd, DRM_IOCTL_SET_MASTER, 0);
@@ -1735,8 +1811,14 @@ static bool kms_setup(void)
 		if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &f))
 			goto fail;
 		kms_fb[i] = f.fb_id;
+		kms_handle[i] = ph.handle;
 	}
 	kms_crtc = crtcs[0];
+	if (handed) {
+		/* the layer stays on the old picture until the first flip */
+		kms_fd = fd;
+		return true;
+	}
 	set.crtc_id = kms_crtc;
 	set.fb_id = kms_fb[0];
 	set.mode = modes[0];

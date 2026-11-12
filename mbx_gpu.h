@@ -46,6 +46,8 @@ lv_draw_buf_t *mbx_gpu_flatten(const lv_draw_buf_t *src, lv_color_t bg);
  * the CPU's while it is on. Without layer 1 it does nothing.
  */
 void mbx_gpu_set_transparent(bool on);
+/* before exec'ing a new n72-ui: the display is handed over (no flash) */
+void mbx_gpu_handoff(void);
 /* True when the launcher has the display's layer 1 (KMS n72-clcd-shell). */
 bool mbx_gpu_on_shell_layer(void);
 

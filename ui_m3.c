@@ -28,13 +28,18 @@ static bool system_sleep(void);
 
 #define CONF_PATH "/tmp/n72-ui.conf"
 
+/* layout: every screen's side margin (status bar, pages, shade, home) */
+#define STATUS_PAD	16
+#define STATUS_GAP	10	/* between the status bar's icons */
+
 static struct {
 	bool dark;
 	int accent;		/* index into accents[] */
 	int idle_s;		/* screen idle timeout, 0 = never */
 	int vol;		/* sound volume, 0..100 % (0 = mute) */
 	bool spk;		/* speaker when no earphones are plugged */
-} conf = { true, 0, 120, 60, true };
+	bool wake_plug;		/* the screen comes on when the cable goes in or out */
+} conf = { true, 0, 120, 60, true, true };
 
 static const struct { const char *name; uint16_t hue; uint8_t sat; } accents[] = {
 	{ "Violet", 265, 48 }, { "Blue", 215, 60 }, { "Teal", 178, 55 },
@@ -65,6 +70,8 @@ static void conf_load(void)
 			conf.vol = v;
 		else if (sscanf(line, "spk=%d", &v) == 1)
 			conf.spk = v;
+		else if (sscanf(line, "plug=%d", &v) == 1)
+			conf.wake_plug = v;
 	}
 	fclose(f);
 }
@@ -75,8 +82,8 @@ static void conf_save(void)
 
 	if (!f)
 		return;
-	fprintf(f, "dark=%d\naccent=%d\nidle=%d\nvol=%d\nspk=%d\n", conf.dark, conf.accent,
-		conf.idle_s, conf.vol, conf.spk);
+	fprintf(f, "dark=%d\naccent=%d\nidle=%d\nvol=%d\nspk=%d\nplug=%d\n", conf.dark,
+		conf.accent, conf.idle_s, conf.vol, conf.spk, conf.wake_plug);
 	fclose(f);
 }
 
@@ -541,6 +548,9 @@ static bool tr_start(lv_draw_buf_t *bg, lv_draw_buf_t *fg, int kind, lv_obj_t *t
 }
 
 /* Slide to @to: left for forward, right for back; @del_from: delete the old screen. */
+static void app_bar_set(bool show);
+static pid_t app_pid;
+
 static void slide(lv_obj_t *to, bool left, bool del_from)
 {
 	lv_obj_t *from;
@@ -553,6 +563,8 @@ static void slide(lv_obj_t *to, bool left, bool del_from)
 	from = lv_screen_active();
 	if (from == to)
 		return;
+	if (to == home_scr && app_pid <= 0)
+		app_bar_set(false);	/* home has its own status bar */
 	{
 		extern uint64_t n72_mark_us;
 
@@ -590,6 +602,14 @@ static void show(lv_obj_t *scr)
 #define NAV_MAX 6
 static lv_obj_t *nav[NAV_MAX];
 static int nav_n;
+static void app_bar_set(bool show);
+static bool locked;
+
+/* A page (Settings and the pages under it, Paint) is on the screen. */
+static bool on_page(void)
+{
+	return !locked && nav_n > 0 && lv_screen_active() == nav[nav_n - 1];
+}
 
 static void shade_set(bool open, bool anim);
 
@@ -1555,7 +1575,7 @@ static lv_obj_t *m3_page(const char *title, lv_obj_t **scr_out)
 	lv_obj_set_pos(body, 0, 56);
 	lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_radius(body, 0, 0);
-	lv_obj_set_style_pad_hor(body, 12, 0);
+	lv_obj_set_style_pad_hor(body, STATUS_PAD, 0);	/* the screen's side margin */
 	lv_obj_set_style_pad_top(body, 4, 0);
 	/* the last card ends as far above the bottom as the first starts
 	 * below the title (the bar's own margin included) */
@@ -1859,6 +1879,8 @@ static bool wifi_powered(void)
 static bool wifi_up;
 static bool bt_powered;
 
+static void net_ui_sync(void);
+
 static void wifi_status_done(const char *out, void *ud)
 {
 	char st[32] = "";
@@ -1869,12 +1891,14 @@ static void wifi_status_done(const char *out, void *ud)
 	kv_get(out, "ssid", wifi_ssid, sizeof(wifi_ssid));
 	if (!wifi_up)
 		wifi_ssid[0] = 0;
+	net_ui_sync();
 }
 
 static void bt_show_done(const char *out, void *ud)
 {
 	LV_UNUSED(ud);
 	bt_powered = strstr(out, "Powered: yes") != NULL;
+	net_ui_sync();
 }
 
 /*
@@ -1892,7 +1916,7 @@ static void status_refresh(bool with_bt)
 
 /* ------------------------------------------------------------- home */
 
-static lv_obj_t *clock_lbl, *date_lbl, *batt_lbl, *status_icons, *status_time;
+static lv_obj_t *clock_lbl, *date_lbl, *batt_lbl, *status_time;
 static lv_obj_t *home_clock, *home_date, *home_batt, *home_net;	/* the widget */
 static lv_obj_t *qs_wifi_sub, *qs_bt_sub, *qs_wifi, *qs_bt;
 static lv_obj_t *set_wifi_sub, *set_bt_sub;	/* on the Settings page */
@@ -1923,6 +1947,36 @@ static void battery_text(char *buf, size_t len)
 
 static lv_timer_t *home_timer;
 
+/*
+ * A status bar's contents, the same on home and in the bar that comes down
+ * over applications and pages: the time on the left; Wi-Fi, Bluetooth and
+ * the battery on the right, in a row with fixed gaps (an icon that is not
+ * shown takes its gap with it).
+ */
+
+static void status_row(lv_obj_t *bar, lv_obj_t **time, lv_obj_t **wifi, lv_obj_t **bt,
+		       lv_obj_t **batt)
+{
+	lv_obj_t *sp;
+
+	lv_obj_set_style_pad_hor(bar, STATUS_PAD, 0);
+	lv_obj_set_style_pad_ver(bar, 0, 0);
+	lv_obj_set_style_pad_column(bar, STATUS_GAP, 0);
+	lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	*time = m3_label(bar, "", &lv_font_montserrat_14, M.on_surface);
+	sp = lv_obj_create(bar);		/* pushes the rest to the right */
+	lv_obj_remove_style_all(sp);
+	lv_obj_remove_flag(sp, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_size(sp, 0, 1);
+	lv_obj_set_flex_grow(sp, 1);
+	*wifi = m3_label(bar, LV_SYMBOL_WIFI, &lv_font_montserrat_14, M.on_surface_v);
+	*bt = m3_label(bar, LV_SYMBOL_BLUETOOTH, &lv_font_montserrat_14, M.on_surface_v);
+	*batt = m3_label(bar, "", &lv_font_montserrat_14, M.on_surface_v);
+	lv_obj_add_flag(*wifi, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_add_flag(*bt, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void qs_style(lv_obj_t *tile, bool on)
 {
 	lv_color_t c = on ? M.primary_c : M.surface_c_high;
@@ -1931,6 +1985,79 @@ static void qs_style(lv_obj_t *tile, bool on)
 		lv_obj_set_style_bg_color(tile, c, 0);
 		shade_changed(tile);
 	}
+}
+
+/*
+ * Wi-Fi and Bluetooth as every view shows them (the shade's tiles, the
+ * Settings rows, the Wi-Fi and Bluetooth pages, the status bar), all from
+ * one state and all updated together (net_ui_sync). While a switch is
+ * being carried out (*_want >= 0) the views show where it is going, and
+ * status reads that land meanwhile cannot flip them back.
+ */
+static int wifi_want = -1, bt_want = -1;	/* -1: no switch in progress */
+static lv_obj_t *wifi_switch, *bt_switch, *bt_state_lbl;
+static lv_obj_t *status_wifi, *status_bt, *app_bar_wifi, *app_bar_bt;
+
+static bool wifi_shown_on(void)
+{
+	return wifi_want >= 0 ? wifi_want : wifi_powered();
+}
+
+static bool bt_shown_on(void)
+{
+	return bt_want >= 0 ? bt_want : bt_powered;
+}
+
+static void switch_show(lv_obj_t *sw, bool on)
+{
+	if (!sw || !lv_obj_is_valid(sw) || lv_obj_has_state(sw, LV_STATE_CHECKED) == on)
+		return;
+	if (on)
+		lv_obj_add_state(sw, LV_STATE_CHECKED);
+	else
+		lv_obj_remove_state(sw, LV_STATE_CHECKED);
+}
+
+static void label_show(lv_obj_t *l, const char *text)
+{
+	if (l && lv_obj_is_valid(l))
+		label_set_if_changed(l, text);
+}
+
+static void icon_show(lv_obj_t *l, bool on)
+{
+	if (!l || lv_obj_has_flag(l, LV_OBJ_FLAG_HIDDEN) == !on)
+		return;
+	if (on)
+		lv_obj_remove_flag(l, LV_OBJ_FLAG_HIDDEN);
+	else
+		lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+	shade_changed(l);
+}
+
+static void net_ui_sync(void)
+{
+	bool w = wifi_shown_on(), b = bt_shown_on(), bt_tool = have_tool("bluetoothctl");
+	const char *wsub = wifi_want == 1 && !wifi_powered() ? "Turning on..." :
+			   !w ? "Off" : wifi_up ? wifi_ssid : "Not connected";
+	const char *bsub = !bt_tool ? "Not installed" :
+			   bt_want == 1 && !bt_powered ? "Turning on..." :
+			   bt_want == 0 && bt_powered ? "Turning off..." : b ? "On" : "Off";
+
+	qs_style(qs_wifi, w);
+	qs_style(qs_bt, b);
+	label_show(qs_wifi_sub, wsub);
+	label_show(qs_bt_sub, bt_tool ? bsub : "Unavailable");
+	label_show(set_wifi_sub, wsub);
+	label_show(set_bt_sub, bsub);
+	switch_show(wifi_switch, w);
+	switch_show(bt_switch, b);
+	label_show(bt_state_lbl, bsub);
+	icon_show(status_wifi, w && wifi_up && wifi_want < 0);
+	icon_show(status_bt, b && bt_want < 0);
+	icon_show(app_bar_wifi, w && wifi_up && wifi_want < 0);
+	icon_show(app_bar_bt, b && bt_want < 0);
+	app_bar_update();
 }
 
 static void home_update(lv_timer_t *t)
@@ -1988,21 +2115,7 @@ static void home_update(lv_timer_t *t)
 		label_set_if_changed(home_batt, buf);
 	if (home_net)
 		label_set_if_changed(home_net, wifi_up ? wifi_ssid : "Wi-Fi off");
-	snprintf(buf, sizeof(buf), "%s%s", wifi_up ? LV_SYMBOL_WIFI "  " : "",
-		 bt_powered ? LV_SYMBOL_BLUETOOTH : "");
-	label_set_if_changed(status_icons, buf);
-	label_set_if_changed(qs_wifi_sub, !wifi_powered() ? "Off" :
-			     wifi_up ? wifi_ssid : "Not connected");
-	if (set_wifi_sub && lv_obj_is_valid(set_wifi_sub))
-		label_set_if_changed(set_wifi_sub, wifi_up ? wifi_ssid : "Not connected");
-	if (set_bt_sub && lv_obj_is_valid(set_bt_sub))
-		label_set_if_changed(set_bt_sub, !have_tool("bluetoothctl") ?
-				     "Not installed" : bt_powered ? "On" : "Off");
-	label_set_if_changed(qs_bt_sub, !have_tool("bluetoothctl") ? "Unavailable" :
-			     bt_powered ? "On" : "Off");
-	qs_style(qs_wifi, wifi_powered());
-	qs_style(qs_bt, bt_powered);
-	app_bar_update();
+	net_ui_sync();
 }
 
 static void open_settings(lv_event_t *e);
@@ -2018,7 +2131,7 @@ static lv_obj_t *qs_tile(lv_obj_t *parent, const char *icon, const char *title,
 	lv_obj_t *t = lv_obj_create(parent), *col;
 
 	plain(t);
-	lv_obj_set_size(t, 142, 64);
+	lv_obj_set_size(t, (W - 2 * STATUS_PAD - 8) / 2, 64);	/* two, 8 apart */
 	lv_obj_set_style_radius(t, 20, 0);
 	lv_obj_set_style_bg_opa(t, LV_OPA_COVER, 0);
 	lv_obj_set_style_pad_hor(t, 14, 0);
@@ -2032,13 +2145,13 @@ static lv_obj_t *qs_tile(lv_obj_t *parent, const char *icon, const char *title,
 	plain(col);
 	lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_pad_all(col, 0, 0);
-	lv_obj_set_size(col, 86, LV_SIZE_CONTENT);
+	lv_obj_set_size(col, 82, LV_SIZE_CONTENT);
 	lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
 	lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 	m3_label(col, title, &lv_font_montserrat_14, M.on_surface);
 	*sub = m3_label(col, "", &lv_font_montserrat_12, M.on_surface_v);
 	lv_label_set_long_mode(*sub, LV_LABEL_LONG_DOT);
-	lv_obj_set_size(*sub, 86, 16);
+	lv_obj_set_size(*sub, 82, 16);
 	lv_obj_add_event_cb(t, cb, LV_EVENT_CLICKED, NULL);
 	return t;
 }
@@ -2089,6 +2202,20 @@ static void home_bright_cb(lv_event_t *e)
 static void shade_closed(void)
 {
 	lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+	/* opened over a page it was on the top layer: home's again */
+	if (app_pid <= 0 && lv_obj_get_parent(shade) != home_scr) {
+		lv_obj_set_parent(scrim, home_scr);
+		lv_obj_set_parent(shade, home_scr);
+	}
+}
+
+/* Over a page the shade comes down on the top layer, as over applications. */
+static void shade_to_top(void)
+{
+	if (lv_obj_get_parent(shade) == lv_layer_top())
+		return;
+	lv_obj_set_parent(scrim, lv_layer_top());
+	lv_obj_set_parent(shade, lv_layer_top());
 }
 
 /*
@@ -2104,6 +2231,8 @@ static void shade_set(bool open, bool anim)
 	if (!shade || open == shade_open)
 		return;
 	tr_finish();
+	if (open && on_page())
+		shade_to_top();
 	shade_open = open;
 	if (open) {
 		lv_slider_set_value(home_bright, backlight_get(), LV_ANIM_OFF);
@@ -2160,25 +2289,39 @@ static void shade_tap_cb(lv_event_t *e)
  */
 static void bt_set(bool on);
 
-static void qs_refresh_done(const char *out, void *ud)
+static void wifi_page_refresh(void);
+
+static void wifi_set_done(const char *out, void *ud)
 {
 	LV_UNUSED(out);
 	LV_UNUSED(ud);
-	status_refresh(true);
-	home_update(NULL);
+	wifi_want = -1;		/* the card is there or gone now (sysfs) */
+	status_refresh(false);
+	net_ui_sync();
+	wifi_page_refresh();
+}
+
+/* Wi-Fi on or off from any switch; a second one waits for the first. */
+static void wifi_set(bool on)
+{
+	if (wifi_want >= 0 || !have_tool("n72-wifi")) {
+		net_ui_sync();		/* (puts a switch that moved back) */
+		return;
+	}
+	if (on == wifi_powered())
+		return;
+	wifi_want = on;
+	if (!on)
+		wifi_up = false;
+	net_ui_sync();
+	/* (on: the card's power-up, firmware and join take a few seconds) */
+	job_run(on ? "n72-wifi on; sleep 4" : "n72-wifi off", NULL, wifi_set_done, NULL);
 }
 
 static void qs_open_wifi(lv_event_t *e)
 {
-	bool on = !wifi_powered();
-
 	LV_UNUSED(e);
-	if (!have_tool("n72-wifi"))
-		return;
-	qs_style(qs_wifi, on);
-	label_set_if_changed(qs_wifi_sub, on ? "Turning on..." : "Off");
-	/* (on: the card's power-up and firmware take a few seconds) */
-	job_run(on ? "n72-wifi on; sleep 4" : "n72-wifi off", NULL, qs_refresh_done, NULL);
+	wifi_set(!wifi_shown_on());
 }
 
 static void qs_open_bt(lv_event_t *e)
@@ -2186,9 +2329,7 @@ static void qs_open_bt(lv_event_t *e)
 	LV_UNUSED(e);
 	if (!have_tool("bluetoothctl"))
 		return;
-	bt_set(!bt_powered);
-	qs_style(qs_bt, !bt_powered);
-	label_set_if_changed(qs_bt_sub, !bt_powered ? "Turning on..." : "Off");
+	bt_set(!bt_shown_on());
 }
 
 static void page_open_from(lv_obj_t *tile, void (*open)(lv_event_t *));
@@ -2235,7 +2376,7 @@ static void build_shade(void)
 	lv_obj_remove_flag(h, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
 	clock_lbl = m3_label(shade, "", &lv_font_montserrat_48, M.on_surface);
-	lv_obj_align(clock_lbl, LV_ALIGN_TOP_LEFT, 20, 24);
+	lv_obj_align(clock_lbl, LV_ALIGN_TOP_LEFT, STATUS_PAD + 2, 24);	/* (+ the glyphs' side bearing) */
 	{
 		/* Settings: a round tonal button at the top right */
 		lv_obj_t *b = lv_button_create(shade);
@@ -2250,11 +2391,11 @@ static void build_shade(void)
 		qs_settings_btn = b;
 	}
 	date_lbl = m3_label(shade, "", &lv_font_montserrat_16, M.primary);
-	lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, 22, 84);
+	lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, STATUS_PAD + 4, 84);
 
 	row = lv_obj_create(shade);
 	plain(row);
-	lv_obj_set_size(row, W - 24, 64);
+	lv_obj_set_size(row, W - 2 * STATUS_PAD, 64);
 	lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 128);
 	lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_pad_all(row, 0, 0);
@@ -2266,7 +2407,7 @@ static void build_shade(void)
 
 	row = lv_obj_create(shade);
 	plain(row);
-	lv_obj_set_size(row, W - 24, 56);
+	lv_obj_set_size(row, W - 2 * STATUS_PAD, 56);
 	lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 204);
 	lv_obj_set_style_bg_color(row, M.surface_c_highest, 0);
 	lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -2334,7 +2475,7 @@ static lv_timer_t *app_timer;
 #define APP_EDGE_H	24	/* the strip at the top that pulls the bar */
 #define APP_BAR_MS	3000
 
-static lv_obj_t *app_bar, *app_bar_time, *app_bar_icons, *app_bar_batt;
+static lv_obj_t *app_bar, *app_bar_time, *app_bar_batt;
 static bool app_bar_shown;
 static lv_timer_t *app_bar_timer;
 
@@ -2452,7 +2593,7 @@ static void app_gesture_cb(lv_event_t *e)
 	lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
 
 	LV_UNUSED(e);
-	if (app_pid <= 0)
+	if (app_pid <= 0 && !on_page())
 		return;
 	if (d == LV_DIR_BOTTOM) {
 		if (!app_bar_shown)
@@ -2471,6 +2612,8 @@ static void app_gesture_cb(lv_event_t *e)
 
 static void app_bar_build(void)
 {
+	if (app_bar)
+		return;
 	app_bar = lv_obj_create(lv_layer_top());
 	plain(app_bar);
 	lv_obj_set_size(app_bar, W, APP_BAR_H);
@@ -2481,18 +2624,13 @@ static void app_bar_build(void)
 	lv_obj_set_style_shadow_width(app_bar, 12, 0);
 	lv_obj_set_style_shadow_offset_y(app_bar, 2, 0);
 	lv_obj_set_style_shadow_opa(app_bar, LV_OPA_30, 0);
-	lv_obj_set_style_pad_hor(app_bar, 16, 0);
 	lv_obj_remove_flag(app_bar, LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_add_event_cb(app_bar, app_bar_touch_cb, LV_EVENT_PRESSED, NULL);
 	lv_obj_add_event_cb(app_bar, app_bar_touch_cb, LV_EVENT_PRESSING, NULL);
 	lv_obj_add_event_cb(app_bar, app_bar_touch_cb, LV_EVENT_CLICKED, NULL);
 	lv_obj_remove_flag(app_bar, LV_OBJ_FLAG_GESTURE_BUBBLE);	/* its own */
-	app_bar_time = m3_label(app_bar, "", &lv_font_montserrat_14, M.on_surface);
-	lv_obj_align(app_bar_time, LV_ALIGN_LEFT_MID, 0, 0);
-	app_bar_batt = m3_label(app_bar, "", &lv_font_montserrat_14, M.on_surface_v);
-	lv_obj_align(app_bar_batt, LV_ALIGN_RIGHT_MID, 0, 0);
-	app_bar_icons = m3_label(app_bar, "", &lv_font_montserrat_14, M.on_surface_v);
-	lv_obj_align(app_bar_icons, LV_ALIGN_RIGHT_MID, -74, 0);
+	status_row(app_bar, &app_bar_time, &app_bar_wifi, &app_bar_bt, &app_bar_batt);
+	net_ui_sync();
 	lv_obj_add_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
 	/* gestures on the bar, the shade and the scrim bubble up to here */
 	lv_obj_add_event_cb(lv_layer_top(), app_gesture_cb, LV_EVENT_GESTURE, NULL);
@@ -2504,7 +2642,6 @@ static void app_bar_update(void)
 	if (!app_bar)
 		return;
 	label_set_if_changed(app_bar_time, lv_label_get_text(status_time));
-	label_set_if_changed(app_bar_icons, lv_label_get_text(status_icons));
 	label_set_if_changed(app_bar_batt, lv_label_get_text(batt_lbl));
 }
 
@@ -2681,7 +2818,7 @@ static void sd_end(bool open)
 		home_wake();
 	} else {
 		shade_closed();
-		if (app_pid > 0 && !sd.to_page)
+		if ((app_pid > 0 || on_page()) && !sd.to_page)
 			app_bar_set(true);	/* the bar's timeout starts again */
 	}
 	sd.to_page = false;
@@ -2704,7 +2841,8 @@ static bool sd_animate(bool open)
 	lv_anim_t a;
 
 	if (sd.on || sd.scr ||
-	    !(lv_screen_active() == home_scr || (app_scr && lv_screen_active() == app_scr)))
+	    !(lv_screen_active() == home_scr || (app_scr && lv_screen_active() == app_scr) ||
+	      on_page()))
 		return false;
 	shade_open = !open;	/* (sd_begin starts from where it is) */
 	sd_begin(false);
@@ -2758,12 +2896,17 @@ static void ui_touch_lost(void)
 
 static bool sd_begin(bool touch)
 {
-	bool home = lv_screen_active() == home_scr;
+	bool home = lv_screen_active() == home_scr, page = on_page();
 	lv_draw_buf_t *bg = NULL, *fg;
 
 	if (touch)
 		ui_touch_lost();
 	tr_finish();
+	if (page) {
+		/* the page as it is, under the shade (which is on the top layer) */
+		shade_to_top();
+		bg = snap(lv_screen_active(), LV_COLOR_FORMAT_XRGB8888);
+	}
 	sd.base = shade_open ? 0 : -SHADE_H;
 	sd.pics = false;
 	/*
@@ -2787,7 +2930,8 @@ static bool sd_begin(bool touch)
 			lv_obj_remove_flag(shade, LV_OBJ_FLAG_HIDDEN);
 		}
 	}
-	tr_free(&sd.home_pic);
+	if (!page)
+		tr_free(&sd.home_pic);
 	fg = shade_pic_get();
 	sd.fg_cached = fg != NULL;
 	if (fg && (bg || !home)) {
@@ -2817,7 +2961,7 @@ static bool sd_begin(bool touch)
 		 * blending it with the CPU every frame would halve the rate */
 		if (!bg)
 			lv_obj_add_flag(sd.scrim, LV_OBJ_FLAG_HIDDEN);
-		if (app_bar && !bg)
+		if (app_bar)
 			lv_obj_add_flag(app_bar, LV_OBJ_FLAG_HIDDEN);	/* not over the shade */
 		sd.fg = lv_image_create(sd.scr);
 		lv_image_set_src(sd.fg, fg);
@@ -3164,6 +3308,7 @@ static bool ui_drag(int phase, int x, int y)
 	if (phase == 0) {
 		bool home = lv_screen_active() == home_scr && !tr.scr;
 		bool app = app_pid > 0 && lv_screen_active() == app_scr;
+		bool page = on_page() && !tr.scr;
 
 		sd_settle_now();
 		sd.cand = 0;
@@ -3171,12 +3316,14 @@ static bool ui_drag(int phase, int x, int y)
 		sd.py = y;
 		sd.last_y = y;
 		sd.last_t = now;
-		if (!shade || screen_off || (!home && !app))
+		if (!shade || screen_off || (!home && !app && !page))
 			return false;
 		if (shade_open && !in_obj(home_bright, x, y))
 			sd.cand = -1;
 		else if (!shade_open && (home || (app_bar_shown && y < APP_BAR_H)))
 			sd.cand = 1;
+		else if (page && !shade_open && y < APP_EDGE_H)
+			sd.cand = 2;	/* the page's top edge: brings the bar */
 		return false;
 	}
 	if (!sd.on) {
@@ -3184,6 +3331,18 @@ static bool ui_drag(int phase, int x, int y)
 
 		if (!sd.cand || phase == 2)
 			return false;
+		if (sd.cand == 2) {
+			if (LV_ABS(dx) > SD_SLOP && LV_ABS(dx) > LV_ABS(dy)) {
+				sd.cand = 0;
+				return false;
+			}
+			if (dy <= SD_SLOP)
+				return false;
+			sd.cand = 0;
+			ui_touch_lost();	/* (not the page's scroll or tap) */
+			app_bar_set(true);
+			return true;
+		}
 		if (LV_ABS(dx) > SD_SLOP && LV_ABS(dx) > LV_ABS(dy)) {
 			sd.cand = 0;	/* sideways: not the shade's */
 			return false;
@@ -4055,18 +4214,12 @@ static void build_home(void)
 	lv_obj_set_size(bar, W, 40);
 	lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_radius(bar, 0, 0);
-	lv_obj_set_style_pad_hor(bar, 16, 0);
 	lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_add_event_cb(bar, shade_tap_cb, LV_EVENT_CLICKED, (void *)1);
-	status_time = m3_label(bar, "", &lv_font_montserrat_14, M.on_surface);
-	lv_obj_align(status_time, LV_ALIGN_LEFT_MID, 0, 0);
+	status_row(bar, &status_time, &status_wifi, &status_bt, &batt_lbl);
 	/* the card below shows the time: the bar on home does not (the
 	 * label stays, hidden: the bar over applications copies it) */
 	lv_obj_add_flag(status_time, LV_OBJ_FLAG_HIDDEN);
-	batt_lbl = m3_label(bar, "", &lv_font_montserrat_14, M.on_surface_v);
-	lv_obj_align(batt_lbl, LV_ALIGN_RIGHT_MID, 0, 0);
-	status_icons = m3_label(bar, "", &lv_font_montserrat_14, M.on_surface_v);
-	lv_obj_align(status_icons, LV_ALIGN_RIGHT_MID, -74, 0);
 
 	/* a widget: the time large, the date, battery and Wi-Fi */
 	{
@@ -4107,13 +4260,14 @@ static void build_home(void)
 	app_tiles(apps);
 
 	build_shade();
+	app_bar_build();	/* the bar over applications and pages */
 
 	status_refresh(true);
 	home_timer = lv_timer_create(home_update, 2000, NULL);
 	lv_timer_create(shade_pic_warm, 1000, NULL);
 	home_update(NULL);
 	lv_screen_load(home_scr);
-	ui_reopen();
+	/* (ui_reopen: main, once the sound card is known) */
 }
 
 /* After a theme or accent change: start afresh (state is in CONF_PATH). */
@@ -4124,6 +4278,7 @@ static void ui_restart(const char *open_page)
 		setenv("N72_UI_OPEN", open_page, 1);
 	if (tty_fd >= 0)
 		close(tty_fd);
+	mbx_gpu_handoff();	/* the screen keeps this frame until the new one */
 	execv("/proc/self/exe", self_argv);
 }
 
@@ -4374,11 +4529,11 @@ static void wifi_state_done(const char *out, void *ud)
 	if (wifi_up) {
 		char buf[128];
 
-		snprintf(buf, sizeof(buf), "Connected to %s\n%s", wifi_ssid, ip);
+		snprintf(buf, sizeof(buf), "%s\n%s", wifi_ssid, ip);
 		label_set_if_changed(wifi_state_lbl, buf);
 	} else {
-		label_set_if_changed(wifi_state_lbl, st[0] ? "Not connected" :
-				     "Wi-Fi is not running");
+		label_set_if_changed(wifi_state_lbl, !wifi_shown_on() ? "Off" :
+				     st[0] ? "Not connected" : "Wi-Fi is not running");
 	}
 }
 
@@ -4399,6 +4554,11 @@ static void wifi_scan_cb(lv_event_t *e)
 	job_run("wpa_cli -i wlan0 scan; sleep 4", wifi_page, wifi_cmd_done, NULL);
 }
 
+static void wifi_switch_cb(lv_event_t *e)
+{
+	wifi_set(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
 static void open_wifi(lv_event_t *e)
 {
 	lv_obj_t *body, *c, *b;
@@ -4411,8 +4571,24 @@ static void open_wifi(lv_event_t *e)
 		return;
 	}
 	body = m3_page("Wi-Fi", &wifi_page);
+	/* the switch on its own card ... */
 	c = m3_card(body, M.primary_c);
-	wifi_state_lbl = m3_label(c, "...", &lv_font_montserrat_16, M.on_primary_c);
+	lv_obj_set_height(c, 64);
+	lv_obj_align(m3_label(c, "Use Wi-Fi", &lv_font_montserrat_16, M.on_primary_c),
+		     LV_ALIGN_LEFT_MID, 0, 0);
+	if (have_tool("n72-wifi")) {
+		wifi_switch = lv_switch_create(c);
+		lv_obj_align(wifi_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+		lv_obj_add_event_cb(wifi_switch, wifi_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+		switch_show(wifi_switch, wifi_shown_on());
+	}
+	/* ... and the connection below it */
+	c = m3_card(body, M.surface_c);
+	lv_obj_set_height(c, LV_SIZE_CONTENT);
+	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_pad_row(c, 2, 0);
+	m3_label(c, "Connection", &lv_font_montserrat_14, M.on_surface_v);
+	wifi_state_lbl = m3_label(c, "...", &lv_font_montserrat_16, M.on_surface);
 	lv_obj_set_width(wifi_state_lbl, lv_pct(100));
 	lv_label_set_long_mode(wifi_state_lbl, LV_LABEL_LONG_WRAP);
 
@@ -4528,14 +4704,7 @@ static void bt_devs_done(const char *out, void *ud)
 static void bt_show_page_done(const char *out, void *ud)
 {
 	bt_show_done(out, ud);
-	if (!bt_switch || !lv_obj_is_valid(bt_switch))
-		return;
-	if (bt_powered)
-		lv_obj_add_state(bt_switch, LV_STATE_CHECKED);
-	else
-		lv_obj_remove_state(bt_switch, LV_STATE_CHECKED);
-	if (bt_state_lbl)
-		label_set_if_changed(bt_state_lbl, bt_powered ? "On" : "Off");
+	net_ui_sync();
 }
 
 static void bt_page_refresh(void)
@@ -4561,16 +4730,39 @@ static void bt_page_refresh(void)
 			"until bluetoothctl show 2>/dev/null | grep -q Powered || [ $n -ge 20 ]; " \
 			"do sleep 0.5; n=$((n+1)); done; bluetoothctl power on"
 
+/* the switch is done when BlueZ says so: its answer ends the switch */
+static void bt_set_shown(const char *out, void *ud)
+{
+	bt_show_done(out, ud);
+	bt_want = -1;
+	net_ui_sync();
+	bt_page_refresh();
+}
+
+static void bt_set_done(const char *out, void *ud)
+{
+	LV_UNUSED(out);
+	LV_UNUSED(ud);
+	job_run("bluetoothctl show", NULL, bt_set_shown, NULL);
+}
+
+/* Bluetooth on or off from any switch; a second one waits for the first. */
 static void bt_set(bool on)
 {
-	job_run(on ? BT_ON_CMD : BT_OFF_CMD, NULL, qs_refresh_done, NULL);
+	if (bt_want >= 0) {
+		net_ui_sync();
+		return;
+	}
+	if (on == bt_powered)
+		return;
+	bt_want = on;
+	net_ui_sync();
+	job_run(on ? BT_ON_CMD : BT_OFF_CMD, NULL, bt_set_done, NULL);
 }
 
 static void bt_switch_cb(lv_event_t *e)
 {
-	bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-
-	job_run(on ? BT_ON_CMD : BT_OFF_CMD, bt_page, bt_cmd_done, NULL);
+	bt_set(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
 static void bt_scan_cb(lv_event_t *e)
@@ -4602,6 +4794,7 @@ static void open_bt(lv_event_t *e)
 	bt_switch = lv_switch_create(c);
 	lv_obj_align(bt_switch, LV_ALIGN_RIGHT_MID, 0, 0);
 	lv_obj_add_event_cb(bt_switch, bt_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	net_ui_sync();
 
 	m3_section(body, "Devices");
 	bt_list = lv_obj_create(body);
@@ -4667,6 +4860,12 @@ static void idle_cb(lv_event_t *e)
 	}
 }
 
+static void plug_cb(lv_event_t *e)
+{
+	conf.wake_plug = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+	conf_save();
+}
+
 static void open_display(lv_event_t *e)
 {
 	static const char *const theme_map[] = { "Dark", "Light", "" };
@@ -4705,6 +4904,9 @@ static void open_display(lv_event_t *e)
 	lv_obj_set_style_bg_color(bm, M.secondary_c, LV_PART_ITEMS | LV_STATE_CHECKED);
 	lv_obj_set_style_text_color(bm, M.on_surface, LV_PART_ITEMS);
 	lv_obj_set_style_text_color(bm, M.on_secondary_c, LV_PART_ITEMS | LV_STATE_CHECKED);
+	/* the default theme gives the buttons a shadow (a halo on light) */
+	lv_obj_set_style_shadow_width(bm, 0, LV_PART_ITEMS);
+	lv_obj_set_style_outline_width(bm, 0, LV_PART_ITEMS);
 	lv_obj_add_event_cb(bm, theme_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
 	m3_section(body, "Colour");
@@ -4720,7 +4922,7 @@ static void open_display(lv_event_t *e)
 		lv_obj_t *dot = lv_obj_create(row);
 
 		plain(dot);
-		lv_obj_set_size(dot, 42, 42);
+		lv_obj_set_size(dot, 40, 40);	/* six in the page's width, gaps between */
 		lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
 		lv_obj_set_style_bg_color(dot, tone(accents[i].hue, accents[i].sat, conf.dark ? 70 : 45), 0);
 		lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
@@ -4744,7 +4946,22 @@ static void open_display(lv_event_t *e)
 	lv_obj_align(dd, LV_ALIGN_TOP_LEFT, 0, 26);
 	lv_obj_set_height(c, 100);
 	lv_obj_add_event_cb(dd, idle_cb, LV_EVENT_VALUE_CHANGED, NULL);
-	m3_note(body, "On battery the iPod sleeps after the timeout; on USB power only the screen turns off.");
+	m3_note(body, "The screen locks when it turns off. On battery the iPod sleeps after the "
+		"timeout; on USB power only the screen turns off.");
+
+	c = m3_card(body, M.surface_c);
+	lv_obj_set_height(c, LV_SIZE_CONTENT);
+	lv_obj_set_style_min_height(c, 64, 0);
+	s = m3_label(c, "Wake when the cable is plugged in or out", &lv_font_montserrat_14,
+		     M.on_surface);
+	lv_obj_set_width(s, lv_pct(72));
+	lv_label_set_long_mode(s, LV_LABEL_LONG_WRAP);
+	lv_obj_align(s, LV_ALIGN_LEFT_MID, 0, 0);
+	s = lv_switch_create(c);
+	lv_obj_align(s, LV_ALIGN_RIGHT_MID, 0, 0);
+	if (conf.wake_plug)
+		lv_obj_add_state(s, LV_STATE_CHECKED);
+	lv_obj_add_event_cb(s, plug_cb, LV_EVENT_VALUE_CHANGED, NULL);
 	push(scr);
 }
 
@@ -4978,7 +5195,7 @@ static void vol_hud_show(void)
 	if (!vol_hud) {
 		vol_hud = lv_obj_create(lv_layer_top());
 		plain(vol_hud);
-		lv_obj_set_size(vol_hud, W - 24, 56);
+		lv_obj_set_size(vol_hud, W - 2 * STATUS_PAD, 56);
 		lv_obj_align(vol_hud, LV_ALIGN_TOP_MID, 0, 36);
 		lv_obj_set_style_radius(vol_hud, LV_RADIUS_CIRCLE, 0);
 		lv_obj_set_style_bg_color(vol_hud, M.surface_c_highest, 0);
@@ -5368,7 +5585,7 @@ static lv_point_t paint_last;
 static bool paint_down;
 static uint32_t paint_hue;
 
-#define PAINT_W (W - 24)
+#define PAINT_W (W - 2 * STATUS_PAD)
 #define PAINT_H (H - 56 - 16)
 
 static void paint_clear(void)
