@@ -59,14 +59,18 @@ static struct {
 	int vol;		/* sound volume, 0..100 % (0 = mute) */
 	bool spk;		/* speaker when no earphones are plugged */
 	bool wake_plug;		/* the screen comes on when the cable goes in or out */
-	int autorot;		/* the screen's turn (quick settings): ROT_* */
+	int autorot;		/* Auto-rotate (quick settings): ROT_AUTO or ROT_LOCKED */
+	int rotlock;		/* with it off: the turn it was left in, 0, 90 or 270 */
 	int bright;		/* brightness %, 0 = as it is */
 	int wifi, bt;		/* left on (1) or off (0); -1 not set */
-} conf = { true, 0, 120, 60, true, true, 0, 0, -1, -1 };
+} conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1 };
 
-#define ROT_PORTRAIT	0	/* upright, always */
-#define ROT_AUTO	1	/* with the iPod */
-#define ROT_LANDSCAPE	2	/* sideways, always (the side it was last held) */
+/*
+ * Auto-rotate on: the screen turns with the iPod. Off: it stays as it was
+ * held when turned off (rotlock), and the accelerometer powers down.
+ */
+#define ROT_LOCKED	0
+#define ROT_AUTO	1
 
 static const struct { const char *name; uint16_t hue; uint8_t sat; } accents[] = {
 	{ "Violet", 265, 48 }, { "Blue", 215, 60 }, { "Teal", 178, 55 },
@@ -102,8 +106,12 @@ static void conf_load(void)
 			conf.spk = v;
 		else if (sscanf(line, "plug=%d", &v) == 1)
 			conf.wake_plug = v;
-		else if (sscanf(line, "rot=%d", &v) == 1 && v >= 0 && v <= 2)
-			conf.autorot = v;
+		else if (sscanf(line, "rot=%d", &v) == 1 && v >= 0 && v <= 2) {
+			conf.autorot = v == ROT_AUTO;
+			if (v == 2)		/* (the old landscape lock) */
+				conf.rotlock = 90;
+		} else if (sscanf(line, "rotlock=%d", &v) == 1 && (v == 0 || v == 90 || v == 270))
+			conf.rotlock = v;
 		else if (sscanf(line, "bright=%d", &v) == 1 && v >= 5 && v <= 100)
 			conf.bright = v;
 		else if (sscanf(line, "wifi=%d", &v) == 1)
@@ -122,9 +130,9 @@ static void conf_save(void)
 	f = fopen(CONF_PATH ".new", "w");
 	if (!f)
 		return;
-	fprintf(f, "dark=%d\naccent=%d\nidle=%d\nvol=%d\nspk=%d\nplug=%d\nrot=%d\n"
+	fprintf(f, "dark=%d\naccent=%d\nidle=%d\nvol=%d\nspk=%d\nplug=%d\nrot=%d\nrotlock=%d\n"
 		"bright=%d\nwifi=%d\nbt=%d\n", conf.dark, conf.accent, conf.idle_s, conf.vol,
-		conf.spk, conf.wake_plug, conf.autorot, conf.bright, conf.wifi, conf.bt);
+		conf.spk, conf.wake_plug, conf.autorot, conf.rotlock, conf.bright, conf.wifi, conf.bt);
 	if (fflush(f) == 0)
 		fsync(fileno(f));
 	fclose(f);
@@ -2554,23 +2562,25 @@ static void qs_settings_cb(lv_event_t *e)
 static lv_obj_t *qs_rot, *qs_rot_sub;
 static void rot_conf_changed(void);
 
-/* The Rotation tile: Auto, Landscape (locked) or Portrait (locked). */
+static int ui_rot;			/* the screen's turn now */
+
+/* The Auto-rotate tile: lit while on; below, the way the screen is now. */
 static void qs_rot_sync(void)
 {
 	if (!qs_rot)
 		return;
-	qs_style(qs_rot, conf.autorot != ROT_PORTRAIT);
-	label_set_if_changed(qs_rot_sub, conf.autorot == ROT_AUTO ? "Auto" :
-			     conf.autorot == ROT_LANDSCAPE ? "Landscape" : "Portrait");
+	qs_style(qs_rot, conf.autorot == ROT_AUTO);
+	label_set_if_changed(qs_rot_sub, ui_rot ? "Landscape" : "Portrait");
 	shade_changed(qs_rot);
 }
 
-/* A tap: Auto -> Landscape -> Portrait -> Auto. */
+/* A tap: on, or off held the way it is now. */
 static void qs_rot_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
-	conf.autorot = conf.autorot == ROT_AUTO ? ROT_LANDSCAPE :
-		       conf.autorot == ROT_LANDSCAPE ? ROT_PORTRAIT : ROT_AUTO;
+	conf.autorot = conf.autorot == ROT_AUTO ? ROT_LOCKED : ROT_AUTO;
+	if (conf.autorot == ROT_LOCKED)
+		conf.rotlock = ui_rot;
 	conf_save();
 	qs_rot_sync();
 	rot_conf_changed();
@@ -2643,7 +2653,7 @@ static void build_shade(void)
 		lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 		qs_wifi = qs_tile(row, LV_SYMBOL_WIFI, "Wi-Fi", &qs_wifi_sub, qs_open_wifi);
 		qs_bt = qs_tile(row, LV_SYMBOL_BLUETOOTH, "Bluetooth", &qs_bt_sub, qs_open_bt);
-		qs_rot = qs_tile(row, LV_SYMBOL_REFRESH, "Rotation", &qs_rot_sub, qs_rot_cb);
+		qs_rot = qs_tile(row, LV_SYMBOL_REFRESH, "Auto-rotate", &qs_rot_sub, qs_rot_cb);
 		qs_rot_sync();
 		/* the slider 12 below; the handle 52 below it */
 		shade_h = 128 + th + 12 + 56 + 52;
@@ -7253,7 +7263,6 @@ static bool rot_ev;			/* the kernel has the motion wake */
 static bool rot_on;			/* we asked it to watch (the chip kept on) */
 static uint32_t rot_move_ms;		/* the last move: an event or a new reading */
 
-static int ui_rot;			/* the screen's turn now */
 static int rot_seen = -1;		/* the way the iPod is held, -1 unknown */
 static int rot_side = 90;		/* the sideways it was last held: 90 or 270 */
 static uint32_t rot_seen_ms;
@@ -7704,10 +7713,8 @@ static int rot_wanted(void)
 		if (video_rot >= 0)	/* the controls' turn button holds it */
 			return video_rot ? rot_side : 0;
 	}
-	if (conf.autorot == ROT_PORTRAIT)
-		return 0;
-	if (conf.autorot == ROT_LANDSCAPE)
-		return rot_side;	/* (the side it was last held: locked, not read) */
+	if (conf.autorot == ROT_LOCKED)
+		return conf.rotlock;	/* (as it was held when Auto-rotate went off) */
 	return rot_seen >= 0 ? rot_seen : ui_rot;
 }
 
@@ -7785,8 +7792,7 @@ static void rot_pos_ev(int fd)
 
 static void rot_poll(lv_timer_t *t)
 {
-	/* the accelerometer only for Auto-rotate and a video: a lock, portrait
-	 * or landscape (the side it was last held), lets it power down */
+	/* the accelerometer only for Auto-rotate and a video: off, it powers down */
 	bool reads = conf.autorot == ROT_AUTO || (app_pid > 0 && app_is_video());
 	bool need = !screen_off && !locked && (reads || rot_wanted() != ui_rot);
 	int r, want;
@@ -7833,7 +7839,7 @@ static void rot_poll(lv_timer_t *t)
 
 static void rot_conf_changed(void)
 {
-	rot_seen = conf.autorot != ROT_PORTRAIT ? rot_read() : -1;
+	rot_seen = conf.autorot == ROT_AUTO ? rot_read() : -1;
 	if (rot_seen > 0)
 		rot_side = rot_seen;
 	rot_seen_ms = 0;
@@ -7851,7 +7857,7 @@ static void rot_init(void)
 		rot_motion(false);
 	}
 	rot_timer = awake_timer(rot_poll, 200, NULL);	/* (dark: no accelerometer reads) */
-	if (conf.autorot != ROT_PORTRAIT)
+	if (conf.autorot == ROT_AUTO)
 		rot_seen = rot_read();
 	if (rot_seen > 0)
 		rot_side = rot_seen;
