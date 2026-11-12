@@ -7707,7 +7707,7 @@ static int rot_wanted(void)
 	if (conf.autorot == ROT_PORTRAIT)
 		return 0;
 	if (conf.autorot == ROT_LANDSCAPE)
-		return rot_side;	/* (the side it is held, or was last) */
+		return rot_side;	/* (the side it was last held: locked, not read) */
 	return rot_seen >= 0 ? rot_seen : ui_rot;
 }
 
@@ -7785,8 +7785,10 @@ static void rot_pos_ev(int fd)
 
 static void rot_poll(lv_timer_t *t)
 {
-	bool reads = conf.autorot != ROT_PORTRAIT || (app_pid > 0 && app_is_video());
-	bool need = !screen_off && !locked && (reads || ui_rot != 0);
+	/* the accelerometer only for Auto-rotate and a video: a lock, portrait
+	 * or landscape (the side it was last held), lets it power down */
+	bool reads = conf.autorot == ROT_AUTO || (app_pid > 0 && app_is_video());
+	bool need = !screen_off && !locked && (reads || rot_wanted() != ui_rot);
 	int r, want;
 
 	if (!rot_ev) {
@@ -7844,6 +7846,9 @@ static void rot_init(void)
 	if (rot_pos_fd >= 0 && access(ROT_MOTION, W_OK) == 0) {
 		rot_ev = true;
 		ui_watch_ev(rot_pos_fd, rot_pos_ev, POLLPRI);
+		/* a UI before this one (restarted, or crashed) may have left the
+		 * chip watching, and kept on: from nothing */
+		rot_motion(false);
 	}
 	rot_timer = awake_timer(rot_poll, 200, NULL);	/* (dark: no accelerometer reads) */
 	if (conf.autorot != ROT_PORTRAIT)
