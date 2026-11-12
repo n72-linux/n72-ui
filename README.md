@@ -16,11 +16,26 @@ A touch launcher for Linux on the iPod touch 2G (N72AP), built on
 | --- | --- | --- |
 | Quick settings follow the finger on home (open / close) | pictures of home and the shade moved by the GPU; home and scrim drawn only below the shade | 53-61 |
 | ... over an application | the shade's picture moved by the CPU (alpha); the dim is added once it settles | 61-69 |
-| App opens: a card in the tile's colour grows from the icon | home picture + rounded GPU fill | 55-57 |
-| ... then fades to show the application | CPU, alpha | ~50 |
-| App closes (Home or its own exit): card fades in, shrinks into the icon | CPU fade, then GPU | ~50 / 56 |
+| App opens: a card in the tile's colour grows from the icon, then clears to show the application | home picture + rounded GPU fill; then one translucent GPU fill | 57-58 |
+| App closes (Home or its own exit): the card comes up, goes into the icon | one translucent GPU fill; then home picture + rounded GPU fill | 58-61 |
+| A page from its tile (Settings, Paint): the same card, over pictures of the page and of home | as above; the page is built once the card covers the screen (one frame of ~65 ms) | 56 open, 59 close |
 | Lock screen swipe up (home or over an application) | the lock screen's picture follows the finger, a scrim fades | ~63 |
 
+- The card moves like a spring, not along a timed curve (`za_path_spring`,
+  `za_path_glide` in `ui_m3.c`). Opening: critically damped, 380 ms, from
+  rest, fastest after ~55 ms, 90 % of the way by ~210 ms, then a soft
+  landing; the symbol dissolves on the way, the corners (20 px at the icon,
+  26 px half way) square off towards the screen's, and the card clears in
+  180 ms as soon as it has landed (no hold; the application has as long to
+  start as before). Closing is shorter: the card comes up in 100 ms and
+  goes in 280 ms, starting gently (no speed in the first frame, fastest
+  after ~60 ms), and melts into home's icon at the end. A frame costs what
+  it did: the same picture and fill, smaller corners, the symbol for less
+  of the way.
+- These rates need the display's vblank: when a burst in the `N72_FPS` log
+  shows `vblank wait` near 48 ms a frame, the kernel's frame interrupt is
+  not coming and every flip waits for its 20 Hz fallback beat (~22 fps,
+  whatever is drawn).
 - The touch router (`main.c`) offers each launcher touch to `ui_drag()`; a
   vertical drag past 12 px where the shade (or the lock screen) can move is
   taken from LVGL, which loses the press without a click. The release

@@ -3374,19 +3374,43 @@ static bool ui_drag(int phase, int x, int y)
 /*
  * Opening and closing animations. A card in the tile's colour, with its
  * symbol, grows from the icon to the whole screen over a picture of home
- * (GPU: the picture, a rounded fill), stays while the application starts
- * below, and fades to show it. Closing runs it backwards: the card fades
- * in over the application, then shrinks into its icon over home, and
- * home's icon shows through as it ends. Fades are drawn with alpha by the
- * CPU (the launcher's transparent mode); the moves are XRGB, on the GPU.
+ * (GPU: the picture, a rounded fill) while the application starts below,
+ * and clears to show it. Closing runs it backwards: the card comes up over
+ * the application, then goes into its icon over home, and home's icon
+ * shows through as it ends. The card over the application is drawn in the
+ * launcher's transparent mode (one GPU fill a frame); the moves are XRGB,
+ * on the GPU.
+ *
+ * The motion is a spring's, not a timed curve's (za_path_spring,
+ * za_path_glide):
+ * - Opening, the card is pulled to the screen by a critically damped
+ *   spring: from rest, fastest after ~55 ms, 90 % of the way by ~210 ms,
+ *   then a long soft landing. On the way its symbol dissolves (a glyph of
+ *   fixed size on a growing card looks stiff) and its corners, a little
+ *   rounder at first, square off as they near the screen's. It clears as
+ *   soon as it has landed, fast first: the landing is the pause, there is
+ *   no hold. (The application gets as long as before to start: the grow
+ *   is longer by the hold that went.)
+ * - Closing is shorter, as leaving should be. The card comes up at an
+ *   even rate and leaves gently (a spring following a smoothed pull: no
+ *   speed in the first frame, fastest after ~60 ms), its symbol back on
+ *   the way; near the icon it melts into home's.
+ * Nothing is drawn that was not before: a frame of a move is home's
+ * picture, one rounded fill (its corners never larger than they were) and
+ * the symbol, for less of the way.
  */
-#define ZA_GROW_MS	330
-#define ZA_HOLD_MS	60
-#define ZA_FADE_MS	170
-#define ZA_SHRINK_MS	320
+#define ZA_GROW_MS	380	/* spring, ZA_SPRING_K time constants long */
+#define ZA_REVEAL_MS	180	/* the card clears: the application, the page */
+#define ZA_COVER_MS	100	/* the card comes up over it */
+#define ZA_SHRINK_MS	280	/* glide, ZA_GLIDE_K time constants long */
+#define ZA_SPRING_K	7.0f
+#define ZA_GLIDE_K	9.0f
+#define ZA_SYM_FROM	384	/* the symbol dissolves between these (of 1024) */
+#define ZA_SYM_TO	896
+#define ZA_MELT		160	/* closing: the card melts into the icon below this */
 
 static struct {
-	int phase;		/* 0 idle, 1 grow, 2 hold, 3 fade out, 4 fade in, 5 shrink */
+	int phase;		/* 0 idle, 1 grow, 3 clear, 4 cover, 5 shrink; a page's: 6 clear, 7 cover */
 	lv_obj_t *scr, *bg, *card, *sym;
 	lv_draw_buf_t *home;	/* home, as it was at the launch */
 	long home_min;
@@ -3428,6 +3452,41 @@ static void za_fill_layer0(lv_color_t c)
 	close(fd);
 }
 
+/*
+ * The paths. Both are the step response of a damped spring, cut where it
+ * has all but arrived (@k time constants) and scaled to end on the value:
+ * time runs on the animation's clock, so a late frame shows where the
+ * card is by then, not the next step.
+ */
+static int32_t za_path(const lv_anim_t *a, float k, bool glide)
+{
+	float x, fx, fk;
+
+	if (a->act_time <= 0)
+		return a->start_value;
+	if (a->act_time >= a->duration)
+		return a->end_value;
+	x = k * (float)a->act_time / (float)a->duration;
+	if (glide) {	/* the pull itself comes on smoothly: no speed, no force at 0 */
+		fx = 1.0f - (1.0f + x + 0.5f * x * x) * expf(-x);
+		fk = 1.0f - (1.0f + k + 0.5f * k * k) * expf(-k);
+	} else {	/* critically damped: no speed at 0, no overshoot */
+		fx = 1.0f - (1.0f + x) * expf(-x);
+		fk = 1.0f - (1.0f + k) * expf(-k);
+	}
+	return a->start_value + (int32_t)lroundf((float)(a->end_value - a->start_value) * fx / fk);
+}
+
+static int32_t za_path_spring(const lv_anim_t *a)
+{
+	return za_path(a, ZA_SPRING_K, false);
+}
+
+static int32_t za_path_glide(const lv_anim_t *a)
+{
+	return za_path(a, ZA_GLIDE_K, true);
+}
+
 static void za_rect(int32_t v)	/* 0 = the icon, 1024 = the screen */
 {
 	int32_t x1 = za.icon.x1 + (0 - za.icon.x1) * v / 1024;
@@ -3437,7 +3496,18 @@ static void za_rect(int32_t v)	/* 0 = the icon, 1024 = the screen */
 
 	lv_obj_set_pos(za.card, x1, y1);
 	lv_obj_set_size(za.card, x2 - x1 + 1, y2 - y1 + 1);
-	lv_obj_set_style_radius(za.card, 20 + (28 - 20) * v / 1024, 0);
+	/* the icon's 20, a card's 26 half way, the screen's square corners */
+	lv_obj_set_style_radius(za.card, v < 512 ? 20 + 6 * v / 512 : 26 * (1024 - v) / 512, 0);
+}
+
+/* The symbol's opacity on a card @v of the way: gone well before the screen. */
+static lv_opa_t za_sym_opa(int32_t v)
+{
+	if (v <= ZA_SYM_FROM)
+		return LV_OPA_COVER;
+	if (v >= ZA_SYM_TO)
+		return LV_OPA_TRANSP;
+	return (lv_opa_t)(255 * (ZA_SYM_TO - v) / (ZA_SYM_TO - ZA_SYM_FROM));
 }
 
 /*
@@ -3446,31 +3516,35 @@ static void za_rect(int32_t v)	/* 0 = the icon, 1024 = the screen */
  * all on the CPU in the launcher's transparent mode; a plain translucent
  * fill is one GPU fill (mbx_gpu.c, mbx_fill_straight).
  */
-static void za_card_opa(lv_opa_t o)
+static void za_look(lv_opa_t card, lv_opa_t sym)
 {
-	if (lv_obj_get_style_bg_opa(za.card, 0) == o)
-		return;
-	lv_obj_set_style_bg_opa(za.card, o, 0);
-	lv_obj_set_style_text_opa(za.sym, o, 0);
+	if (lv_obj_get_style_bg_opa(za.card, 0) != card)
+		lv_obj_set_style_bg_opa(za.card, card, 0);
+	if (lv_obj_get_style_text_opa(za.sym, 0) != sym)
+		lv_obj_set_style_text_opa(za.sym, sym, 0);
 }
 
 static void za_exec(void *var, int32_t v)
 {
+	lv_opa_t o;
+
 	LV_UNUSED(var);
 	switch (za.phase) {
 	case 1:
 		za_rect(v);
+		za_look(LV_OPA_COVER, za_sym_opa(v));
 		break;
 	case 5:
 		za_rect(v);
-		/* home's icon shows through in the last third */
-		za_card_opa(v > 340 ? LV_OPA_COVER : (lv_opa_t)(255 * v / 340));
+		/* home's icon shows through as the card settles on it */
+		o = v >= ZA_MELT ? LV_OPA_COVER : (lv_opa_t)(255 * v / ZA_MELT);
+		za_look(o, LV_MIN(o, za_sym_opa(v)));
 		break;
 	case 3:
 	case 4:
 	case 6:
 	case 7:
-		za_card_opa((lv_opa_t)v);
+		za_look((lv_opa_t)v, LV_OPA_TRANSP);	/* (the symbol went on the way) */
 		break;
 	}
 }
@@ -3524,9 +3598,11 @@ static void za_build(void)
 	lv_obj_set_style_bg_color(za.card, za.col, 0);
 	lv_obj_set_style_bg_opa(za.card, LV_OPA_COVER, 0);
 	lv_obj_set_style_pad_all(za.card, 0, 0);
+	/* the badge's own symbol: the card starts, and ends, as the icon */
 	l = lv_obj_get_child(badge, 0);
-	za.sym = m3_label(za.card, l ? lv_label_get_text(l) : "", &lv_font_montserrat_28,
-			  lv_color_white());
+	za.sym = m3_label(za.card, l ? lv_label_get_text(l) : "",
+			  l ? lv_obj_get_style_text_font(l, 0) : &lv_font_montserrat_24,
+			  l ? lv_obj_get_style_text_color(l, 0) : lv_color_white());
 	lv_obj_center(za.sym);
 }
 
@@ -3569,8 +3645,7 @@ static void za_next(void)
 				return;
 			}
 			lv_image_set_src(za.bg, za.page_pic);
-			lv_obj_set_style_radius(za.card, 0, 0);
-			za_run(6, LV_OPA_COVER, LV_OPA_TRANSP, ZA_FADE_MS, lv_anim_path_ease_in);
+			za_run(6, LV_OPA_COVER, LV_OPA_TRANSP, ZA_REVEAL_MS, lv_anim_path_ease_out);
 			return;
 		case 6:
 			za.phase = 0;
@@ -3582,7 +3657,7 @@ static void za_next(void)
 		case 7:		/* covered: into the icon over home */
 			za_home_fresh();
 			lv_image_set_src(za.bg, za.home);
-			za_run(5, 1024, 0, ZA_SHRINK_MS, lv_anim_path_ease_out);
+			za_run(5, 1024, 0, ZA_SHRINK_MS, za_path_glide);
 			return;
 		case 5:
 			za.phase = 0;
@@ -3597,16 +3672,12 @@ static void za_next(void)
 		}
 	}
 	switch (za.phase) {
-	case 1:			/* grown: hold while the application starts */
+	case 1:			/* grown: the card clears, the application shows */
 		lv_obj_add_flag(za.bg, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_set_style_radius(za.card, 0, 0);
-		za_run(2, 0, 1, ZA_HOLD_MS, lv_anim_path_linear);
-		break;
-	case 2:			/* fade the card: the application shows */
 		/* the card alone: one GPU fill a frame (mbx_fill_straight) */
 		lv_obj_add_flag(za.sym, LV_OBJ_FLAG_HIDDEN);
 		mbx_gpu_set_transparent(true);
-		za_run(3, LV_OPA_COVER, LV_OPA_TRANSP, ZA_FADE_MS, lv_anim_path_ease_in);
+		za_run(3, LV_OPA_COVER, LV_OPA_TRANSP, ZA_REVEAL_MS, lv_anim_path_ease_out);
 		break;
 	case 3:
 		za.phase = 0;
@@ -3621,7 +3692,7 @@ static void za_next(void)
 		za_home_fresh();
 		lv_image_set_src(za.bg, za.home);
 		lv_obj_remove_flag(za.bg, LV_OBJ_FLAG_HIDDEN);
-		za_run(5, 1024, 0, ZA_SHRINK_MS, lv_anim_path_ease_out);
+		za_run(5, 1024, 0, ZA_SHRINK_MS, za_path_glide);
 		break;
 	case 5:
 		za.phase = 0;
@@ -3683,7 +3754,7 @@ static void page_open_from(lv_obj_t *tile, void (*open)(lv_event_t *))
 	za.page = true;
 	za_build();
 	lv_screen_load(za.scr);
-	za_run(1, 0, 1024, ZA_GROW_MS, lv_anim_path_ease_out);
+	za_run(1, 0, 1024, ZA_GROW_MS, za_path_spring);
 }
 
 static void page_launch_cb(lv_event_t *e)
@@ -3724,9 +3795,8 @@ static bool za_page_close(void)
 	za_build();
 	lv_image_set_src(za.bg, za.page_pic);
 	za_rect(1024);
-	lv_obj_set_style_radius(za.card, 0, 0);
 	lv_screen_load(za.scr);
-	za_run(7, LV_OPA_TRANSP, LV_OPA_COVER, ZA_FADE_MS, lv_anim_path_ease_out);
+	za_run(7, LV_OPA_TRANSP, LV_OPA_COVER, ZA_COVER_MS, lv_anim_path_linear);
 	return true;
 }
 
@@ -3935,9 +4005,8 @@ static void za_close(void)
 	lv_obj_add_flag(za.bg, LV_OBJ_FLAG_HIDDEN);
 	lv_obj_add_flag(za.sym, LV_OBJ_FLAG_HIDDEN);	/* (see case 2) */
 	za_rect(1024);
-	lv_obj_set_style_radius(za.card, 0, 0);
 	lv_screen_load(za.scr);
-	za_run(4, LV_OPA_TRANSP, LV_OPA_COVER, ZA_FADE_MS, lv_anim_path_ease_out);
+	za_run(4, LV_OPA_TRANSP, LV_OPA_COVER, ZA_COVER_MS, lv_anim_path_linear);
 }
 
 /* The application has gone (reaped). */
@@ -4112,7 +4181,7 @@ static void app_launch_cb(lv_event_t *e)
 
 	za_build();
 	lv_screen_load(za.scr);
-	za_run(1, 0, 1024, ZA_GROW_MS, lv_anim_path_ease_out);
+	za_run(1, 0, 1024, ZA_GROW_MS, za_path_spring);
 }
 
 /* One tile for every manifest in APPS_DIR. */
