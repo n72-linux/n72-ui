@@ -1721,6 +1721,7 @@ int main(int argc, char **argv)
 	rot_init();
 	drags_init();
 	sound_ui_init();
+	ui_apply_saved();	/* brightness, Wi-Fi and Bluetooth as left */
 	ui_reopen();		/* a page asked for at start (after a theme change) */
 	crash_handlers();
 	signal(SIGUSR1, on_usr1);

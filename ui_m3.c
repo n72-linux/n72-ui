@@ -23,6 +23,7 @@
 #include "lvgl/src/core/lv_global.h"
 #include <sys/wait.h>
 #include <sys/un.h>
+#include <sys/statvfs.h>
 
 extern char **environ;
 
@@ -41,7 +42,10 @@ static void vc_stop(void);
 
 /* ------------------------------------------------------------ settings */
 
-#define CONF_PATH "/tmp/n72-ui.conf"
+/* on the flash, so that a reboot keeps them (/tmp: the old place, read once) */
+#define CONF_DIR "/var/lib/n72"
+#define CONF_PATH CONF_DIR "/ui.conf"
+#define CONF_OLD "/tmp/n72-ui.conf"
 
 /* layout: every screen's side margin (status bar, pages, shade, home) */
 #define STATUS_PAD	16
@@ -55,7 +59,9 @@ static struct {
 	bool spk;		/* speaker when no earphones are plugged */
 	bool wake_plug;		/* the screen comes on when the cable goes in or out */
 	int autorot;		/* the screen's turn (quick settings): ROT_* */
-} conf = { true, 0, 120, 60, true, true, false };
+	int bright;		/* brightness %, 0 = as it is */
+	int wifi, bt;		/* left on (1) or off (0); -1 not set */
+} conf = { true, 0, 120, 60, true, true, 0, 0, -1, -1 };
 
 #define ROT_PORTRAIT	0	/* upright, always */
 #define ROT_AUTO	1	/* with the iPod */
@@ -72,6 +78,9 @@ static void conf_load(void)
 	char line[64];
 	FILE *f = fopen(CONF_PATH, "r");
 	const char *e = getenv("N72_IDLE_SLEEP");
+
+	if (!f)
+		f = fopen(CONF_OLD, "r");
 
 	if (e)
 		conf.idle_s = atoi(e);
@@ -94,19 +103,51 @@ static void conf_load(void)
 			conf.wake_plug = v;
 		else if (sscanf(line, "rot=%d", &v) == 1 && v >= 0 && v <= 2)
 			conf.autorot = v;
+		else if (sscanf(line, "bright=%d", &v) == 1 && v >= 5 && v <= 100)
+			conf.bright = v;
+		else if (sscanf(line, "wifi=%d", &v) == 1)
+			conf.wifi = !!v;
+		else if (sscanf(line, "bt=%d", &v) == 1)
+			conf.bt = !!v;
 	}
 	fclose(f);
 }
 
 static void conf_save(void)
 {
-	FILE *f = fopen(CONF_PATH, "w");
+	FILE *f;
 
+	mkdir(CONF_DIR, 0755);
+	f = fopen(CONF_PATH ".new", "w");
 	if (!f)
 		return;
-	fprintf(f, "dark=%d\naccent=%d\nidle=%d\nvol=%d\nspk=%d\nplug=%d\nrot=%d\n", conf.dark,
-		conf.accent, conf.idle_s, conf.vol, conf.spk, conf.wake_plug, conf.autorot);
+	fprintf(f, "dark=%d\naccent=%d\nidle=%d\nvol=%d\nspk=%d\nplug=%d\nrot=%d\n"
+		"bright=%d\nwifi=%d\nbt=%d\n", conf.dark, conf.accent, conf.idle_s, conf.vol,
+		conf.spk, conf.wake_plug, conf.autorot, conf.bright, conf.wifi, conf.bt);
+	if (fflush(f) == 0)
+		fsync(fileno(f));
 	fclose(f);
+	rename(CONF_PATH ".new", CONF_PATH);	/* (whole or not at all) */
+}
+
+/* A setting that moves a lot (the brightness slider): saved once it rests. */
+static lv_timer_t *conf_save_timer;
+
+static void conf_save_cb(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	conf_save_timer = NULL;
+	conf_save();
+}
+
+static void conf_save_later(void)
+{
+	if (conf_save_timer)
+		lv_timer_reset(conf_save_timer);
+	else {
+		conf_save_timer = lv_timer_create(conf_save_cb, 2000, NULL);
+		lv_timer_set_repeat_count(conf_save_timer, 1);
+	}
 }
 
 /* --------------------------------------------------- Material You theme */
@@ -2309,6 +2350,8 @@ static void home_wake(void)
 static void home_bright_cb(lv_event_t *e)
 {
 	backlight_set(lv_slider_get_value(lv_event_get_target(e)));
+	conf.bright = lv_slider_get_value(lv_event_get_target(e));
+	conf_save_later();
 	shade_changed(home_bright);
 }
 
@@ -2426,6 +2469,10 @@ static void wifi_set(bool on)
 	if (wifi_want >= 0 || !have_tool("n72-wifi")) {
 		net_ui_sync();		/* (puts a switch that moved back) */
 		return;
+	}
+	if (conf.wifi != on) {
+		conf.wifi = on;
+		conf_save();
 	}
 	if (on == wifi_powered())
 		return;
@@ -5299,6 +5346,55 @@ static void bt_cmd_done(const char *out, void *ud)
 struct bt_dev { char mac[18]; char name[64]; bool paired, connected; };
 static struct bt_dev bdevs[16];
 static int n_bdevs;
+static char bt_list_sig[16 * 24];	/* what the list shows: rebuilt only on a change */
+
+/*
+ * Connect automatically (a device's page): the paired devices the iPod
+ * reaches for itself (bt_auto_tick), on unless turned off. Kept on the
+ * flash: /var/lib/n72/bt-auto, a line "MAC off" for each one turned off.
+ */
+#define BT_AUTO_PATH "/var/lib/n72/bt-auto"
+
+static bool bt_auto_get(const char *mac)
+{
+	char line[64];
+	bool on = true;
+	FILE *f = fopen(BT_AUTO_PATH, "r");
+
+	while (f && fgets(line, sizeof(line), f))
+		if (!strncasecmp(line, mac, 17) && strstr(line, " off"))
+			on = false;
+	if (f)
+		fclose(f);
+	return on;
+}
+
+static void bt_auto_set(const char *mac, bool on)
+{
+	char line[64], buf[2048] = "";
+	size_t o = 0;
+	FILE *f = fopen(BT_AUTO_PATH, "r");
+
+	while (f && fgets(line, sizeof(line), f))
+		if (strncasecmp(line, mac, 17) && o + strlen(line) < sizeof(buf)) {
+			memcpy(buf + o, line, strlen(line));
+			o += strlen(line);
+		}
+	if (f)
+		fclose(f);
+	buf[o] = 0;
+	mkdir("/var/lib/n72", 0755);
+	f = fopen(BT_AUTO_PATH ".new", "w");
+	if (!f)
+		return;
+	fputs(buf, f);
+	if (!on)
+		fprintf(f, "%s off\n", mac);
+	fclose(f);
+	rename(BT_AUTO_PATH ".new", BT_AUTO_PATH);
+}
+
+static void open_bt_dev_cb(lv_event_t *e);
 
 static void bt_dev_cb(lv_event_t *e)
 {
@@ -5386,15 +5482,49 @@ static void bt_devs_done(const char *out, void *ud)
 			bdevs[0] = t;
 			break;
 		}
+	{
+		/* (refreshed every few seconds: rebuilt only when it changed) */
+		char sig[sizeof(bt_list_sig)];
+		size_t o = 0;
+
+		sig[0] = 0;
+		for (i = 0; i < n_bdevs && o < sizeof(sig) - 24; i++)
+			o += snprintf(sig + o, sizeof(sig) - o, "%.17s%d%d%d;", bdevs[i].mac,
+				      bdevs[i].paired, bdevs[i].connected, (int)strlen(bdevs[i].name));
+		if (o < sizeof(sig) - 2)
+			snprintf(sig + o, sizeof(sig) - o, "%d", bt_powered);
+		if (!strcmp(sig, bt_list_sig) && lv_obj_get_child_count(bt_list)) {
+			if (bt_scan_lbl && lv_obj_is_valid(bt_scan_lbl))
+				lv_label_set_text(bt_scan_lbl, "Scan");
+			return;
+		}
+		memcpy(bt_list_sig, sig, sizeof(sig));
+	}
 	lv_obj_clean(bt_list);
 	if (!n_bdevs)
 		m3_label(bt_list, bt_powered ? "No devices yet: tap Scan" : "Bluetooth is off",
 			 &lv_font_montserrat_14, M.on_surface_v);
 	for (i = 0; i < n_bdevs; i++) {
-		lv_obj_t *r = m3_row(bt_list, LV_SYMBOL_BLUETOOTH, bdevs[i].name,
-				     bdevs[i].connected ? "Connected" :
-				     bdevs[i].paired ? "Paired" : "Tap to pair", bt_dev_cb, &bdevs[i], NULL);
+		lv_obj_t *r = m3_row_ex(bt_list, LV_SYMBOL_BLUETOOTH, M.secondary_c, M.on_secondary_c,
+					bdevs[i].name, bdevs[i].connected ? "Connected" :
+					bdevs[i].paired ? "Paired" : "Tap to pair",
+					bt_dev_cb, &bdevs[i], NULL, false);
 
+		if (bdevs[i].paired || bdevs[i].connected) {
+			/* the device's own page: a gear at the end of the row */
+			lv_obj_t *g = lv_button_create(r);
+
+			plain(g);
+			lv_obj_set_size(g, 40, 40);
+			lv_obj_set_style_radius(g, LV_RADIUS_CIRCLE, 0);
+			lv_obj_set_style_bg_opa(g, LV_OPA_TRANSP, 0);
+			lv_obj_set_style_bg_color(g, M.on_surface, LV_STATE_PRESSED);
+			lv_obj_set_style_bg_opa(g, LV_OPA_10, LV_STATE_PRESSED);
+			lv_obj_set_style_shadow_width(g, 0, 0);
+			lv_obj_center(m3_label(g, LV_SYMBOL_SETTINGS, &lv_font_montserrat_16,
+					       M.on_surface_v));
+			lv_obj_add_event_cb(g, open_bt_dev_cb, LV_EVENT_CLICKED, bdevs[i].mac);
+		}
 		if (bdevs[i].connected)
 			m3_row_current(r);
 		if (bdevs[i].paired || bdevs[i].connected)
@@ -5456,6 +5586,10 @@ static void bt_set(bool on)
 		net_ui_sync();
 		return;
 	}
+	if (conf.bt != on) {
+		conf.bt = on;
+		conf_save();
+	}
 	if (on == bt_powered)
 		return;
 	bt_want = on;
@@ -5474,6 +5608,18 @@ static void bt_scan_cb(lv_event_t *e)
 	if (bt_scan_lbl)
 		lv_label_set_text(bt_scan_lbl, "Scanning...");
 	job_run("bluetoothctl --timeout 8 scan on", bt_page, bt_cmd_done, NULL);
+}
+
+static void bt_page_tick(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	if (!screen_off && bt_page && lv_screen_active() == bt_page)
+		bt_page_refresh();
+}
+
+static void bt_page_gone(lv_event_t *e)
+{
+	lv_timer_delete(lv_event_get_user_data(e));
 }
 
 static void open_bt(lv_event_t *e)
@@ -5515,9 +5661,268 @@ static void open_bt(lv_event_t *e)
 	b = m3_button(body, "Scan", false, bt_scan_cb, NULL);
 	bt_scan_lbl = lv_obj_get_child(b, 0);
 	obj_track(&bt_scan_lbl);
-	m3_note(body, "Long-press a paired device to forget it.");
+	m3_note(body, "Tap a device to connect; its gear for details.");
+	bt_list_sig[0] = 0;
 	push(bt_page);
 	bt_page_refresh();
+	{
+		/* live while the page is up: connections come and go by
+		 * themselves (a speaker switched on or off) */
+		lv_timer_t *t = lv_timer_create(bt_page_tick, 3000, NULL);
+
+		lv_obj_add_event_cb(bt_page, bt_page_gone, LV_EVENT_DELETE, t);
+	}
+}
+
+/* --------------------------------------------------- a Bluetooth device */
+
+/*
+ * A device's page: name, status, address, the sound codec while it plays
+ * to it; Connect or Disconnect, Connect automatically, Forget. Live while
+ * shown (bluetoothctl info every 2 s).
+ */
+static char btd_mac[18];
+static lv_obj_t *btd_page, *btd_card, *btd_status, *btd_codec_row, *btd_codec,
+		*btd_conn_lbl, *btd_auto_sw;
+static bool btd_connected;
+
+static void btd_show(bool connected, const char *codec)
+{
+	btd_connected = connected;
+	if (btd_status)
+		label_set_if_changed(btd_status, connected ? "Connected" : "Not connected");
+	if (btd_conn_lbl)
+		label_set_if_changed(btd_conn_lbl, connected ? "Disconnect" : "Connect");
+	if (btd_card)
+		lv_obj_set_style_bg_color(btd_card, connected ? M.primary_c : M.surface_c, 0);
+	if (btd_codec_row) {
+		if (connected && codec && *codec) {
+			label_set_if_changed(btd_codec, codec);
+			lv_obj_remove_flag(btd_codec_row, LV_OBJ_FLAG_HIDDEN);
+		} else {
+			lv_obj_add_flag(btd_codec_row, LV_OBJ_FLAG_HIDDEN);
+		}
+	}
+}
+
+static void btd_info_done(const char *out, void *ud)
+{
+	const char *c = strstr(out, "Selected codec:");
+	char codec[32] = "";
+
+	LV_UNUSED(ud);
+	if (c && sscanf(c, "Selected codec: %31[^\n]", codec) != 1)
+		codec[0] = 0;
+	btd_show(strstr(out, "Connected: yes") != NULL, codec);
+}
+
+static void btd_refresh(void)
+{
+	char cmd[300], und[18];
+	int i;
+
+	if (!btd_page || !lv_obj_is_valid(btd_page))
+		return;
+	for (i = 0; i < 17; i++)
+		und[i] = btd_mac[i] == ':' ? '_' : btd_mac[i];
+	und[17] = 0;
+	snprintf(cmd, sizeof(cmd), "bluetoothctl info %s; p=$(bluealsa-cli list-pcms | "
+		 "grep 'dev_%s/a2dpsrc/sink$' | head -1); [ -n \"$p\" ] && bluealsa-cli info \"$p\"",
+		 btd_mac, und);
+	job_run(cmd, btd_page, btd_info_done, NULL);
+}
+
+static void btd_tick(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	if (!screen_off && btd_page && lv_screen_active() == btd_page)
+		btd_refresh();
+}
+
+static void btd_gone(lv_event_t *e)
+{
+	lv_timer_delete(lv_event_get_user_data(e));
+}
+
+static void btd_cmd_done(const char *out, void *ud)
+{
+	LV_UNUSED(out);
+	LV_UNUSED(ud);
+	btd_refresh();
+}
+
+static void btd_conn_cb(lv_event_t *e)
+{
+	char cmd[96];
+
+	LV_UNUSED(e);
+	snprintf(cmd, sizeof(cmd), btd_connected ? "bluetoothctl disconnect %s" :
+		 "bluetoothctl --timeout 20 connect %s", btd_mac);
+	if (btd_status)
+		lv_label_set_text(btd_status, btd_connected ? "Disconnecting..." : "Connecting...");
+	job_run(cmd, btd_page, btd_cmd_done, NULL);
+}
+
+static void btd_auto_cb(lv_event_t *e)
+{
+	bt_auto_set(btd_mac, lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
+static void btd_forget_done(const char *out, void *ud)
+{
+	LV_UNUSED(out);
+	LV_UNUSED(ud);
+	bt_auto_set(btd_mac, true);	/* (no note of a device that is gone) */
+	if (btd_page && lv_obj_is_valid(btd_page) && lv_screen_active() == btd_page)
+		go_back();
+}
+
+static void btd_forget_cb(lv_event_t *e)
+{
+	char cmd[64];
+
+	LV_UNUSED(e);
+	snprintf(cmd, sizeof(cmd), "bluetoothctl remove %s", btd_mac);
+	job_run(cmd, NULL, btd_forget_done, NULL);
+}
+
+static void open_bt_dev(lv_event_t *e)
+{
+	nav_mark(open_bt_dev, NULL);	/* (reopened on a turn: btd_mac stays) */
+	lv_obj_t *body, *c, *col, *row, *b;
+	const char *name = btd_mac;
+	bool connected = false;
+	int i;
+
+	LV_UNUSED(e);
+	for (i = 0; i < n_bdevs; i++)
+		if (!strcmp(bdevs[i].mac, btd_mac)) {
+			name = bdevs[i].name;
+			connected = bdevs[i].connected;
+		}
+	body = m3_page("Device", &btd_page);	/* (the card has the name) */
+	obj_track(&btd_page);
+
+	/* the device: badge, name, status, address */
+	c = btd_card = m3_card(body, connected ? M.primary_c : M.surface_c);
+	obj_track(&btd_card);
+	lv_obj_set_height(c, LV_SIZE_CONTENT);
+	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(c, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_column(c, 16, 0);
+	m3_badge(c, LV_SYMBOL_BLUETOOTH, M.primary, M.on_primary, 56);
+	col = lv_obj_create(c);
+	plain(col);
+	lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_pad_all(col, 0, 0);
+	lv_obj_set_height(col, LV_SIZE_CONTENT);
+	lv_obj_set_flex_grow(col, 1);
+	lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_pad_row(col, 2, 0);
+	lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	b = m3_label(col, name, &lv_font_montserrat_20, M.on_surface);
+	lv_label_set_long_mode(b, LV_LABEL_LONG_DOT);
+	lv_obj_set_width(b, lv_pct(100));
+	btd_status = m3_label(col, connected ? "Connected" : "Not connected",
+			      &lv_font_montserrat_14, M.on_surface_v);
+	obj_track(&btd_status);
+	m3_label(col, btd_mac, &lv_font_montserrat_12, M.on_surface_v);
+
+	/* settings */
+	c = m3_card(body, M.surface_c);
+	lv_obj_set_height(c, LV_SIZE_CONTENT);
+	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_pad_all(c, 4, 0);
+	row = m3_row_ex(c, LV_SYMBOL_REFRESH, M.secondary_c, M.on_secondary_c,
+			"Auto-connect", "When it is in reach", NULL, NULL, NULL, false);
+	btd_auto_sw = lv_switch_create(row);
+	obj_track(&btd_auto_sw);
+	if (bt_auto_get(btd_mac))
+		lv_obj_add_state(btd_auto_sw, LV_STATE_CHECKED);
+	lv_obj_add_event_cb(btd_auto_sw, btd_auto_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	btd_codec_row = m3_row_ex(c, LV_SYMBOL_AUDIO, M.tertiary_c, M.on_tertiary_c,
+				  "Sound", "", NULL, NULL, &btd_codec, false);
+	obj_track(&btd_codec_row);
+	obj_track(&btd_codec);
+	lv_obj_add_flag(btd_codec_row, LV_OBJ_FLAG_HIDDEN);
+
+	/* actions */
+	row = lv_obj_create(body);
+	lv_obj_remove_style_all(row);
+	lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+	lv_obj_set_style_pad_column(row, 12, 0);
+	lv_obj_set_style_pad_top(row, 4, 0);
+	b = m3_button(row, connected ? "Disconnect" : "Connect", true, btd_conn_cb, NULL);
+	btd_conn_lbl = lv_obj_get_child(b, 0);
+	obj_track(&btd_conn_lbl);
+	m3_button(row, "Forget", false, btd_forget_cb, NULL);
+
+	btd_connected = connected;
+	push(btd_page);
+	btd_refresh();
+	{
+		lv_timer_t *t = lv_timer_create(btd_tick, 2000, NULL);
+
+		lv_obj_add_event_cb(btd_page, btd_gone, LV_EVENT_DELETE, t);
+	}
+}
+
+static void open_bt_dev_cb(lv_event_t *e)
+{
+	snprintf(btd_mac, sizeof(btd_mac), "%s", (const char *)lv_event_get_user_data(e));
+	open_bt_dev(NULL);
+}
+
+/*
+ * Connect automatically: while the screen is on, Bluetooth is on and no
+ * sound device is connected, the paired devices left on are tried in turn
+ * every 30 s (a speaker switched on is found within that; one that is off
+ * costs a page of the radio, ~5 s). n72-audio-route has the sound follow.
+ */
+static bool bt_auto_busy;
+
+static void bt_auto_try_done(const char *out, void *ud)
+{
+	LV_UNUSED(out);
+	LV_UNUSED(ud);
+	bt_auto_busy = false;
+	if (bt_page && lv_obj_is_valid(bt_page))
+		bt_page_refresh();
+}
+
+static void bt_auto_paired_done(const char *out, void *ud)
+{
+	char cmd[512] = "", mac[18];
+	const char *p;
+	size_t o = 0;
+
+	LV_UNUSED(ud);
+	for (p = out; p && *p; ) {
+		if (sscanf(p, "Device %17s", mac) == 1 && bt_auto_get(mac) && o < sizeof(cmd) - 90)
+			o += snprintf(cmd + o, sizeof(cmd) - o, "%sbluetoothctl --timeout 8 connect %s "
+				      "| grep -q 'Connection successful'", o ? " || " : "", mac);
+		p = strchr(p, '\n');
+		if (p)
+			p++;
+	}
+	if (!o) {
+		bt_auto_busy = false;
+		return;
+	}
+	job_run(cmd, NULL, bt_auto_try_done, NULL);
+}
+
+static void bt_auto_tick(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	if (bt_auto_busy || screen_off || locked || !bt_powered || bt_want >= 0 ||
+	    !access("/run/n72-audio", F_OK) || !have_tool("bluetoothctl"))
+		return;
+	bt_auto_busy = true;
+	/* paired, and not connected to anything else of ours */
+	job_run("bluetoothctl devices Connected | grep -q Device || bluetoothctl devices Paired",
+		NULL, bt_auto_paired_done, NULL);
 }
 
 /* ------------------------------------------------------------ Display */
@@ -5530,6 +5935,8 @@ static void bright_cb(lv_event_t *e)
 	char buf[16];
 
 	backlight_set(v);
+	conf.bright = v;
+	conf_save_later();
 	lv_slider_set_value(home_bright, v, LV_ANIM_OFF);
 	snprintf(buf, sizeof(buf), "%d%%", v);
 	label_set_if_changed(bright_val, buf);
@@ -5710,6 +6117,198 @@ static void open_power(lv_event_t *e)
 
 /* -------------------------------------------------------------- About */
 
+/* ------------------------------------------------------------ Storage */
+
+/*
+ * Storage: the flash's root file system (df) as a bar in parts (system
+ * and applications, media, other files, free) and a row for each part;
+ * the folders' sizes come from du in the background. The media rows open
+ * their folders in Files. Also the RAM file system (/tmp).
+ */
+static void storage_fmt(char *b, size_t n, uint64_t bytes, const char *tail)
+{
+	if (bytes >= 1000ULL * 1000 * 1000)
+		snprintf(b, n, "%llu.%llu GB%s", (unsigned long long)(bytes / 1000000000ULL),
+			 (unsigned long long)(bytes / 100000000ULL % 10), tail);
+	else if (bytes >= 1000ULL * 1000)
+		snprintf(b, n, "%llu MB%s", (unsigned long long)(bytes / 1000000ULL), tail);
+	else
+		snprintf(b, n, "%llu kB%s", (unsigned long long)(bytes / 1000ULL), tail);
+}
+
+static lv_obj_t *st_page, *st_head, *st_bar, *st_sub[7];
+
+static void st_open_dir(lv_event_t *e)
+{
+	files_open_dir(lv_event_get_user_data(e));
+}
+
+/* df / and /tmp, du of the folders (kB) */
+static void st_done(const char *out, void *ud)
+{
+	unsigned long long tot = 0, used = 0, avail = 0, ttot = 0, tused = 0, k;
+	unsigned long long vid = 0, mus = 0, pic = 0, root = 0, usr = 0, var = 0;
+	const char *p;
+	char path[96], b[48];
+
+	LV_UNUSED(ud);
+	if (!st_page || !lv_obj_is_valid(st_page))
+		return;
+	for (p = out; p && *p; ) {
+		char mnt[64];
+		unsigned long long t, u, a;
+
+		if (sscanf(p, "%*s %llu %llu %llu %*s %63s", &t, &u, &a, mnt) == 4) {
+			if (!strcmp(mnt, "/")) {
+				tot = t;
+				used = u;
+				avail = a;
+			} else if (!strcmp(mnt, "/tmp")) {
+				ttot = t;
+				tused = u;
+			}
+		} else if (sscanf(p, "%llu %95s", &k, path) == 2) {
+			if (!strcmp(path, "/root/Videos"))
+				vid = k;
+			else if (!strcmp(path, "/root/Music"))
+				mus = k;
+			else if (!strcmp(path, "/root/Pictures"))
+				pic = k;
+			else if (!strcmp(path, "/root"))
+				root = k;
+			else if (!strcmp(path, "/usr"))
+				usr = k;
+			else if (!strcmp(path, "/var"))
+				var = k;
+		}
+		p = strchr(p, '\n');
+		if (p)
+			p++;
+	}
+	if (!tot)
+		return;
+	{
+		unsigned long long media = vid + mus + pic;
+		unsigned long long home = root > media ? root - media : 0;
+		unsigned long long sys = used > root ? used - root : 0;	/* (system, apps, the rest) */
+		unsigned long long parts[3] = { sys, media, home };
+		int i;
+
+		storage_fmt(b, sizeof(b), used * 1024, " used");
+		label_set_if_changed(st_head, b);
+		storage_fmt(b, sizeof(b), tot * 1024, "");
+		{
+			char line[96], fr[32];
+
+			storage_fmt(fr, sizeof(fr), avail * 1024, " free");
+			snprintf(line, sizeof(line), "of %s, %s", b, fr);
+			label_set_if_changed(st_sub[0], line);
+		}
+		/* the bar: a part each, as wide as its share (at least a sliver) */
+		for (i = 0; i < 3; i++) {
+			lv_obj_t *seg = lv_obj_get_child(st_bar, i);
+			int32_t w = (int32_t)(parts[i] * 1000 / tot);
+
+			if (seg)
+				lv_obj_set_width(seg, lv_pct(LV_MAX(parts[i] ? 1 : 0, w / 10)));
+		}
+		storage_fmt(b, sizeof(b), sys * 1024, "");
+		label_set_if_changed(st_sub[1], b);
+		storage_fmt(b, sizeof(b), vid * 1024, "");
+		label_set_if_changed(st_sub[2], b);
+		storage_fmt(b, sizeof(b), mus * 1024, "");
+		label_set_if_changed(st_sub[3], b);
+		storage_fmt(b, sizeof(b), pic * 1024, "");
+		label_set_if_changed(st_sub[4], b);
+		storage_fmt(b, sizeof(b), home * 1024, "");
+		label_set_if_changed(st_sub[5], b);
+		{
+			char t1[32], t2[32], line[80];
+
+			storage_fmt(t1, sizeof(t1), tused * 1024, "");
+			storage_fmt(t2, sizeof(t2), ttot * 1024, "");
+			snprintf(line, sizeof(line), "%s of %s (memory)", t1, t2);
+			label_set_if_changed(st_sub[6], line);
+		}
+		LV_UNUSED(var);
+		LV_UNUSED(usr);
+	}
+}
+
+static void open_storage(lv_event_t *e)
+{
+	nav_mark(open_storage, NULL);
+	static const struct {
+		const char *icon, *title, *dir;
+		int col;	/* 0 primary, 1 tertiary, 2 secondary */
+	} rows[] = {
+		{ LV_SYMBOL_SETTINGS, "System and apps", NULL, 0 },
+		{ LV_SYMBOL_VIDEO, "Videos", FILES_ROOT "/Videos", 1 },
+		{ LV_SYMBOL_AUDIO, "Music", FILES_ROOT "/Music", 1 },
+		{ LV_SYMBOL_IMAGE, "Pictures", FILES_ROOT "/Pictures", 1 },
+		{ LV_SYMBOL_DIRECTORY, "Other files", FILES_ROOT, 2 },
+		{ LV_SYMBOL_REFRESH, "Temporary files", NULL, 2 },
+	};
+	lv_obj_t *scr, *body, *c, *seg;
+	unsigned int i;
+
+	LV_UNUSED(e);
+	body = m3_page("Storage", &scr);
+	st_page = scr;
+	obj_track(&st_page);
+
+	/* used of total, and the bar in parts */
+	c = m3_card(body, M.surface_c);
+	lv_obj_set_height(c, LV_SIZE_CONTENT);
+	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_pad_row(c, 6, 0);
+	st_head = m3_label(c, "...", &lv_font_montserrat_24, M.on_surface);
+	obj_track(&st_head);
+	st_sub[0] = m3_label(c, "Internal storage", &lv_font_montserrat_14, M.on_surface_v);
+	obj_track(&st_sub[0]);
+	st_bar = lv_obj_create(c);
+	obj_track(&st_bar);
+	plain(st_bar);
+	lv_obj_set_size(st_bar, lv_pct(100), 12);
+	lv_obj_set_style_radius(st_bar, 6, 0);
+	lv_obj_set_style_clip_corner(st_bar, true, 0);
+	lv_obj_set_style_bg_color(st_bar, M.surface_c_highest, 0);	/* free */
+	lv_obj_set_style_bg_opa(st_bar, LV_OPA_COVER, 0);
+	lv_obj_set_style_pad_all(st_bar, 0, 0);
+	lv_obj_set_style_pad_column(st_bar, 2, 0);
+	lv_obj_set_flex_flow(st_bar, LV_FLEX_FLOW_ROW);
+	lv_obj_remove_flag(st_bar, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	for (i = 0; i < 3; i++) {
+		seg = lv_obj_create(st_bar);
+		plain(seg);
+		lv_obj_set_size(seg, 0, lv_pct(100));
+		lv_obj_set_style_radius(seg, 0, 0);
+		lv_obj_set_style_bg_color(seg, i == 0 ? M.primary : i == 1 ? M.tertiary_c :
+					  M.secondary_c, 0);
+		lv_obj_set_style_bg_opa(seg, LV_OPA_COVER, 0);
+		lv_obj_remove_flag(seg, LV_OBJ_FLAG_CLICKABLE);
+	}
+
+	/* the parts */
+	c = m3_card(body, M.surface_c);
+	lv_obj_set_style_pad_all(c, 4, 0);
+	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+	for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+		lv_color_t bg = rows[i].col == 0 ? M.primary_c : rows[i].col == 1 ? M.tertiary_c :
+				M.secondary_c;
+		lv_color_t fg = rows[i].col == 0 ? M.on_primary_c : rows[i].col == 1 ?
+				M.on_tertiary_c : M.on_secondary_c;
+
+		m3_row_ex(c, rows[i].icon, bg, fg, rows[i].title, "...",
+			  rows[i].dir ? st_open_dir : NULL, (void *)rows[i].dir,
+			  &st_sub[i + 1], rows[i].dir != NULL);
+		obj_track(&st_sub[i + 1]);
+	}
+	push(scr);
+	job_run("df -k / /tmp; du -sk /root/Videos /root/Music /root/Pictures /root /usr /var "
+		"2>/dev/null", scr, st_done, NULL);
+}
+
 static lv_obj_t *about_val[8];
 static lv_timer_t *about_timer;
 
@@ -5756,9 +6355,6 @@ static void about_update(lv_timer_t *t)
 	ip_of("wlan0", wlan, sizeof(wlan));
 	snprintf(buf, sizeof(buf), "USB: %s\nWi-Fi: %s", usb, wlan);
 	label_set_if_changed(about_val[5], buf);
-	snprintf(buf, sizeof(buf), "%s", access("/dev/nandsystem", F_OK) ? "not attached" :
-		 "iOS System and Data volumes (read-only)");
-	label_set_if_changed(about_val[6], buf);
 }
 
 static void about_delete_cb(lv_event_t *e)
@@ -5773,7 +6369,7 @@ static void open_about(lv_event_t *e)
 {
 	nav_mark(open_about, NULL);
 	static const char *const titles[] = { "Device", "Kernel", "Uptime", "Memory",
-		"Battery", "Network", "NAND" };
+		"Battery", "Network" };
 	lv_obj_t *scr, *body, *c;
 	unsigned int i;
 
@@ -6177,6 +6773,15 @@ static void open_settings(lv_event_t *e)
 	c = m3_card(body, M.surface_c);
 	lv_obj_set_style_pad_all(c, 4, 0);
 	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+	{
+		struct statvfs v;
+
+		if (!statvfs("/", &v))
+			storage_fmt(sub, sizeof(sub), (uint64_t)v.f_bavail * v.f_frsize, " free");
+		else
+			snprintf(sub, sizeof(sub), "Space used and free");
+		m3_row(c, LV_SYMBOL_SD_CARD, "Storage", sub, open_storage, NULL, NULL);
+	}
 	m3_row(c, LV_SYMBOL_EYE_OPEN, "About", "Device, memory, battery",
 	       open_about, NULL, NULL);
 	m3_row(c, LV_SYMBOL_FILE, "Logs", "Kernel messages", open_logs, NULL, NULL);
@@ -7533,4 +8138,18 @@ static void vc_stop(void)
 	vc.root = vc.ui = vc.rot_btn = vc.rot_lbl = NULL;
 	vc.up = vc.shown = false;
 	video_rot = -1;
+}
+
+/* The settings kept on the flash, applied once at start. */
+static void ui_apply_saved(void)
+{
+	if (access(CONF_PATH, F_OK))
+		conf_save();	/* (the first start: what was in /tmp, onto the flash) */
+	if (conf.bright >= 5)
+		backlight_set(conf.bright);
+	if (conf.wifi == 0 && have_tool("n72-wifi") && wifi_powered())
+		job_run("n72-wifi off", NULL, NULL, NULL);
+	if (conf.bt == 0 && have_tool("bluetoothctl"))
+		job_run(BT_OFF_CMD, NULL, bt_set_done, NULL);
+	lv_timer_create(bt_auto_tick, 30000, NULL);	/* Connect automatically */
 }
