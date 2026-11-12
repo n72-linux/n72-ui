@@ -2337,7 +2337,7 @@ static void app_slide(lv_obj_t *obj, int32_t to, lv_anim_completed_cb_t done)
 	lv_anim_init(&a);
 	lv_anim_set_var(&a, obj);
 	lv_anim_set_exec_cb(&a, app_y);
-	lv_anim_set_values(&a, lv_obj_get_y(obj), to);
+	lv_anim_set_values(&a, lv_obj_get_style_y(obj, LV_PART_MAIN), to);
 	lv_anim_set_duration(&a, 200);
 	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
 	if (done)
@@ -2578,7 +2578,13 @@ static lv_draw_buf_t *shade_pic_get(void)
 	if (shade_pic && sd.sfg == shade_pic)
 		return shade_pic;	/* (in use right now) */
 	tr_free(&shade_pic);
-	y = lv_obj_get_y(shade);
+	/*
+	 * Where it was set to be, not where it was last laid out: on a screen
+	 * that is not showing (home, while a page is up) nothing is laid out,
+	 * and the coordinates still say "open" after the shade was closed.
+	 * Putting it back there left it open for good.
+	 */
+	y = lv_obj_get_style_y(shade, LV_PART_MAIN);
 	lv_obj_set_y(shade, 0);
 	shade_pic = snap(shade, LV_COLOR_FORMAT_ARGB8888);
 	lv_obj_set_y(shade, y);
