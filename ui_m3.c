@@ -19,6 +19,8 @@
 #include "lvgl/src/core/lv_obj_scroll_private.h"	/* lv_obj_scroll_by_raw() */
 #include "lvgl/src/core/lv_obj_draw_private.h"	/* lv_obj_get_ext_draw_size() */
 #include "lvgl/src/misc/lv_area_private.h"	/* lv_area_intersect() */
+#include "lvgl/src/misc/lv_anim_private.h"	/* the animation list (turning) */
+#include "lvgl/src/core/lv_global.h"
 #include <sys/wait.h>
 #include <sys/un.h>
 
@@ -6599,6 +6601,21 @@ static int rot_wanted(void)
 	return rot_seen >= 0 ? rot_seen : ui_rot;
 }
 
+/*
+ * Animations that will end: a text area's cursor blinks by an endless one
+ * (running whether or not the field has the focus), which must not keep
+ * the screen from turning for as long as such a page is on the stack.
+ */
+static bool finite_anims_running(void)
+{
+	lv_anim_t *a;
+
+	LV_LL_READ(&LV_GLOBAL_DEFAULT()->anim_state.anim_ll, a)
+		if (a->repeat_cnt != LV_ANIM_REPEAT_INFINITE)
+			return true;
+	return false;
+}
+
 /* Whether the UI may be rebuilt now (nothing moving, nothing held). */
 static bool rot_can_turn(void)
 {
@@ -6606,7 +6623,7 @@ static bool rot_can_turn(void)
 	int i;
 
 	if (screen_off || locked || za.phase || tr.scr || sd.on || sd.scr || shade_open ||
-	    page_over_app || lv_anim_count_running() ||
+	    page_over_app || finite_anims_running() ||
 	    (touch_indev && lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
 		return false;
 	if (app_pid != 0 && !(app_pid > 0 && a == app_scr && app_is_video()))
@@ -6629,6 +6646,7 @@ static void rot_poll(lv_timer_t *t)
 		if (r >= 0 && r != rot_seen) {
 			rot_seen = r;
 			rot_seen_ms = lv_tick_get();
+			video_rot = -1;	/* the turn button holds until the iPod turns */
 		}
 		if (lv_tick_elaps(rot_seen_ms) < ROT_HOLD_MS)
 			return;
