@@ -2191,14 +2191,35 @@ static void icon_show(lv_obj_t *l, bool on)
 	shade_changed(l);
 }
 
+/* The sound device connected (n72-audio-route's /run/n72-audio), if any. */
+static bool bt_audio_name(char *name, size_t n)
+{
+	char line[96];
+	FILE *f = fopen("/run/n72-audio", "r");
+	bool found = false;
+
+	if (!f)
+		return false;
+	while (fgets(line, sizeof(line), f))
+		if (!strncmp(line, "name=", 5)) {
+			snprintf(name, n, "%s", line + 5);
+			name[strcspn(name, "\n")] = 0;
+			found = name[0] != 0;
+		}
+	fclose(f);
+	return found;
+}
+
 static void net_ui_sync(void)
 {
 	bool w = wifi_shown_on(), b = bt_shown_on(), bt_tool = have_tool("bluetoothctl");
 	const char *wsub = wifi_want == 1 && !wifi_powered() ? "Turning on..." :
 			   !w ? "Off" : wifi_up ? wifi_ssid : "Not connected";
+	char bt_dev[64];
 	const char *bsub = !bt_tool ? "Not installed" :
 			   bt_want == 1 && !bt_powered ? "Turning on..." :
-			   bt_want == 0 && bt_powered ? "Turning off..." : b ? "On" : "Off";
+			   bt_want == 0 && bt_powered ? "Turning off..." :
+			   b && bt_audio_name(bt_dev, sizeof(bt_dev)) ? bt_dev : b ? "On" : "Off";
 
 	qs_style(qs_wifi, w);
 	qs_style(qs_bt, b);
@@ -3815,6 +3836,10 @@ static void za_build(void)
 
 	lv_obj_get_coords(badge, &za.icon);
 	za.col = lv_obj_get_style_bg_color(badge, 0);
+	/* a video opens on black: the card, and layer 0 around the picture
+	 * (a Play button is no badge to take a colour from either) */
+	if (app_cmd && cmd_is_video(app_cmd) && app_pid != 0 && !za.page)
+		za.col = lv_color_black();
 	za.scr = lv_obj_create(NULL);
 	lv_obj_remove_style_all(za.scr);
 	lv_obj_remove_flag(za.scr, LV_OBJ_FLAG_SCROLLABLE);
@@ -4445,7 +4470,11 @@ static void app_launch_cb(lv_event_t *e)
 	lv_obj_set_parent(shade, lv_layer_top());
 	{
 		/* started once the first frame of the grow is out (za_spawn_cb) */
-		lv_timer_t *st = lv_timer_create(za_spawn_cb, 20, NULL);
+		/* (a video player: once the grow has landed; its start-up,
+		 * GStreamer's plugins and the stream opening, made the grow
+		 * jitter, and it shows nothing for a second anyway) */
+		lv_timer_t *st = lv_timer_create(za_spawn_cb,
+						  cmd_is_video(cmd) ? ZA_GROW_MS + 20 : 20, NULL);
 
 		lv_timer_set_repeat_count(st, 1);
 	}
@@ -7837,6 +7866,10 @@ static void vc_poll(lv_timer_t *t)
 			continue;		/* (a command's effect not in yet) */
 		if (vc.playing != !strcmp(st, "playing")) {
 			vc.playing = !strcmp(st, "playing");
+			/* paused by the player itself (the sound output changed):
+			 * the controls up, play at hand */
+			if (!vc.playing && !vc.shown)
+				vc_show(true);
 			vc_hide_later();
 		}
 		vc.pos_ms = pos;
