@@ -6458,9 +6458,61 @@ static int rot_read(void)
 	return -1;
 }
 
+/*
+ * The turn's transition: the screen as it was, turned by the GPU to lie on
+ * the panel where it lay, over the new layout, fading out (a GPU blend a
+ * frame): a crossfade with nothing jumping.
+ */
+#define TURN_FADE_MS 260
+static lv_obj_t *turn_img;
+static lv_draw_buf_t *turn_pic;
+
+static void turn_fade_exec(void *o, int32_t v)
+{
+	lv_obj_set_style_opa(o, (lv_opa_t)v, 0);
+}
+
+static void turn_fade_done(lv_anim_t *a)
+{
+	LV_UNUSED(a);
+	if (turn_img) {
+		lv_obj_delete(turn_img);
+		turn_img = NULL;
+	}
+	tr_free(&turn_pic);
+}
+
+static void turn_fade_start(lv_draw_buf_t *old, int from, int to)
+{
+	int delta = ((from - to) % 360 + 360) % 360;
+	lv_anim_t a;
+
+	if (turn_img)
+		turn_fade_done(NULL);
+	turn_pic = old && (delta == 90 || delta == 270) ? mbx_gpu_turn_buf(old, delta) : NULL;
+	if (old)
+		lv_draw_buf_destroy(old);
+	if (!turn_pic)
+		return;
+	turn_img = lv_image_create(lv_layer_top());
+	lv_image_set_src(turn_img, turn_pic);
+	lv_obj_set_pos(turn_img, 0, 0);
+	lv_obj_remove_flag(turn_img, LV_OBJ_FLAG_CLICKABLE);
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, turn_img);
+	lv_anim_set_exec_cb(&a, turn_fade_exec);
+	lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
+	lv_anim_set_duration(&a, TURN_FADE_MS);
+	lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+	lv_anim_set_completed_cb(&a, turn_fade_done);
+	lv_anim_start(&a);
+}
+
 /* Rebuild what is shown at the new size; false if it could not turn. */
 static bool ui_turn(int rot)
 {
+	lv_draw_buf_t *old_pic = NULL;
+	int from = ui_rot;
 	struct nav_re re[NAV_MAX];
 	lv_obj_t *tmp = NULL, *active = lv_screen_active();
 	bool over_app = app_pid > 0 && active == app_scr;
@@ -6476,8 +6528,17 @@ static bool ui_turn(int rot)
 	}
 	if (launch_from == home_scr)
 		from_idx = -1;
-	if (!mbx_gpu_set_rotation(rot))
+	/* the screen as it is, for the crossfade (not over an application:
+	 * the layer holds only the launcher's own things there) */
+	if (!over_app) {
+		lv_refr_now(NULL);
+		old_pic = mbx_gpu_grab_screen();
+	}
+	if (!mbx_gpu_set_rotation(rot)) {
+		if (old_pic)
+			lv_draw_buf_destroy(old_pic);
 		return false;
+	}
 	ui_rot = rot;
 	ui_w = lv_display_get_horizontal_resolution(NULL);
 	ui_h = lv_display_get_vertical_resolution(NULL);
@@ -6582,6 +6643,7 @@ static bool ui_turn(int rot)
 	status_refresh(true);
 	qs_rot_sync();
 	vc_turned();
+	turn_fade_start(old_pic, from, rot);
 	return true;
 }
 

@@ -2431,3 +2431,35 @@ int mbx_gpu_rotation(void)
 {
 	return rot_deg;
 }
+
+/*
+ * @src (XRGB8888, in GPU memory) turned a quarter, 90 or 270 as LVGL turns
+ * the screen, into a new buffer of the swapped size: one 3D copy. NULL if
+ * it cannot be done.
+ */
+lv_draw_buf_t *mbx_gpu_turn_buf(const lv_draw_buf_t *src, int deg)
+{
+	lv_draw_buf_t *b;
+	uint32_t cw[48];
+	int n;
+
+	if (mbx < 0 || !src || (deg != 90 && deg != 270) || !in_pool(src->data))
+		return NULL;
+	b = lv_draw_buf_create(src->header.h, src->header.w, LV_COLOR_FORMAT_XRGB8888, 0);
+	if (!b)
+		return NULL;
+	if (!in_pool(b->data) || (b->header.stride & 31) || (gpu_addr(b->data) & 127)) {
+		lv_draw_buf_destroy(b);
+		return NULL;
+	}
+	n = mbx_cmd_copy_turn(cw, b->header.stride, src->header.stride, 0, 0,
+			      src->header.w, src->header.h, deg, src->header.w, src->header.h);
+	sync_range(b->data, b->header.stride * b->header.h, MBX_SYNC_FLUSH);
+	if (blit3d(8, gpu_addr(b->data), gpu_addr(src->data), cw, n)) {
+		lv_draw_buf_destroy(b);
+		return NULL;
+	}
+	gpu_wait(last_seq);
+	last_seq = 0;
+	return b;
+}
