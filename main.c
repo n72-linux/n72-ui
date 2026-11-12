@@ -794,6 +794,138 @@ static bool write_sleep_state(const char *state)
  * when sleep is unavailable or refused, so the caller can fall back to
  * blanking the screen.
  */
+/*
+ * What can tell a wake by the network from one by a person: how often the
+ * Wi-Fi chip's wake line and the two buttons have interrupted, and whether
+ * the cable is in.
+ */
+struct wake_marks {
+	long wlan, home, power;
+	int wlan_irq, home_irq, power_irq;
+	bool usb;
+};
+
+static void wake_marks(struct wake_marks *m)
+{
+	char line[256];
+	FILE *f = fopen("/proc/interrupts", "r");
+
+	memset(m, 0, sizeof(*m));
+	m->wlan_irq = m->home_irq = m->power_irq = -1;
+	m->usb = usb_powered();
+	if (!f)
+		return;
+	while (fgets(line, sizeof(line), f)) {
+		char *colon = strchr(line, ':'), *end;
+		long n;
+		int irq;
+
+		if (!colon)
+			continue;
+		line[strcspn(line, "\n")] = 0;
+		irq = atoi(line);
+		n = strtol(colon + 1, &end, 10);
+		if (end == colon + 1)
+			continue;
+		end = line + strlen(line);
+		if (end - line > 15 && !strcmp(end - 15, "brcmf_host_wake")) {
+			m->wlan = n;
+			m->wlan_irq = irq;
+		} else if (end - line > 5 && !strcmp(end - 5, " Home")) {
+			m->home = n;
+			m->home_irq = irq;
+		} else if (end - line > 6 && !strcmp(end - 6, " Power")) {
+			m->power = n;
+			m->power_irq = irq;
+		}
+	}
+	fclose(f);
+}
+
+/* The interrupt that ended the last suspend to idle, or -1. */
+static int wake_irq(void)
+{
+	char buf[32] = "";
+	FILE *f = fopen("/sys/power/pm_wakeup_irq", "r");
+
+	if (!f)
+		return -1;
+	if (!fgets(buf, sizeof(buf), f))
+		buf[0] = 0;
+	fclose(f);
+	return buf[0] ? atoi(buf) : -1;
+}
+
+/*
+ * Was it only the network? Wi-Fi stays associated in suspend to idle, and
+ * a frame for this station wakes the system (so that it answers, and an
+ * SSH login gets in). That is no reason to light the screen. Anything not
+ * clearly the network counts as a person: a button's interrupt, the cable,
+ * a wake the kernel cannot name.
+ */
+static bool woke_for_network(const struct wake_marks *before)
+{
+	struct wake_marks now;
+	int irq = wake_irq();
+
+	wake_marks(&now);
+	if (now.home != before->home || now.power != before->power || now.usb != before->usb)
+		return false;
+	if (irq < 0 || irq == now.home_irq || irq == now.power_irq)
+		return false;
+	return now.wlan > before->wlan;
+}
+
+/* Is somebody logged in over SSH? (dropbear: the listener plus one per session) */
+static bool ssh_sessions(void)
+{
+	glob_t g;
+	int n = 0;
+
+	if (glob("/proc/[0-9]*/comm", 0, NULL, &g))
+		return false;
+	for (size_t i = 0; i < g.gl_pathc && n < 2; i++) {
+		char buf[32] = "";
+		FILE *f = fopen(g.gl_pathv[i], "r");
+
+		if (!f)
+			continue;
+		if (fgets(buf, sizeof(buf), f) && !strncmp(buf, "dropbear", 8))
+			n++;
+		fclose(f);
+	}
+	globfree(&g);
+	return n >= 2;
+}
+
+/*
+ * Awake for the network, screen dark: stay up for a few seconds, and for
+ * as long as an SSH session lasts, then sleep on. True: Power or Home was
+ * pressed meanwhile, the screen is wanted.
+ */
+static bool dark_linger(void)
+{
+	uint64_t until = mono_us() + 4000000, checked = 0;
+
+	for (;;) {
+		struct pollfd p = { .fd = keys_fd, .events = POLLIN };
+		struct input_event ev;
+
+		poll(&p, 1, 250);
+		while (keys_fd >= 0 && read(keys_fd, &ev, sizeof(ev)) == sizeof(ev))
+			if (ev.type == EV_KEY && ev.value == 1 &&
+			    (ev.code == KEY_POWER || ev.code == KEY_HOMEPAGE))
+				return true;
+		if (mono_us() - checked > 1000000) {
+			checked = mono_us();
+			if (ssh_sessions())
+				until = checked + 4000000;
+		}
+		if (mono_us() > until)
+			return false;
+	}
+}
+
 static bool system_sleep(void)
 {
 	const char *e = getenv("N72_SLEEP");
@@ -801,12 +933,26 @@ static bool system_sleep(void)
 
 	if (e && !strcmp(e, "0"))
 		return false;
-	deep = !(e && !strcmp(e, "freeze")) && !usb_powered() && sleep_offered("mem");
-	/* (the caller has switched the panel off: screen_set(false)) */
-	ok = deep && write_sleep_state("mem");
-	if (!ok)	/* not deep, or the PMU refused: suspend to idle */
-		ok = write_sleep_state("freeze");
-	woke_us = mono_us();
+	for (;;) {
+		struct wake_marks before;
+
+		deep = !(e && !strcmp(e, "freeze")) && !usb_powered() && sleep_offered("mem");
+		wake_marks(&before);
+		/* (the caller has switched the panel off: screen_set(false)) */
+		ok = deep && write_sleep_state("mem");
+		if (ok) {
+			deep = true;
+		} else {	/* not deep, or the PMU refused: suspend to idle */
+			deep = false;
+			ok = write_sleep_state("freeze");
+		}
+		woke_us = mono_us();
+		/* out of the deep sleep nothing says what woke us: the screen */
+		if (!ok || deep || !woke_for_network(&before))
+			break;
+		if (dark_linger())
+			break;
+	}
 
 	/* the wake press and anything touched meanwhile are not input */
 	drain(keys_fd);
