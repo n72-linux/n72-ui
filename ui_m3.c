@@ -682,10 +682,14 @@ static bool za_page_close(void);
 static bool page_back_to_app(void);
 static bool page_home_over_app(void);
 
+static void home_fresh(void);
+static void page_fresh(int i);
+
 static void go_home(void)
 {
 	if (locked)
 		return;		/* Home does not unlock */
+	home_fresh();		/* (a turn on a page left home for later) */
 	/*
 	 * A shade drag, its settling or an app animation has a screen of its
 	 * own on display, which it deletes itself: end those first, or the
@@ -721,6 +725,7 @@ static void go_back(void)
 		go_home();	/* (with the card, for a page opened from a tile) */
 		return;
 	}
+	page_fresh(nav_n - 2);	/* (a turn left it for later) */
 	nav_n--;
 	prev = nav[nav_n - 1];
 	slide(prev, false, true);
@@ -4101,6 +4106,8 @@ static void app_home_ui(void)
 	vc_stop();
 	if (layout_stale)
 		ui_rebuild(false);	/* (turned over a video: home and pages now) */
+	else
+		home_fresh();
 	shade_set(false, false);
 	app_bar_set(false);
 	if (app_bar) {
@@ -4781,6 +4788,7 @@ static void shade_pic_warm(lv_timer_t *t)
 }
 
 static lv_obj_t *home_apps;		/* the tile grid */
+static bool home_build_quiet;		/* build_home() loads nothing */
 static lv_timer_t *shade_warm_timer;
 
 static void build_home(void)
@@ -4855,7 +4863,7 @@ static void build_home(void)
 	home_timer = lv_timer_create(home_update, 2000, NULL);
 	shade_warm_timer = lv_timer_create(shade_pic_warm, 1000, NULL);
 	home_update(NULL);
-	if (app_pid <= 0)	/* (a turn over an application keeps it) */
+	if (app_pid <= 0 && !home_build_quiet)	/* (a turn keeps what shows) */
 		lv_screen_load(home_scr);
 	/* (ui_reopen: main, once the sound card is known) */
 }
@@ -6519,6 +6527,8 @@ static void turn_fade_start(lv_draw_buf_t *old, int from, int to)
  * rebuilt only what shows over it): built again before they are shown.
  */
 static bool layout_stale;
+static bool home_stale;
+static bool nav_stale[NAV_MAX];
 
 /* What lies over an application: the shade, the bar, the volume pop-up,
  * the video controls; rebuilt at the current size. */
@@ -6569,8 +6579,9 @@ static void ui_rebuild_overlays_free(void)
 		for (i = 0; i < (int)(sizeof(gone) / sizeof(gone[0])); i++)
 			*gone[i] = NULL;
 	}
-	/* the card's way back: home's picture and the tile are another turn's */
+	/* the card's way back: home's picture and the tiles are another turn's */
 	za.tile = NULL;
+	za.page_tile = NULL;
 	tr_free(&za.home);
 }
 
@@ -6599,6 +6610,7 @@ static void ui_rebuild(bool load)
 	struct nav_re re[NAV_MAX];
 	lv_obj_t *tmp = NULL;
 	int n = nav_n, from_idx = -2, i;
+	uint32_t rb_t0 = lv_tick_get();
 
 	for (i = 0; i < n; i++)
 		if (launch_from == nav[i])
@@ -6637,20 +6649,28 @@ static void ui_rebuild(bool load)
 		for (i = 0; i < (int)(sizeof(gone) / sizeof(gone[0])); i++)
 			*gone[i] = NULL;
 	}
+	uint32_t tb = lv_tick_get();
+
 	build_home();
 	if (app_pid > 0) {
 		app_bar_build();
 		lv_obj_set_parent(scrim, lv_layer_top());
 		lv_obj_set_parent(shade, lv_layer_top());
 	}
+	fprintf(stderr, "turn: delete %u ms, home %u ms;", (unsigned)(tb - rb_t0),
+			(unsigned)lv_tick_elaps(tb));
 	push_quiet = true;
 	for (i = 0; i < n; i++) {
+		uint32_t tp = lv_tick_get();
+
 		if (re[i].open)
 			re[i].open(NULL);
 		else
 			files_open_dir(re[i].dir);
 		free(re[i].dir);
+		fprintf(stderr, " page %d %u ms;", i, (unsigned)lv_tick_elaps(tp));
 	}
+	fprintf(stderr, "\n");
 	push_quiet = false;
 	push_quiet_scr = NULL;
 	launch_from = from_idx == -1 ? home_scr : from_idx >= 0 && from_idx < nav_n ?
@@ -6665,6 +6685,108 @@ static void ui_rebuild(bool load)
 	qs_rot_sync();
 	vc_turned();
 	layout_stale = false;
+	home_stale = false;
+	memset(nav_stale, 0, sizeof(nav_stale));
+}
+
+/*
+ * A turn on a page rebuilds that page only (and what lies over it): home
+ * and the pages under it were built for the other turn, and are built
+ * again when they are about to show (going back, Home). Rebuilding all of
+ * them took 140-215 ms a turn (YouTube's page).
+ */
+static bool home_stale;
+static bool nav_stale[NAV_MAX];
+
+static void home_fresh(void)
+{
+	lv_obj_t *old = home_scr;
+	int i;
+
+	if (!home_stale)
+		return;
+	home_stale = false;
+	ui_rebuild_overlays_free();
+	if (home_timer) {
+		lv_timer_delete(home_timer);
+		home_timer = NULL;
+	}
+	if (shade_warm_timer) {
+		lv_timer_delete(shade_warm_timer);
+		shade_warm_timer = NULL;
+	}
+	{
+		lv_obj_t **gone[] = {
+			&status_time, &status_wifi, &status_bt, &batt_lbl,
+			&home_clock, &home_date, &home_batt, &home_net,
+			&settings_tile, &home_apps,
+		};
+
+		for (i = 0; i < (int)(sizeof(gone) / sizeof(gone[0])); i++)
+			*gone[i] = NULL;
+	}
+	if (launch_from == old)
+		launch_from = NULL;
+	home_build_quiet = true;
+	build_home();
+	home_build_quiet = false;
+	if (app_pid > 0) {
+		app_bar_build();
+		lv_obj_set_parent(scrim, lv_layer_top());
+		lv_obj_set_parent(shade, lv_layer_top());
+	}
+	if (lv_screen_active() != old)
+		lv_obj_delete(old);
+	else
+		lv_obj_delete_async(old);
+	net_ui_sync();
+	status_refresh(true);
+	qs_rot_sync();
+}
+
+/* Page @i of the stack, built again if a turn left it (not showing). */
+static void page_fresh(int i)
+{
+	struct nav_re re;
+	lv_obj_t *old;
+	int top = nav_n;
+
+	if (i < 0 || i >= nav_n || !nav_stale[i])
+		return;
+	nav_stale[i] = false;
+	if (!nav_re[i].open && !nav_re[i].dir)
+		return;
+	/* reopened in its place: the stack above it set aside meanwhile */
+	re = nav_re[i];
+	nav_re[i].dir = NULL;
+	old = nav[i];
+	{
+		lv_obj_t *above[NAV_MAX];
+		struct nav_re above_re[NAV_MAX];
+		int k, na = top - i - 1;
+
+		for (k = 0; k < na; k++) {
+			above[k] = nav[i + 1 + k];
+			above_re[k] = nav_re[i + 1 + k];
+		}
+		nav_n = i;
+		push_quiet = true;
+		if (re.open)
+			re.open(NULL);
+		else
+			files_open_dir(re.dir);
+		push_quiet = false;
+		push_quiet_scr = NULL;
+		free(re.dir);
+		for (k = 0; k < na && nav_n < NAV_MAX; k++) {
+			nav[nav_n] = above[k];
+			nav_re[nav_n] = above_re[k];
+			nav_n++;
+		}
+	}
+	if (launch_from == old)
+		launch_from = nav[i];
+	lv_obj_delete(old);
 }
 
 /* Rebuild what is shown at the new size; false if it could not turn. */
@@ -6703,6 +6825,35 @@ static bool ui_turn(int rot)
 		 */
 		ui_rebuild_overlays();
 		layout_stale = true;
+	} else if (nav_n > 0) {
+		/* a page: it alone (and the overlays); home and the pages
+		 * under it when they show */
+		int top = nav_n - 1;
+		lv_obj_t *old = nav[top], *tmp = lv_obj_create(NULL);
+		struct nav_re re = nav_re[top];
+
+		lv_screen_load(tmp);
+		ui_rebuild_overlays();
+		nav_re[top].dir = NULL;
+		nav_n = top;
+		push_quiet = true;
+		if (re.open)
+			re.open(NULL);
+		else
+			files_open_dir(re.dir);
+		push_quiet = false;
+		push_quiet_scr = NULL;
+		free(re.dir);
+		if (launch_from == old)
+			launch_from = nav_n > top ? nav[top] : NULL;
+		lv_screen_load(nav_n ? nav[nav_n - 1] : home_scr);
+		lv_obj_delete(old);
+		lv_obj_delete(tmp);
+		home_stale = true;
+		for (i = 0; i < top; i++)
+			nav_stale[i] = true;
+		net_ui_sync();
+		qs_rot_sync();
 	} else {
 		ui_rebuild(true);
 	}
