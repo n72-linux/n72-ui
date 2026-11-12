@@ -54,8 +54,12 @@ static struct {
 	int vol;		/* sound volume, 0..100 % (0 = mute) */
 	bool spk;		/* speaker when no earphones are plugged */
 	bool wake_plug;		/* the screen comes on when the cable goes in or out */
-	bool autorot;		/* the screen turns with the iPod (quick settings) */
+	int autorot;		/* the screen's turn (quick settings): ROT_* */
 } conf = { true, 0, 120, 60, true, true, false };
+
+#define ROT_PORTRAIT	0	/* upright, always */
+#define ROT_AUTO	1	/* with the iPod */
+#define ROT_LANDSCAPE	2	/* sideways, always (the side it was last held) */
 
 static const struct { const char *name; uint16_t hue; uint8_t sat; } accents[] = {
 	{ "Violet", 265, 48 }, { "Blue", 215, 60 }, { "Teal", 178, 55 },
@@ -88,7 +92,7 @@ static void conf_load(void)
 			conf.spk = v;
 		else if (sscanf(line, "plug=%d", &v) == 1)
 			conf.wake_plug = v;
-		else if (sscanf(line, "rot=%d", &v) == 1)
+		else if (sscanf(line, "rot=%d", &v) == 1 && v >= 0 && v <= 2)
 			conf.autorot = v;
 	}
 	fclose(f);
@@ -306,6 +310,25 @@ static lv_obj_t *m3_row_ex(lv_obj_t *parent, const char *icon, lv_color_t bg, lv
 	if (chevron)
 		m3_label(r, LV_SYMBOL_RIGHT, &lv_font_montserrat_14, M.on_surface_v);
 	return r;
+}
+
+/* A row marked as the current one (the network or device in use):
+ * Material's primary container, its text and badge to match. */
+static void m3_row_current(lv_obj_t *r)
+{
+	lv_obj_t *badge = lv_obj_get_child(r, 0), *col = lv_obj_get_child(r, 1);
+	uint32_t i;
+
+	lv_obj_set_style_bg_color(r, M.primary_c, 0);
+	lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
+	if (badge && lv_obj_get_child_count(badge)) {
+		lv_obj_set_style_bg_color(badge, M.primary, 0);
+		lv_obj_set_style_text_color(lv_obj_get_child(badge, 0), M.on_primary, 0);
+	}
+	for (i = 0; col && i < lv_obj_get_child_count(col); i++)
+		lv_obj_set_style_text_color(lv_obj_get_child(col, i), M.on_primary_c, 0);
+	if (lv_obj_get_child_count(r) > 2)	/* the chevron */
+		lv_obj_set_style_text_color(lv_obj_get_child(r, 2), M.on_primary_c, 0);
 }
 
 static lv_obj_t *m3_row(lv_obj_t *parent, const char *icon, const char *title,
@@ -2443,21 +2466,23 @@ static void qs_settings_cb(lv_event_t *e)
 static lv_obj_t *qs_rot, *qs_rot_sub;
 static void rot_conf_changed(void);
 
-/* The Auto-rotate tile: on, it says which way the screen is now. */
+/* The Rotation tile: Auto, Landscape (locked) or Portrait (locked). */
 static void qs_rot_sync(void)
 {
 	if (!qs_rot)
 		return;
-	qs_style(qs_rot, conf.autorot);
-	label_set_if_changed(qs_rot_sub, !conf.autorot ? "Portrait" :
-			     W > H ? "On, landscape" : "On");
+	qs_style(qs_rot, conf.autorot != ROT_PORTRAIT);
+	label_set_if_changed(qs_rot_sub, conf.autorot == ROT_AUTO ? "Auto" :
+			     conf.autorot == ROT_LANDSCAPE ? "Landscape" : "Portrait");
 	shade_changed(qs_rot);
 }
 
+/* A tap: Auto -> Landscape -> Portrait -> Auto. */
 static void qs_rot_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
-	conf.autorot = !conf.autorot;
+	conf.autorot = conf.autorot == ROT_AUTO ? ROT_LANDSCAPE :
+		       conf.autorot == ROT_LANDSCAPE ? ROT_PORTRAIT : ROT_AUTO;
 	conf_save();
 	qs_rot_sync();
 	rot_conf_changed();
@@ -2530,7 +2555,7 @@ static void build_shade(void)
 		lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 		qs_wifi = qs_tile(row, LV_SYMBOL_WIFI, "Wi-Fi", &qs_wifi_sub, qs_open_wifi);
 		qs_bt = qs_tile(row, LV_SYMBOL_BLUETOOTH, "Bluetooth", &qs_bt_sub, qs_open_bt);
-		qs_rot = qs_tile(row, LV_SYMBOL_REFRESH, "Auto-rotate", &qs_rot_sub, qs_rot_cb);
+		qs_rot = qs_tile(row, LV_SYMBOL_REFRESH, "Rotation", &qs_rot_sub, qs_rot_cb);
 		qs_rot_sync();
 		/* the slider 12 below; the handle 52 below it */
 		shade_h = 128 + th + 12 + 56 + 52;
@@ -5122,6 +5147,15 @@ static void wifi_lists_done(const char *out, void *ud)
 	lv_obj_clean(wifi_list);
 	if (!n_nets)
 		m3_label(wifi_list, "No networks found yet", &lv_font_montserrat_14, M.on_surface_v);
+	/* the network in use first */
+	for (i = 1; i < n_nets && wifi_up; i++)
+		if (!strcmp(nets[i].ssid, wifi_ssid)) {
+			struct wifi_net t = nets[i];
+
+			memmove(&nets[1], &nets[0], i * sizeof(nets[0]));
+			nets[0] = t;
+			break;
+		}
 	/* the strongest 24 (sorted): more is only slower to build and scroll */
 	for (i = 0; i < n_nets && i < 24; i++) {
 		struct wifi_net *n = &nets[i];
@@ -5130,10 +5164,16 @@ static void wifi_lists_done(const char *out, void *ud)
 				   n->signal > -78 ? "Fair" : "Weak";
 		lv_obj_t *r;
 
-		snprintf(sub, sizeof(sub), "%s%s%s", bars, n->secure ? ", secured" : ", open",
-			 !strcmp(n->ssid, wifi_ssid) && wifi_up ? ", connected" :
-			 n->saved ? ", saved" : "");
+		bool cur = !strcmp(n->ssid, wifi_ssid) && wifi_up;
+
+		if (cur)
+			snprintf(sub, sizeof(sub), "Connected, %s", bars);
+		else
+			snprintf(sub, sizeof(sub), "%s%s%s", bars, n->secure ? ", secured" : ", open",
+				 n->saved ? ", saved" : "");
 		r = m3_row(wifi_list, LV_SYMBOL_WIFI, n->ssid, sub, wifi_net_cb, n, NULL);
+		if (cur)
+			m3_row_current(r);
 		if (n->saved)
 			lv_obj_add_event_cb(r, wifi_forget_cb, LV_EVENT_LONG_PRESSED, n);
 	}
@@ -5256,7 +5296,7 @@ static void bt_cmd_done(const char *out, void *ud)
 	bt_page_refresh();
 }
 
-struct bt_dev { char mac[18]; char name[64]; bool paired; };
+struct bt_dev { char mac[18]; char name[64]; bool paired, connected; };
 static struct bt_dev bdevs[16];
 static int n_bdevs;
 
@@ -5271,14 +5311,24 @@ static void bt_dev_cb(lv_event_t *e)
 	 * fails here). Audio devices connect only when bluez-alsa (bluealsa)
 	 * runs: it is what offers BlueZ the A2DP profile.
 	 */
-	if (d->paired)
+	if (d->connected)
+		snprintf(cmd, sizeof(cmd), "bluetoothctl disconnect %s", d->mac);
+	else if (d->paired)
 		snprintf(cmd, sizeof(cmd), "bluetoothctl --timeout 20 connect %s", d->mac);
 	else
 		snprintf(cmd, sizeof(cmd), "bluetoothctl --agent NoInputNoOutput --timeout 25 pair %s && "
 			 "bluetoothctl trust %s && bluetoothctl --timeout 20 connect %s",
 			 d->mac, d->mac, d->mac);
-	if (bt_state_lbl)
-		lv_label_set_text_fmt(bt_state_lbl, "Connecting to %s...", d->name);
+	{
+		/* the row says what is going on (its second line) */
+		lv_obj_t *col = lv_obj_get_child(lv_event_get_current_target(e), 1);
+		lv_obj_t *sub = col ? lv_obj_get_child(col, 1) : NULL;
+
+		if (sub) {
+			lv_label_set_text(sub, d->connected ? "Disconnecting..." : "Connecting...");
+			lv_obj_remove_flag(sub, LV_OBJ_FLAG_HIDDEN);
+		}
+	}
 	job_run(cmd, bt_page, bt_cmd_done, NULL);
 }
 
@@ -5294,7 +5344,7 @@ static void bt_forget_cb(lv_event_t *e)
 /* "Device AA:BB:CC:DD:EE:FF Name"; the paired list follows @@PAIRED@@ */
 static void bt_devs_done(const char *out, void *ud)
 {
-	const char *p, *paired = strstr(out, "@@PAIRED@@");
+	const char *p, *paired = strstr(out, "@@PAIRED@@"), *conn = strstr(out, "@@CONN@@");
 	int i;
 
 	LV_UNUSED(ud);
@@ -5303,18 +5353,21 @@ static void bt_devs_done(const char *out, void *ud)
 		char mac[18], name[64];
 
 		if (sscanf(p, "Device %17s %63[^\n]", mac, name) == 2) {
-			bool is_paired = paired && p > paired;
+			bool is_conn = conn && p > conn;
+			bool is_paired = paired && p > paired && !is_conn;
 			bool dup = false;
 
 			for (i = 0; i < n_bdevs; i++)
 				if (!strcmp(bdevs[i].mac, mac)) {
 					bdevs[i].paired |= is_paired;
+					bdevs[i].connected |= is_conn;
 					dup = true;
 				}
-			if (!dup) {
+			if (!dup && !is_conn) {
 				snprintf(bdevs[n_bdevs].mac, 18, "%s", mac);
 				snprintf(bdevs[n_bdevs].name, 64, "%s", name);
 				bdevs[n_bdevs].paired = is_paired;
+				bdevs[n_bdevs].connected = false;
 				n_bdevs++;
 			}
 		}
@@ -5324,15 +5377,27 @@ static void bt_devs_done(const char *out, void *ud)
 	}
 	if (!bt_list || !lv_obj_is_valid(bt_list))
 		return;
+	/* the connected device first */
+	for (i = 1; i < n_bdevs; i++)
+		if (bdevs[i].connected) {
+			struct bt_dev t = bdevs[i];
+
+			memmove(&bdevs[1], &bdevs[0], i * sizeof(bdevs[0]));
+			bdevs[0] = t;
+			break;
+		}
 	lv_obj_clean(bt_list);
 	if (!n_bdevs)
 		m3_label(bt_list, bt_powered ? "No devices yet: tap Scan" : "Bluetooth is off",
 			 &lv_font_montserrat_14, M.on_surface_v);
 	for (i = 0; i < n_bdevs; i++) {
 		lv_obj_t *r = m3_row(bt_list, LV_SYMBOL_BLUETOOTH, bdevs[i].name,
+				     bdevs[i].connected ? "Connected" :
 				     bdevs[i].paired ? "Paired" : "Tap to pair", bt_dev_cb, &bdevs[i], NULL);
 
-		if (bdevs[i].paired)
+		if (bdevs[i].connected)
+			m3_row_current(r);
+		if (bdevs[i].paired || bdevs[i].connected)
 			lv_obj_add_event_cb(r, bt_forget_cb, LV_EVENT_LONG_PRESSED, &bdevs[i]);
 	}
 	if (bt_scan_lbl && lv_obj_is_valid(bt_scan_lbl))
@@ -5350,8 +5415,8 @@ static void bt_page_refresh(void)
 	if (!bt_page || !lv_obj_is_valid(bt_page))
 		return;
 	job_run("bluetoothctl show", bt_page, bt_show_page_done, NULL);
-	job_run("bluetoothctl devices; echo @@PAIRED@@; bluetoothctl devices Paired",
-		bt_page, bt_devs_done, NULL);
+	job_run("bluetoothctl devices; echo @@PAIRED@@; bluetoothctl devices Paired; "
+		"echo @@CONN@@; bluetoothctl devices Connected", bt_page, bt_devs_done, NULL);
 }
 
 /*
@@ -5425,13 +5490,11 @@ static void open_bt(lv_event_t *e)
 		push(bt_page);
 		return;
 	}
+	/* the switch alone (as Wi-Fi's); the device in use is in the list */
 	c = m3_card(body, M.primary_c);
-	lv_obj_set_height(c, 72);
-	bt_state_lbl = m3_label(c, "...", &lv_font_montserrat_16, M.on_primary_c);
-	obj_track(&bt_state_lbl);
-	lv_obj_align(m3_label(c, "Use Bluetooth", &lv_font_montserrat_14, M.on_primary_c),
-		     LV_ALIGN_TOP_LEFT, 0, 0);
-	lv_obj_align(bt_state_lbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+	lv_obj_set_height(c, 64);
+	lv_obj_align(m3_label(c, "Use Bluetooth", &lv_font_montserrat_16, M.on_primary_c),
+		     LV_ALIGN_LEFT_MID, 0, 0);
 	bt_switch = lv_switch_create(c);
 	obj_track(&bt_switch);
 	lv_obj_align(bt_switch, LV_ALIGN_RIGHT_MID, 0, 0);
@@ -6462,6 +6525,7 @@ static void open_paint(lv_event_t *e)
 
 static int ui_rot;			/* the screen's turn now */
 static int rot_seen = -1;		/* the way the iPod is held, -1 unknown */
+static int rot_side = 90;		/* the sideways it was last held: 90 or 270 */
 static uint32_t rot_seen_ms;
 static lv_timer_t *rot_timer;
 static int video_rot = -1;		/* the player's controls asked for this (-1: follow) */
@@ -6793,6 +6857,7 @@ static void page_fresh(int i)
 			above_re[k] = nav_re[i + 1 + k];
 		}
 		nav_n = i;
+		lv_obj_delete(old);	/* first: an opener may refuse a second copy */
 		push_quiet = true;
 		if (re.open)
 			re.open(NULL);
@@ -6808,8 +6873,7 @@ static void page_fresh(int i)
 		}
 	}
 	if (launch_from == old)
-		launch_from = nav[i];
-	lv_obj_delete(old);
+		launch_from = nav_n > i ? nav[i] : NULL;
 }
 
 /* Rebuild what is shown at the new size; false if it could not turn. */
@@ -6859,6 +6923,8 @@ static bool ui_turn(int rot)
 		ui_rebuild_overlays();
 		nav_re[top].dir = NULL;
 		nav_n = top;
+		/* gone first: an opener may refuse a second copy (YouTube's) */
+		lv_obj_delete(old);
 		push_quiet = true;
 		if (re.open)
 			re.open(NULL);
@@ -6869,12 +6935,18 @@ static bool ui_turn(int rot)
 		free(re.dir);
 		if (launch_from == old)
 			launch_from = nav_n > top ? nav[top] : NULL;
-		lv_screen_load(nav_n ? nav[nav_n - 1] : home_scr);
-		lv_obj_delete(old);
-		lv_obj_delete(tmp);
 		home_stale = true;
 		for (i = 0; i < top; i++)
 			nav_stale[i] = true;
+		/* not reopened: what shows instead is built for this turn first */
+		if (nav_n <= top) {
+			if (nav_n)
+				page_fresh(nav_n - 1);
+			else
+				home_fresh();
+		}
+		lv_screen_load(nav_n ? nav[nav_n - 1] : home_scr);
+		lv_obj_delete(tmp);
 		net_ui_sync();
 		qs_rot_sync();
 	} else {
@@ -6894,11 +6966,13 @@ static int rot_wanted(void)
 	if (app_pid > 0 && a == app_scr) {
 		if (!app_is_video())
 			return 0;
-		if (video_rot >= 0)
-			return video_rot;
+		if (video_rot >= 0)	/* the controls' turn button holds it */
+			return video_rot ? rot_side : 0;
 	}
-	if (!conf.autorot)
+	if (conf.autorot == ROT_PORTRAIT)
 		return 0;
+	if (conf.autorot == ROT_LANDSCAPE)
+		return rot_side;	/* (the side it is held, or was last) */
 	return rot_seen >= 0 ? rot_seen : ui_rot;
 }
 
@@ -6942,12 +7016,13 @@ static void rot_poll(lv_timer_t *t)
 	LV_UNUSED(t);
 	if (screen_off || locked)
 		return;
-	if (conf.autorot || (app_pid > 0 && app_is_video())) {
+	if (conf.autorot != ROT_PORTRAIT || (app_pid > 0 && app_is_video())) {
 		r = rot_read();
 		if (r >= 0 && r != rot_seen) {
 			rot_seen = r;
 			rot_seen_ms = lv_tick_get();
-			video_rot = -1;	/* the turn button holds until the iPod turns */
+			if (r)
+				rot_side = r;
 		}
 		if (lv_tick_elaps(rot_seen_ms) < ROT_HOLD_MS)
 			return;
@@ -6959,15 +7034,19 @@ static void rot_poll(lv_timer_t *t)
 
 static void rot_conf_changed(void)
 {
-	rot_seen = conf.autorot ? rot_read() : -1;
+	rot_seen = conf.autorot != ROT_PORTRAIT ? rot_read() : -1;
+	if (rot_seen > 0)
+		rot_side = rot_seen;
 	rot_seen_ms = 0;
 }
 
 static void rot_init(void)
 {
 	rot_timer = lv_timer_create(rot_poll, 200, NULL);
-	if (conf.autorot)
+	if (conf.autorot != ROT_PORTRAIT)
 		rot_seen = rot_read();
+	if (rot_seen > 0)
+		rot_side = rot_seen;
 }
 
 /* Upright now, for something that only works upright (an application). */
@@ -6993,7 +7072,7 @@ static void ui_upright(void)
 
 
 static struct {
-	lv_obj_t *root, *ui, *title, *play_sym, *slider, *pos, *dur, *rot_lbl;
+	lv_obj_t *root, *ui, *title, *play_sym, *slider, *pos, *dur, *rot_lbl, *rot_btn;
 	lv_timer_t *poll, *hide;
 	int sock;
 	bool up;			/* the player has answered */
@@ -7141,6 +7220,13 @@ static void vc_poll(lv_timer_t *t)
 			vc_build();
 			vc_show(true);		/* a moment at the start */
 		}
+		{
+			/* the title from every answer (a stray one goes right) */
+			const char *nl = strchr(buf, '\n');
+
+			if (nl && strcmp(vc.name, nl + 1))
+				snprintf(vc.name, sizeof(vc.name), "%s", nl + 1);
+		}
 		vc.prot = r;
 		if (lv_tick_elaps(vc.quiet_ms) < 700)
 			continue;		/* (a command's effect not in yet) */
@@ -7223,13 +7309,18 @@ static void vc_back_cb(lv_event_t *e)
 	app_end();		/* back to where it was started (Files) */
 }
 
-/* The turn button: landscape for this video, or back upright. */
+static void vc_rot_show(void);
+
+/*
+ * The turn button holds the screen the other way for this video (sideways
+ * on the side the iPod was last held, or upright), until it is pressed
+ * again or the video ends; the accelerometer does not undo it.
+ */
 static void vc_rot_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
-	video_rot = ui_rot ? 0 : 90;
-	if (conf.autorot && rot_seen > 0 && !ui_rot)
-		video_rot = rot_seen;	/* (held sideways already: that way) */
+	video_rot = video_rot >= 0 ? -1 : ui_rot ? 0 : 90;	/* (90: sideways) */
+	vc_rot_show();
 	vc_hide_later();
 }
 
@@ -7289,8 +7380,10 @@ static void vc_build(void)
 	vc.title = m3_label(row, vc.name, &lv_font_montserrat_16, lv_color_white());
 	lv_label_set_long_mode(vc.title, LV_LABEL_LONG_DOT);
 	lv_obj_set_flex_grow(vc.title, 1);
-	b = vc_icon_btn(row, LV_SYMBOL_REFRESH, 48, &lv_font_montserrat_20, vc_rot_cb, NULL);
+	b = vc.rot_btn = vc_icon_btn(row, LV_SYMBOL_REFRESH, 48, &lv_font_montserrat_20,
+				     vc_rot_cb, NULL);
 	vc.rot_lbl = lv_obj_get_child(b, 0);
+	vc_rot_show();
 
 	/* middle: back 10 s, play/pause, on 10 s */
 	row = lv_obj_create(vc.ui);
@@ -7365,6 +7458,18 @@ static void vc_build(void)
 	vc_update();
 }
 
+/* The turn button filled (primary) while it holds the screen. */
+static void vc_rot_show(void)
+{
+	bool held = video_rot >= 0;
+
+	if (!vc.rot_btn)
+		return;
+	lv_obj_set_style_bg_color(vc.rot_btn, held ? M.primary_c : lv_color_white(), 0);
+	lv_obj_set_style_bg_opa(vc.rot_btn, held ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+	lv_obj_set_style_text_color(vc.rot_lbl, held ? M.on_primary_c : lv_color_white(), 0);
+}
+
 /* Rebuilt at a new size, as it was. */
 static void vc_turned(void)
 {
@@ -7373,7 +7478,7 @@ static void vc_turned(void)
 	if (!vc.root)
 		return;
 	lv_obj_delete(vc.root);
-	vc.root = vc.ui = NULL;
+	vc.root = vc.ui = vc.rot_btn = vc.rot_lbl = NULL;
 	vc_build();
 	if (shown) {
 		lv_obj_remove_flag(vc.ui, LV_OBJ_FLAG_HIDDEN);
@@ -7401,6 +7506,13 @@ static void vc_start(void)
 			vc.sock = -1;
 		}
 	}
+	if (vc.sock >= 0) {
+		/* answers of the last player still queued: not this one's */
+		char b[256];
+
+		while (recv(vc.sock, b, sizeof(b), MSG_DONTWAIT) > 0)
+			;
+	}
 	if (!vc.poll)
 		vc.poll = lv_timer_create(vc_poll, 250, NULL);
 	fprintf(stderr, "n72-ui: video controls for %s (socket %d)\n", app_cmd, vc.sock);
@@ -7418,7 +7530,7 @@ static void vc_stop(void)
 	}
 	if (vc.root && lv_obj_is_valid(vc.root))
 		lv_obj_delete(vc.root);
-	vc.root = vc.ui = NULL;
+	vc.root = vc.ui = vc.rot_btn = vc.rot_lbl = NULL;
 	vc.up = vc.shown = false;
 	video_rot = -1;
 }
