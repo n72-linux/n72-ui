@@ -221,8 +221,14 @@ static lv_obj_t *m3_badge(lv_obj_t *parent, const char *icon, lv_color_t bg,
  * A 64 px list row: badge, title and supporting text, optional trailing
  * widget area (returned in *trail). Clicking runs cb.
  */
-static lv_obj_t *m3_row(lv_obj_t *parent, const char *icon, const char *title,
-			const char *sub, lv_event_cb_t cb, void *ud, lv_obj_t **sub_lbl)
+/*
+ * A two-line list item (Material 3): leading icon in a tonal circle
+ * (@bg/@fg), headline and supporting text, a trailing chevron for an item
+ * that navigates.
+ */
+static lv_obj_t *m3_row_ex(lv_obj_t *parent, const char *icon, lv_color_t bg, lv_color_t fg,
+			   const char *title, const char *sub, lv_event_cb_t cb, void *ud,
+			   lv_obj_t **sub_lbl, bool chevron)
 {
 	lv_obj_t *r = lv_obj_create(parent), *t, *col;
 
@@ -239,7 +245,7 @@ static lv_obj_t *m3_row(lv_obj_t *parent, const char *icon, const char *title,
 	lv_obj_set_flex_align(r, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_column(r, 14, 0);
 	if (icon)
-		m3_badge(r, icon, M.secondary_c, M.on_secondary_c, 40);
+		m3_badge(r, icon, bg, fg, 40);
 	col = lv_obj_create(r);
 	plain(col);
 	lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
@@ -258,11 +264,18 @@ static lv_obj_t *m3_row(lv_obj_t *parent, const char *icon, const char *title,
 		lv_obj_add_flag(t, LV_OBJ_FLAG_HIDDEN);
 	if (sub_lbl)
 		*sub_lbl = t;
-	if (cb) {
+	if (cb)
 		lv_obj_add_event_cb(r, cb, LV_EVENT_CLICKED, ud);
+	if (chevron)
 		m3_label(r, LV_SYMBOL_RIGHT, &lv_font_montserrat_14, M.on_surface_v);
-	}
 	return r;
+}
+
+static lv_obj_t *m3_row(lv_obj_t *parent, const char *icon, const char *title,
+			const char *sub, lv_event_cb_t cb, void *ud, lv_obj_t **sub_lbl)
+{
+	return m3_row_ex(parent, icon, M.secondary_c, M.on_secondary_c, title, sub, cb, ud,
+			 sub_lbl, cb != NULL);
 }
 
 static void m3_section(lv_obj_t *parent, const char *title)
@@ -600,9 +613,12 @@ static void show(lv_obj_t *scr)
 }
 
 /* Back goes to the previous page; pages are a small stack. */
-#define NAV_MAX 6
+#define NAV_MAX 16	/* (Files: a page a folder) */
 static lv_obj_t *nav[NAV_MAX];
 static int nav_n;
+/* where an application was launched from (home, or a page such as Files):
+ * the picture behind its card, and the screen it ends on */
+static lv_obj_t *launch_from;
 static void app_bar_set(bool show);
 static bool locked;
 
@@ -641,6 +657,7 @@ static void go_home(void)
 	ui_settle_all();
 	if (page_home_over_app())
 		return;
+	launch_from = NULL;		/* Home: the application ends on home, not its page */
 	if (app_end())
 		return;
 	if (za_page_close())
@@ -3613,7 +3630,8 @@ static void za_home_fresh(void)
 		return;
 	lv_image_set_src(za.bg, NULL);
 	tr_free(&za.home);
-	za.home = snap(home_scr, LV_COLOR_FORMAT_XRGB8888);
+	za.home = snap(launch_from && lv_obj_is_valid(launch_from) ? launch_from : home_scr,
+		       LV_COLOR_FORMAT_XRGB8888);
 	za.home_min = bp_minute();
 	za.home_stale = false;
 }
@@ -3981,11 +3999,20 @@ static void app_home_ui(void)
 		 * a page like any other now (Home puts it into its tile) */
 		page_over_app = false;
 		za.page_tile = settings_tile;
-	} else if (lv_screen_active() != home_scr && !locked) {
-		lv_screen_load(home_scr);
+	} else {
+		/* back where the application was started: a page (Files) still
+		 * on the stack, else home (Home was pressed: the pages go) */
+		lv_obj_t *to = launch_from && launch_from != home_scr && lv_obj_is_valid(launch_from) &&
+			       nav_n > 0 && nav[nav_n - 1] == launch_from ? launch_from : home_scr;
+
+		if (to == home_scr)
+			while (nav_n > 0)
+				lv_obj_delete_async(nav[--nav_n]);
+		if (lv_screen_active() != to && !locked)
+			lv_screen_load(to);
+		if (locked)
+			lock_from = to;
 	}
-	if (locked)
-		lock_from = home_scr;
 	lv_obj_invalidate(lv_layer_top());
 	home_update(NULL);
 }
@@ -4163,7 +4190,8 @@ static void app_launch_cb(lv_event_t *e)
 		}
 	}
 	tr_free(&za.home);
-	za.home = grab_or_snap(home_scr);
+	launch_from = lv_screen_active();	/* home, or a page (Files) */
+	za.home = grab_or_snap(launch_from);
 	za.home_min = bp_minute();
 
 	za.cmd = cmd;
@@ -4185,16 +4213,47 @@ static void app_launch_cb(lv_event_t *e)
 }
 
 /* One tile for every manifest in APPS_DIR. */
-static void app_tiles(lv_obj_t *parent)
+/* A tile that starts @cmd: icon=<name> picks a symbol, @rgb the badge. */
+static void app_tile_cmd(lv_obj_t *parent, const char *name, const char *cmd,
+			 const char *icon, bool have_rgb, unsigned rgb)
+{
+	static const struct { const char *n, *sym; } syms[] = {
+		{ "video", LV_SYMBOL_VIDEO }, { "image", LV_SYMBOL_IMAGE },
+		{ "music", LV_SYMBOL_AUDIO }, { "gears", LV_SYMBOL_SETTINGS },
+		{ "shuffle", LV_SYMBOL_SHUFFLE }, { "eye", LV_SYMBOL_EYE_OPEN },
+		{ "file", LV_SYMBOL_FILE }, { "list", LV_SYMBOL_LIST },
+		{ "terminal", LV_SYMBOL_KEYBOARD }, { "gps", LV_SYMBOL_GPS },
+		{ "charge", LV_SYMBOL_CHARGE }, { "home", LV_SYMBOL_HOME },
+		{ "folder", LV_SYMBOL_DIRECTORY }, { "game", LV_SYMBOL_PLAY },
+		{ "web", LV_SYMBOL_WIFI },
+	};
+	uint32_t before = lv_obj_get_child_count(parent);
+	const char *sym = LV_SYMBOL_PLAY;
+	size_t k;
+
+	for (k = 0; k < sizeof(syms) / sizeof(syms[0]); k++)
+		if (!strcmp(icon, syms[k].n))
+			sym = syms[k].sym;
+	app_tile(parent, sym, name,
+		 have_rgb ? lv_color_hex(rgb) : M.secondary_c,
+		 have_rgb ? lv_color_white() : M.on_secondary_c, app_launch_cb);
+	/* the command rides on the tile's click */
+	if (lv_obj_get_child_count(parent) > before) {
+		lv_obj_t *t = lv_obj_get_child(parent, before);
+
+		lv_obj_remove_event_cb(t, app_launch_cb);
+		lv_obj_add_event_cb(t, app_launch_cb, LV_EVENT_CLICKED, strdup(cmd));
+	}
+}
+
+/* Our manifests: /usr/share/n72-ui/apps/NAME.app (name=, exec=, icon=, color=#). */
+static void app_tiles_n72(lv_obj_t *parent)
 {
 	DIR *d = opendir(APPS_DIR);
 	struct dirent *de;
 
-	if (!d || !mbx_gpu_on_shell_layer()) {
-		if (d)
-			closedir(d);
+	if (!d)
 		return;
-	}
 	while ((de = readdir(d))) {
 		char path[300], line[400], name[40] = "", cmd[400] = "", icon[24] = "";
 		unsigned rgb = 0;
@@ -4220,37 +4279,344 @@ static void app_tiles(lv_obj_t *parent)
 				have_rgb = sscanf(line + 7, "%x", &rgb) == 1;
 		}
 		fclose(f);
-		if (name[0] && cmd[0]) {
-			uint32_t before = lv_obj_get_child_count(parent);
-
-			/* icon=<name> picks a symbol, color=#rrggbb the badge */
-			static const struct { const char *n, *sym; } syms[] = {
-				{ "video", LV_SYMBOL_VIDEO }, { "image", LV_SYMBOL_IMAGE },
-				{ "music", LV_SYMBOL_AUDIO }, { "gears", LV_SYMBOL_SETTINGS },
-				{ "shuffle", LV_SYMBOL_SHUFFLE }, { "eye", LV_SYMBOL_EYE_OPEN },
-				{ "file", LV_SYMBOL_FILE }, { "list", LV_SYMBOL_LIST },
-				{ "terminal", LV_SYMBOL_KEYBOARD }, { "gps", LV_SYMBOL_GPS },
-				{ "charge", LV_SYMBOL_CHARGE }, { "home", LV_SYMBOL_HOME },
-			};
-			const char *sym = LV_SYMBOL_PLAY;
-			size_t k;
-
-			for (k = 0; k < sizeof(syms) / sizeof(syms[0]); k++)
-				if (!strcmp(icon, syms[k].n))
-					sym = syms[k].sym;
-			app_tile(parent, sym, name,
-				 have_rgb ? lv_color_hex(rgb) : M.secondary_c,
-				 have_rgb ? lv_color_white() : M.on_secondary_c, app_launch_cb);
-			/* the manifest's command rides on the tile's click */
-			if (lv_obj_get_child_count(parent) > before) {
-				lv_obj_t *t = lv_obj_get_child(parent, before);
-
-				lv_obj_remove_event_cb(t, app_launch_cb);
-				lv_obj_add_event_cb(t, app_launch_cb, LV_EVENT_CLICKED, strdup(cmd));
-			}
-		}
+		if (name[0] && cmd[0])
+			app_tile_cmd(parent, name, cmd, icon, have_rgb, rgb);
 	}
 	closedir(d);
+}
+
+/*
+ * Packaged applications: freedesktop .desktop files. Only those that can
+ * run here: no desktop session (X11, Wayland) and so no GTK or Qt; told by
+ * the program's ELF header, which names the libraries it needs.
+ */
+#define DESKTOP_DIR "/usr/share/applications"
+
+static bool prog_path(const char *prog, char *out, size_t len)
+{
+	const char *path = getenv("PATH"), *p;
+
+	if (strchr(prog, '/')) {
+		snprintf(out, len, "%s", prog);
+		return access(out, X_OK) == 0;
+	}
+	if (!path || !*path)
+		path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+	for (p = path; *p; ) {
+		size_t n = strcspn(p, ":");
+
+		snprintf(out, len, "%.*s/%s", (int)n, p, prog);
+		if (n && access(out, X_OK) == 0)
+			return true;
+		p += n;
+		if (*p == ':')
+			p++;
+	}
+	return false;
+}
+
+/* the program needs a desktop session: it links X11, Wayland, GTK or Qt */
+static bool needs_desktop(const char *path)
+{
+	static const char *const libs[] = { "libX11.so", "libwayland-client.so",
+		"libgtk-", "libQt5", "libQt6" };
+	size_t len = 512 * 1024, got, i;	/* the dynamic section is near the start */
+	char *buf = malloc(len);
+	bool hit = false;
+	FILE *f = fopen(path, "rb");
+
+	if (!buf || !f) {
+		free(buf);
+		if (f)
+			fclose(f);
+		return false;
+	}
+	got = fread(buf, 1, len, f);
+	fclose(f);
+	for (i = 0; i < sizeof(libs) / sizeof(libs[0]) && !hit; i++)
+		hit = memmem(buf, got, libs[i], strlen(libs[i])) != NULL;
+	free(buf);
+	return hit;
+}
+
+static void app_tiles_desktop(lv_obj_t *parent)
+{
+	DIR *d = opendir(DESKTOP_DIR);
+	struct dirent *de;
+
+	if (!d)
+		return;
+	while ((de = readdir(d))) {
+		char path[300], line[512], name[40] = "", cmd[400] = "", icon[24] = "";
+		char prog[PATH_MAX], arg0[256];
+		unsigned rgb = 0;
+		bool have_rgb = false, skip = false, entry = false, app = false;
+		size_t n = strlen(de->d_name);
+		FILE *f;
+		char *p, *q;
+
+		if (n < 9 || strcmp(de->d_name + n - 8, ".desktop"))
+			continue;
+		snprintf(path, sizeof(path), DESKTOP_DIR "/%s", de->d_name);
+		f = fopen(path, "r");
+		if (!f)
+			continue;
+		while (fgets(line, sizeof(line), f)) {
+			line[strcspn(line, "\r\n")] = 0;
+			if (line[0] == '[') {		/* only the main group */
+				entry = !strcmp(line, "[Desktop Entry]");
+				continue;
+			}
+			if (!entry)
+				continue;
+			if (!strncmp(line, "Name=", 5))
+				snprintf(name, sizeof(name), "%s", line + 5);
+			else if (!strncmp(line, "Exec=", 5))
+				snprintf(cmd, sizeof(cmd), "%s", line + 5);
+			else if (!strncmp(line, "Type=", 5))
+				app = !strcmp(line + 5, "Application");
+			else if (!strcmp(line, "NoDisplay=true") || !strcmp(line, "Hidden=true") ||
+				 !strcmp(line, "Terminal=true"))
+				skip = true;
+			else if (!strncmp(line, "X-N72-Icon=", 11))
+				snprintf(icon, sizeof(icon), "%s", line + 11);
+			else if (!strncmp(line, "X-N72-Color=#", 13))
+				have_rgb = sscanf(line + 13, "%x", &rgb) == 1;
+			else if (!icon[0] && !strncmp(line, "Categories=", 11))
+				snprintf(icon, sizeof(icon), "%s",
+					 strstr(line, "Game") ? "game" : strstr(line, "WebBrowser") ? "web" :
+					 strstr(line, "AudioVideo") ? "video" : strstr(line, "Graphics") ? "image" : "");
+		}
+		fclose(f);
+		if (skip || !app || !name[0] || !cmd[0])
+			continue;
+		/* field codes (%f %U ...) out: started without a file */
+		for (p = q = cmd; *p; p++) {
+			if (*p == '%' && p[1]) {
+				p++;
+				if (*p == '%')
+					*q++ = '%';
+				continue;
+			}
+			*q++ = *p;
+		}
+		*q = 0;
+		snprintf(arg0, sizeof(arg0), "%.*s", (int)strcspn(cmd, " \t"), cmd);
+		if (!prog_path(arg0, prog, sizeof(prog)) || needs_desktop(prog))
+			continue;
+		app_tile_cmd(parent, name, cmd, icon, have_rgb, rgb);
+	}
+	closedir(d);
+}
+
+static void app_tiles(lv_obj_t *parent)
+{
+	if (!mbx_gpu_on_shell_layer())
+		return;
+	app_tiles_n72(parent);
+	app_tiles_desktop(parent);
+}
+
+/* -------------------------------------------------------------- files */
+
+/*
+ * Files: a page a folder, from FILES_ROOT (Back goes up a level, as any
+ * page). Folders first, then files, by name; video and sound open with
+ * n72-video, launched from the row as an application from its tile.
+ */
+#define FILES_ROOT	"/root"
+#define FILES_MAX	400
+
+struct fent {
+	char *name;
+	bool dir;
+	off_t size;
+};
+
+static int fent_cmp(const void *a, const void *b)
+{
+	const struct fent *x = a, *y = b;
+
+	if (x->dir != y->dir)
+		return x->dir ? -1 : 1;
+	return strcasecmp(x->name, y->name);
+}
+
+/* video, sound, picture or other, by the name's extension (*kind: its word) */
+static const char *files_icon(const char *name, bool *media, const char **kind)
+{
+	static const char *const video[] = { "mp4", "m4v", "mov", "mkv", "webm", "avi",
+		"flv", "3gp", "h264", "264", "m2v", "mpg", "mpeg", "ts" };
+	static const char *const audio[] = { "mp3", "m4a", "aac", "ogg", "oga", "opus",
+		"wav", "flac" };
+	static const char *const image[] = { "png", "jpg", "jpeg", "gif", "bmp", "webp" };
+	const char *e = strrchr(name, '.');
+	size_t i;
+
+	*media = false;
+	*kind = "File";
+	if (!e)
+		return LV_SYMBOL_FILE;
+	e++;
+	for (i = 0; i < sizeof(video) / sizeof(video[0]); i++)
+		if (!strcasecmp(e, video[i]))
+			return *media = true, *kind = "Video", LV_SYMBOL_VIDEO;
+	for (i = 0; i < sizeof(audio) / sizeof(audio[0]); i++)
+		if (!strcasecmp(e, audio[i]))
+			return *media = true, *kind = "Audio", LV_SYMBOL_AUDIO;
+	for (i = 0; i < sizeof(image) / sizeof(image[0]); i++)
+		if (!strcasecmp(e, image[i]))
+			return *kind = "Picture", LV_SYMBOL_IMAGE;
+	return LV_SYMBOL_FILE;
+}
+
+static void files_size(off_t n, char *buf, size_t len)
+{
+	if (n < 1024)
+		snprintf(buf, len, "%ld bytes", (long)n);
+	else if (n < 1024 * 1024)
+		snprintf(buf, len, "%.1f kB", n / 1024.0);
+	else if (n < 1024L * 1024 * 1024)
+		snprintf(buf, len, "%.1f MB", n / (1024.0 * 1024));
+	else
+		snprintf(buf, len, "%.1f GB", n / (1024.0 * 1024 * 1024));
+}
+
+static void files_free_ud(lv_event_t *e)
+{
+	free(lv_event_get_user_data(e));
+}
+
+/* "12 items" (visible ones; counted up to 999) */
+static void files_count(const char *path, char *buf, size_t len)
+{
+	DIR *d = opendir(path);
+	struct dirent *de;
+	int n = 0;
+
+	if (!d) {
+		snprintf(buf, len, "Folder");
+		return;
+	}
+	while (n < 999 && (de = readdir(d)))
+		if (de->d_name[0] != '.')
+			n++;
+	closedir(d);
+	snprintf(buf, len, n == 0 ? "Empty" : n == 1 ? "1 item" : n == 999 ? "999+ items" : "%d items", n);
+}
+
+static void files_open_dir(const char *path);
+
+static void files_dir_cb(lv_event_t *e)
+{
+	files_open_dir(lv_event_get_user_data(e));
+}
+
+static void files_open_dir(const char *path)
+{
+	const char *title = !strcmp(path, FILES_ROOT) ? "Files" : strrchr(path, '/') + 1;
+	struct fent *v = calloc(FILES_MAX, sizeof(*v));
+	lv_obj_t *scr, *body, *c, *row;
+	struct dirent *de;
+	int n = 0, i;
+	DIR *d;
+
+	if (!v)
+		return;
+	body = m3_page(title, &scr);
+	d = opendir(path);
+	while (d && n < FILES_MAX && (de = readdir(d))) {
+		struct stat st;
+
+		if (de->d_name[0] == '.' || fstatat(dirfd(d), de->d_name, &st, 0))
+			continue;
+		v[n].name = strdup(de->d_name);
+		if (!v[n].name)
+			break;
+		v[n].dir = S_ISDIR(st.st_mode);
+		v[n].size = st.st_size;
+		n++;
+	}
+	qsort(v, n, sizeof(*v), fent_cmp);
+	if (!n) {
+		/* empty state: the icon large, a headline, what to do */
+		c = m3_card(body, M.surface_c);
+		lv_obj_set_height(c, LV_SIZE_CONTENT);
+		lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+		lv_obj_set_flex_align(c, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+		lv_obj_set_style_pad_ver(c, 24, 0);
+		lv_obj_set_style_pad_row(c, 8, 0);
+		m3_badge(c, LV_SYMBOL_DIRECTORY, M.surface_c_highest, M.on_surface_v, 56);
+		m3_label(c, d ? "Nothing here yet" : "Cannot open this folder",
+			 &lv_font_montserrat_16, M.on_surface);
+		row = m3_label(c, d ? "Copy files over SSH or USB into this folder." :
+			       "You may not have permission to read it.",
+			       &lv_font_montserrat_14, M.on_surface_v);
+		lv_obj_set_width(row, lv_pct(100));
+		lv_label_set_long_mode(row, LV_LABEL_LONG_WRAP);
+		lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_CENTER, 0);
+	} else {
+		int nd = 0;
+
+		while (nd < n && v[nd].dir)
+			nd++;
+		c = NULL;
+		for (i = 0; i < n; i++) {
+			char full[PATH_MAX], sub[48], *ud;
+
+			if (i == 0 || i == nd) {	/* a section and its card: folders, then files */
+				m3_section(body, i < nd ? "Folders" : "Files");
+				c = m3_card(body, M.surface_c);
+				lv_obj_set_style_pad_all(c, 4, 0);
+				lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+			}
+			snprintf(full, sizeof(full), "%s/%s", path, v[i].name);
+			if (v[i].dir) {
+				files_count(full, sub, sizeof(sub));
+				ud = strdup(full);
+				row = m3_row_ex(c, LV_SYMBOL_DIRECTORY, M.primary_c, M.on_primary_c,
+						v[i].name, sub, ud ? files_dir_cb : NULL, ud, NULL, true);
+			} else {
+				const char *icon, *kind;
+				char size[24];
+				bool media;
+
+				icon = files_icon(v[i].name, &media, &kind);
+				files_size(v[i].size, size, sizeof(size));
+				snprintf(sub, sizeof(sub), "%s, %s", kind, size);	/* (the fonts are ASCII) */
+				ud = NULL;
+				if (media) {
+					char q[PATH_MAX * 2];
+
+					shq(full, q, sizeof(q));
+					ud = malloc(strlen(q) + 16);
+					if (ud)
+						sprintf(ud, "n72-video %s", q);
+				}
+				/* opened as an application from its tile (app_launch_cb) */
+				row = m3_row_ex(c, icon,
+						media ? M.tertiary_c : M.secondary_c,
+						media ? M.on_tertiary_c : M.on_secondary_c,
+						v[i].name, sub, ud ? app_launch_cb : NULL, ud, NULL, false);
+			}
+			if (ud)
+				lv_obj_add_event_cb(row, files_free_ud, LV_EVENT_DELETE, ud);
+		}
+		if (n == FILES_MAX)
+			m3_note(body, "Only the first 400 entries are shown.");
+	}
+	for (i = 0; i < n; i++)
+		free(v[i].name);
+	free(v);
+	if (d)
+		closedir(d);
+	push(scr);
+}
+
+static void open_files(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	files_open_dir(FILES_ROOT);
 }
 
 static void open_paint(lv_event_t *e);
@@ -4327,6 +4693,8 @@ static void build_home(void)
 	settings_tile = page_tile_anim(apps, open_settings);
 	app_tile(apps, LV_SYMBOL_EDIT, "Paint", M.tertiary_c, M.on_tertiary_c, open_paint);
 	page_tile_anim(apps, open_paint);
+	app_tile(apps, LV_SYMBOL_DIRECTORY, "Files", M.secondary_c, M.on_secondary_c, open_files);
+	page_tile_anim(apps, open_files);
 	app_tiles(apps);
 
 	build_shade();
@@ -5451,11 +5819,10 @@ static void snd_test_cb(lv_event_t *e)
 	LV_UNUSED(e);
 	if (!have_tool("n72tone"))
 		return;
-	if (bta.on)	/* through ALSA's default: the Bluetooth device */
-		job_run("/usr/bin/n72tone -w -f 660 -a -12 -t 0.6 -r 48000 | "
-			"aplay -q -D default -f S16_LE -c 2 -r 48000", NULL, NULL, NULL);
-	else
-		job_run("/usr/bin/n72tone -f 660 -a -12 -t 0.6", NULL, NULL, NULL);
+	/* through ALSA's default: mixed with what plays (dmix), or the
+	 * Bluetooth device while one is connected */
+	job_run("/usr/bin/n72tone -w -f 660 -a -12 -t 0.6 -r 44100 | "
+		"aplay -q -D default -f S16_LE -c 2 -r 44100", NULL, NULL, NULL);
 }
 
 static void open_sound(lv_event_t *e)
