@@ -1898,6 +1898,24 @@ static bool flip_setup(uint32_t size)
 		return false;
 	for (i = 0; i < NSCAN; i++) {
 		scan[i] = region_add(size, MBX_ALLOC_CACHED | MBX_ALLOC_CONTIG, &scan_handle[i]);
+		if (!scan[i]) {
+			/*
+			 * Contiguous memory can run out by fragmentation after a
+			 * long uptime: have the kernel compact memory, once, and
+			 * try again (without flipping the screen is wrong).
+			 */
+			int fd = open("/proc/sys/vm/compact_memory", O_WRONLY | O_CLOEXEC);
+
+			if (fd >= 0) {
+				if (write(fd, "1", 1) < 0)
+					;
+				close(fd);
+			}
+			scan[i] = region_add(size, MBX_ALLOC_CACHED | MBX_ALLOC_CONTIG,
+					     &scan_handle[i]);
+			if (scan[i])
+				fprintf(stderr, "n72-ui: contiguous memory after compaction\n");
+		}
 		if (!scan[i])
 			return false;	/* (the regions stay mapped; unused) */
 	}

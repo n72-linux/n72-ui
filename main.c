@@ -1656,6 +1656,7 @@ int main(int argc, char **argv)
 		const char *r = getenv("N72_ROT");
 
 		if (r && (atoi(r) == 90 || atoi(r) == 270) && mbx_gpu_set_rotation(atoi(r))) {
+			ui_rot = atoi(r);
 			ui_w = lv_display_get_horizontal_resolution(disp);
 			ui_h = lv_display_get_vertical_resolution(disp);
 		}

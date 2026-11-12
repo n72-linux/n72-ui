@@ -180,6 +180,26 @@ static void m3_screen(lv_obj_t *scr)
 	lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 }
 
+/*
+ * A global that points at an object of a page: cleared when the object
+ * is deleted (the page closed, or rebuilt by a turn). lv_obj_is_valid()
+ * alone is not enough: a new object may take the freed one's address, and
+ * the old pointer then "is valid" but points at something else.
+ */
+static void obj_untrack_cb(lv_event_t *e)
+{
+	lv_obj_t **pp = lv_event_get_user_data(e);
+
+	if (*pp == lv_event_get_target(e))
+		*pp = NULL;
+}
+
+static void obj_track(lv_obj_t **pp)
+{
+	if (*pp)
+		lv_obj_add_event_cb(*pp, obj_untrack_cb, LV_EVENT_DELETE, pp);
+}
+
 static void plain(lv_obj_t *o)
 {
 	lv_obj_set_style_border_width(o, 0, 0);
@@ -1877,7 +1897,11 @@ static void shade_changed(lv_obj_t *o);
 
 static void label_set_if_changed(lv_obj_t *lbl, const char *text)
 {
-	const char *cur = lv_label_get_text(lbl);
+	const char *cur;
+
+	if (!lbl)
+		return;
+	cur = lv_label_get_text(lbl);
 
 	if (!cur || strcmp(cur, text)) {
 		lv_label_set_text(lbl, text);
@@ -2038,6 +2062,9 @@ static void status_row(lv_obj_t *bar, lv_obj_t **time, lv_obj_t **wifi, lv_obj_t
 static void qs_style(lv_obj_t *tile, bool on)
 {
 	lv_color_t c = on ? M.primary_c : M.surface_c_high;
+
+	if (!tile)
+		return;
 
 	if (!lv_color_eq(lv_obj_get_style_bg_color(tile, 0), c)) {
 		lv_obj_set_style_bg_color(tile, c, 0);
@@ -4900,8 +4927,10 @@ static void wifi_ask_password(const char *ssid)
 
 	snprintf(pw_ssid, sizeof(pw_ssid), "%s", ssid);
 	body = m3_page(ssid, &pw_scr);
+	obj_track(&pw_scr);
 	m3_label(body, "Password (at least 8 characters)", &lv_font_montserrat_14, M.on_surface_v);
 	pw_ta = lv_textarea_create(body);
+	obj_track(&pw_ta);
 	lv_textarea_set_one_line(pw_ta, true);
 	lv_textarea_set_password_mode(pw_ta, true);
 	lv_obj_set_width(pw_ta, lv_pct(100));
@@ -5124,11 +5153,13 @@ static void open_wifi(lv_event_t *e)
 	LV_UNUSED(e);
 	if (!have_tool("wpa_cli")) {
 		body = m3_page("Wi-Fi", &wifi_page);
+		obj_track(&wifi_page);
 		m3_note(m3_card(body, M.surface_c), "wpa_supplicant is not installed.");
 		push(wifi_page);
 		return;
 	}
 	body = m3_page("Wi-Fi", &wifi_page);
+	obj_track(&wifi_page);
 	/* the switch on its own card ... */
 	c = m3_card(body, M.primary_c);
 	lv_obj_set_height(c, 64);
@@ -5136,6 +5167,7 @@ static void open_wifi(lv_event_t *e)
 		     LV_ALIGN_LEFT_MID, 0, 0);
 	if (have_tool("n72-wifi")) {
 		wifi_switch = lv_switch_create(c);
+		obj_track(&wifi_switch);
 		lv_obj_align(wifi_switch, LV_ALIGN_RIGHT_MID, 0, 0);
 		lv_obj_add_event_cb(wifi_switch, wifi_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
 		switch_show(wifi_switch, wifi_shown_on());
@@ -5147,12 +5179,14 @@ static void open_wifi(lv_event_t *e)
 	lv_obj_set_style_pad_row(c, 2, 0);
 	m3_label(c, "Connection", &lv_font_montserrat_14, M.on_surface_v);
 	wifi_state_lbl = m3_label(c, "...", &lv_font_montserrat_16, M.on_surface);
+	obj_track(&wifi_state_lbl);
 	lv_obj_set_width(wifi_state_lbl, lv_pct(100));
 	lv_label_set_long_mode(wifi_state_lbl, LV_LABEL_LONG_WRAP);
 
 	m3_section(body, "Networks");
 	wifi_last_sig[0] = 0;
 	wifi_list = lv_obj_create(body);
+	obj_track(&wifi_list);
 	plain(wifi_list);
 	lv_obj_set_width(wifi_list, lv_pct(100));
 	lv_obj_set_height(wifi_list, LV_SIZE_CONTENT);
@@ -5164,6 +5198,7 @@ static void open_wifi(lv_event_t *e)
 	m3_label(wifi_list, "Looking for networks...", &lv_font_montserrat_14, M.on_surface_v);
 	b = m3_button(body, "Scan", false, wifi_scan_cb, NULL);
 	wifi_scan_btn_lbl = lv_obj_get_child(b, 0);
+	obj_track(&wifi_scan_btn_lbl);
 	m3_note(body, "Long-press a saved network to forget it.");
 	push(wifi_page);
 	job_run("wpa_cli -i wlan0 scan; sleep 3", wifi_page, wifi_cmd_done, NULL);
@@ -5345,6 +5380,7 @@ static void open_bt(lv_event_t *e)
 
 	LV_UNUSED(e);
 	body = m3_page("Bluetooth", &bt_page);
+	obj_track(&bt_page);
 	if (!have_tool("bluetoothctl")) {
 		c = m3_card(body, M.surface_c);
 		m3_note(c, "BlueZ (bluetoothctl) is not installed.");
@@ -5354,16 +5390,19 @@ static void open_bt(lv_event_t *e)
 	c = m3_card(body, M.primary_c);
 	lv_obj_set_height(c, 72);
 	bt_state_lbl = m3_label(c, "...", &lv_font_montserrat_16, M.on_primary_c);
+	obj_track(&bt_state_lbl);
 	lv_obj_align(m3_label(c, "Use Bluetooth", &lv_font_montserrat_14, M.on_primary_c),
 		     LV_ALIGN_TOP_LEFT, 0, 0);
 	lv_obj_align(bt_state_lbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 	bt_switch = lv_switch_create(c);
+	obj_track(&bt_switch);
 	lv_obj_align(bt_switch, LV_ALIGN_RIGHT_MID, 0, 0);
 	lv_obj_add_event_cb(bt_switch, bt_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
 	net_ui_sync();
 
 	m3_section(body, "Devices");
 	bt_list = lv_obj_create(body);
+	obj_track(&bt_list);
 	plain(bt_list);
 	lv_obj_set_width(bt_list, lv_pct(100));
 	lv_obj_set_height(bt_list, LV_SIZE_CONTENT);
@@ -5374,6 +5413,7 @@ static void open_bt(lv_event_t *e)
 	lv_obj_remove_flag(bt_list, LV_OBJ_FLAG_SCROLLABLE);
 	b = m3_button(body, "Scan", false, bt_scan_cb, NULL);
 	bt_scan_lbl = lv_obj_get_child(b, 0);
+	obj_track(&bt_scan_lbl);
 	m3_note(body, "Long-press a paired device to forget it.");
 	push(bt_page);
 	bt_page_refresh();
@@ -5454,6 +5494,7 @@ static void open_display(lv_event_t *e)
 	lv_slider_set_value(s, backlight_get(), LV_ANIM_OFF);
 	lv_obj_add_event_cb(s, bright_cb, LV_EVENT_VALUE_CHANGED, NULL);
 	bright_val = m3_label(c, "", &lv_font_montserrat_14, M.on_surface_v);
+	obj_track(&bright_val);
 	lv_label_set_text_fmt(bright_val, "%d%%", backlight_get());
 
 	m3_section(body, "Theme");
@@ -5643,6 +5684,7 @@ static void open_about(lv_event_t *e)
 		lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
 		m3_label(c, titles[i], &lv_font_montserrat_12, M.primary);
 		about_val[i] = m3_label(c, "", &lv_font_montserrat_14, M.on_surface);
+		obj_track(&about_val[i]);
 		lv_obj_set_width(about_val[i], lv_pct(100));
 		lv_label_set_long_mode(about_val[i], LV_LABEL_LONG_WRAP);
 	}
@@ -5957,6 +5999,7 @@ static void open_sound(lv_event_t *e)
 	LV_UNUSED(e);
 	body = m3_page("Sound", &scr);
 	snd_page = scr;
+	obj_track(&snd_page);
 
 	m3_section(body, "Volume");
 	c = m3_card(body, M.surface_c);
@@ -5965,17 +6008,20 @@ static void open_sound(lv_event_t *e)
 	lv_obj_set_style_pad_column(c, 12, 0);
 	m3_label(c, LV_SYMBOL_VOLUME_MAX, &lv_font_montserrat_20, M.on_surface_v);
 	snd_slider = lv_slider_create(c);
+	obj_track(&snd_slider);
 	lv_obj_set_flex_grow(snd_slider, 1);
 	lv_slider_set_range(snd_slider, 0, 100);
 	lv_slider_set_value(snd_slider, conf.vol, LV_ANIM_OFF);
 	lv_obj_add_event_cb(snd_slider, snd_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
 	snd_val = m3_label(c, "", &lv_font_montserrat_14, M.on_surface_v);
+	obj_track(&snd_val);
 
 	m3_section(body, "Output");
 	c = m3_card(body, M.surface_c);
 	lv_obj_set_style_pad_all(c, 4, 0);
 	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
 	m3_row(c, LV_SYMBOL_AUDIO, "Playing on", snd_output_name(), NULL, NULL, &snd_out_lbl);
+	obj_track(&snd_out_lbl);
 	row = m3_row(c, LV_SYMBOL_VOLUME_MAX, "Speaker", "When no earphones are plugged in",
 		     NULL, NULL, NULL);
 	sw = lv_switch_create(row);
@@ -6010,9 +6056,11 @@ static void open_settings(lv_event_t *e)
 	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
 	m3_row(c, LV_SYMBOL_WIFI, "Wi-Fi", wifi_up ? wifi_ssid : "Not connected",
 	       open_wifi, NULL, &set_wifi_sub);
+	obj_track(&set_wifi_sub);
 	m3_row(c, LV_SYMBOL_BLUETOOTH, "Bluetooth",
 	       !have_tool("bluetoothctl") ? "Not installed" : bt_powered ? "On" : "Off",
 	       open_bt, NULL, &set_bt_sub);
+	obj_track(&set_bt_sub);
 
 	c = m3_card(body, M.surface_c);
 	lv_obj_set_style_pad_all(c, 4, 0);
@@ -6022,6 +6070,7 @@ static void open_settings(lv_event_t *e)
 	m3_row(c, LV_SYMBOL_IMAGE, "Display", sub, open_display, NULL, NULL);
 	snd_summary(sub, sizeof(sub));
 	m3_row(c, LV_SYMBOL_VOLUME_MAX, "Sound", sub, open_sound, NULL, &set_snd_sub);
+	obj_track(&set_snd_sub);
 	m3_row(c, LV_SYMBOL_POWER, "Power", "Sleep, restart, power off", open_power, NULL, NULL);
 
 	c = m3_card(body, M.surface_c);
@@ -6085,6 +6134,7 @@ static void logs_set_chunks(const char *text)
 		part[len] = 0;
 		if (c == logs_nchunks) {
 			logs_chunk[c] = m3_label(logs_box, "", &lv_font_montserrat_12, M.on_surface);
+			obj_track(&logs_chunk[c]);
 			lv_obj_set_width(logs_chunk[c], lv_pct(100));
 			lv_label_set_long_mode(logs_chunk[c], LV_LABEL_LONG_WRAP);
 			logs_nchunks++;
@@ -6187,8 +6237,10 @@ static void open_logs(lv_event_t *e)
 	body = m3_page("Logs", &scr);
 	lv_obj_remove_flag(body, LV_OBJ_FLAG_SCROLLABLE);
 	logs_net = m3_label(body, "", &lv_font_montserrat_12, M.primary);
+	obj_track(&logs_net);
 	lv_obj_set_width(logs_net, lv_pct(100));
 	logs_box = lv_obj_create(body);
+	obj_track(&logs_box);
 	plain(logs_box);
 	lv_obj_set_width(logs_box, lv_pct(100));
 	lv_obj_set_flex_grow(logs_box, 1);
@@ -6326,6 +6378,7 @@ static void open_paint(lv_event_t *e)
 		return;
 	}
 	paint_canvas = lv_canvas_create(body);
+	obj_track(&paint_canvas);
 	lv_canvas_set_buffer(paint_canvas, paint_buf, PAINT_W, PAINT_H, LV_COLOR_FORMAT_XRGB8888);
 	lv_obj_add_flag(paint_canvas, LV_OBJ_FLAG_CLICKABLE);
 	lv_obj_remove_flag(paint_canvas, LV_OBJ_FLAG_GESTURE_BUBBLE);
@@ -6478,6 +6531,21 @@ static bool ui_turn(int rot)
 	if (shade_warm_timer) {
 		lv_timer_delete(shade_warm_timer);
 		shade_warm_timer = NULL;
+	}
+	/* what pointed into them (net_ui_sync and the status updates run
+	 * while the new ones are built: they skip what is NULL) */
+	{
+		lv_obj_t **gone[] = {
+			&app_bar_time, &app_bar_batt, &app_bar_wifi, &app_bar_bt,
+			&status_time, &status_wifi, &status_bt, &batt_lbl,
+			&clock_lbl, &date_lbl, &home_clock, &home_date, &home_batt, &home_net,
+			&qs_wifi, &qs_bt, &qs_wifi_sub, &qs_bt_sub, &qs_rot, &qs_rot_sub,
+			&home_bright, &qs_settings_btn, &settings_tile, &home_apps,
+			&vol_hud_slider, &vol_hud_icon,
+		};
+
+		for (i = 0; i < (int)(sizeof(gone) / sizeof(gone[0])); i++)
+			*gone[i] = NULL;
 	}
 	/* the picture of where an application was launched, and its tile */
 	za.tile = NULL;
