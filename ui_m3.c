@@ -3456,6 +3456,7 @@ static void ul_finish(bool open)
 {
 	if (open) {
 		locked = false;
+		rot_kick();	/* (unlocked: a turn may be due) */
 		lv_screen_load(lock_from && lv_obj_is_valid(lock_from) ? lock_from : home_scr);
 		ul_free();
 		if (lock_from == app_scr && app_pid > 0)
@@ -4326,6 +4327,7 @@ static void app_closed(void)
 
 	app_pid = 0;
 	app_pidfd_close();
+	rot_kick();		/* (a player gone: no reads needed) */
 	vc_stop();
 	if (app_timer) {
 		lv_timer_delete(app_timer);
@@ -4446,6 +4448,7 @@ static void za_spawn_cb(lv_timer_t *t)
 	posix_spawnattr_destroy(&at);
 	free(envp);
 	app_pid = pid;
+	rot_kick();		/* (a player turns with the iPod) */
 	if (pid > 0) {
 		/* its end as an event: a pidfd in the main loop's poll() */
 		app_pidfd_close();
@@ -7235,6 +7238,20 @@ static void open_paint(lv_event_t *e)
 #define ROT_POS "/sys/devices/platform/lis3lv02d/position"
 #define ROT_G 550		/* mg along an axis to count as down */
 #define ROT_HOLD_MS 450
+/*
+ * The chip's motion wake (kernel "motion"): while a turn is possible the
+ * accelerometer watches for a move itself and the kernel notifies
+ * "position" (POLLPRI in the main loop's poll()); the timer reads 5 times
+ * a second only from then until the reading has been still ROT_SETTLE_MS
+ * and the screen is turned to match, then arms the chip again and rests.
+ * Without it (an older kernel) the timer reads all the time, as before.
+ */
+#define ROT_MOTION "/sys/devices/platform/lis3lv02d/motion"
+#define ROT_SETTLE_MS 1000
+static int rot_pos_fd = -1;		/* "position", kept open: notified, and read */
+static bool rot_ev;			/* the kernel has the motion wake */
+static bool rot_on;			/* we asked it to watch (the chip kept on) */
+static uint32_t rot_move_ms;		/* the last move: an event or a new reading */
 
 static int ui_rot;			/* the screen's turn now */
 static int rot_seen = -1;		/* the way the iPod is held, -1 unknown */
@@ -7250,13 +7267,18 @@ static void vc_turned(void);
 static int rot_read(void)
 {
 	char buf[64];
-	int fd = open(ROT_POS, O_RDONLY | O_CLOEXEC), x, y, z;
+	int fd, x, y, z;
 	ssize_t n;
 
-	if (fd < 0)
-		return -1;
-	n = read(fd, buf, sizeof(buf) - 1);
-	close(fd);
+	if (rot_pos_fd >= 0) {
+		n = pread(rot_pos_fd, buf, sizeof(buf) - 1, 0);	/* (also takes the notification) */
+	} else {
+		fd = open(ROT_POS, O_RDONLY | O_CLOEXEC);
+		if (fd < 0)
+			return -1;
+		n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+	}
 	if (n <= 0)
 		return -1;
 	buf[n] = 0;
@@ -7722,28 +7744,72 @@ static bool rot_can_turn(void)
 	return a == home_scr || (nav_n && a == nav[nav_n - 1]) || (app_pid > 0 && a == app_scr);
 }
 
+static void rot_motion(bool on)
+{
+	int fd = open(ROT_MOTION, O_WRONLY | O_CLOEXEC);
+
+	if (fd >= 0) {
+		if (write(fd, on ? "1" : "0", 1) != 1)
+			on = false;
+		close(fd);
+	}
+	rot_on = on;
+}
+
+/* The screen went dark: nothing to watch for (screen_set). */
+static void rot_motion_off(void)
+{
+	if (rot_on)
+		rot_motion(false);
+}
+
+/* Something that changes what a turn needs: look now (the timer may rest). */
+static void rot_kick(void)
+{
+	if (rot_timer && !screen_off) {
+		lv_timer_resume(rot_timer);
+		lv_timer_ready(rot_timer);
+	}
+}
+
+/* The accelerometer saw a move: read it 5 times a second until it settles. */
+static void rot_pos_ev(int fd)
+{
+	char buf[64];
+
+	if (pread(fd, buf, sizeof(buf), 0) < 0)	/* (the notification taken) */
+		return;
+	rot_move_ms = lv_tick_get();
+	rot_kick();
+}
+
 static void rot_poll(lv_timer_t *t)
 {
+	bool reads = conf.autorot != ROT_PORTRAIT || (app_pid > 0 && app_is_video());
+	bool need = !screen_off && !locked && (reads || ui_rot != 0);
 	int r, want;
 
-	{
+	if (!rot_ev) {
 		/* 5 a second only while a turn can happen (each read is an I2C
 		 * transfer and a wake-up); else every 2 s, to notice */
-		bool need = !screen_off && !locked &&
-			    (conf.autorot != ROT_PORTRAIT || (app_pid > 0 && app_is_video()) ||
-			     ui_rot != 0);
 		uint32_t period = need ? 200 : 2000;
 
 		if (t->period != period)
 			lv_timer_set_period(t, period);
+	} else if (!need) {
+		rot_motion_off();
+		lv_timer_pause(t);	/* (rot_kick, or the screen lit, looks again) */
+		return;
+	} else if (t->period != 200) {
+		lv_timer_set_period(t, 200);
 	}
 	if (screen_off || locked)
 		return;
-	if (conf.autorot != ROT_PORTRAIT || (app_pid > 0 && app_is_video())) {
+	if (reads) {
 		r = rot_read();
 		if (r >= 0 && r != rot_seen) {
 			rot_seen = r;
-			rot_seen_ms = lv_tick_get();
+			rot_seen_ms = rot_move_ms = lv_tick_get();
 			if (r)
 				rot_side = r;
 		}
@@ -7753,6 +7819,14 @@ static void rot_poll(lv_timer_t *t)
 	want = rot_wanted();
 	if (want != ui_rot && rot_can_turn())
 		ui_turn(want);
+	/* still, and turned to match: the chip watches from here */
+	if (rot_ev && want == ui_rot && lv_tick_elaps(rot_move_ms) >= ROT_SETTLE_MS) {
+		if (reads)
+			rot_motion(true);	/* (armed around where it is now) */
+		else
+			rot_motion_off();
+		lv_timer_pause(t);
+	}
 }
 
 static void rot_conf_changed(void)
@@ -7761,10 +7835,16 @@ static void rot_conf_changed(void)
 	if (rot_seen > 0)
 		rot_side = rot_seen;
 	rot_seen_ms = 0;
+	rot_kick();
 }
 
 static void rot_init(void)
 {
+	rot_pos_fd = open(ROT_POS, O_RDONLY | O_CLOEXEC);
+	if (rot_pos_fd >= 0 && access(ROT_MOTION, W_OK) == 0) {
+		rot_ev = true;
+		ui_watch_ev(rot_pos_fd, rot_pos_ev, POLLPRI);
+	}
 	rot_timer = awake_timer(rot_poll, 200, NULL);	/* (dark: no accelerometer reads) */
 	if (conf.autorot != ROT_PORTRAIT)
 		rot_seen = rot_read();
@@ -8047,6 +8127,7 @@ static void vc_rot_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
 	video_rot = video_rot >= 0 ? -1 : ui_rot ? 0 : 90;	/* (90: sideways) */
+	rot_kick();
 	vc_rot_show();
 	vc_hide_later();
 }

@@ -554,6 +554,8 @@ static void awake_set(bool on)
 	}
 }
 
+static void rot_motion_off(void);
+
 static void screen_set(bool on)
 {
 	bool fade;
@@ -564,6 +566,8 @@ static void screen_set(bool on)
 	if (screen_off == on)
 		awake_set(on);		/* (on a change only) */
 	screen_off = !on;
+	if (!on)
+		rot_motion_off();	/* the accelerometer may power down */
 	if (fade && !on)
 		backlight_fade_out();
 	else if (fade)
@@ -598,27 +602,36 @@ static void screen_set(bool on)
  * D-Bus signals). Each has a callback, run when it is readable.
  */
 #define NWATCH 8
-static struct { int fd; void (*cb)(int fd); } watch[NWATCH];
+static struct { int fd; short events; void (*cb)(int fd); } watch[NWATCH];
 static int nwatch;
 
-static void ui_watch(int fd, void (*cb)(int fd))
+/* (events: POLLIN, or POLLPRI for a sysfs attribute the kernel notifies) */
+static void ui_watch_ev(int fd, void (*cb)(int fd), short events)
 {
 	int i;
 
 	for (i = 0; i < nwatch; i++)
 		if (watch[i].fd == fd) {
 			watch[i].cb = cb;
+			watch[i].events = events;
 			return;
 		}
 	if (fd >= 0 && nwatch < NWATCH) {
 		watch[nwatch].fd = fd;
+		watch[nwatch].events = events;
 		watch[nwatch].cb = cb;
 		nwatch++;
 	}
 }
 
+static void ui_watch(int fd, void (*cb)(int fd))
+{
+	ui_watch_ev(fd, cb, POLLIN);
+}
+
 static lv_timer_t *idle_timer;
 static void idle_kick(void);
+static void rot_kick(void);
 
 static void ui_unwatch(int fd)
 {
@@ -1941,12 +1954,12 @@ int main(int argc, char **argv)
 		nw = nwatch;	/* (after the timers, which may have changed it) */
 		for (w = 0; w < nw; w++) {
 			pf[3 + w].fd = watch[w].fd;
-			pf[3 + w].events = POLLIN;
+			pf[3 + w].events = watch[w].events;
 		}
 		/* until LVGL's next timer, or an event: no fixed tick */
 		if (poll(pf, 3 + nw, idle == LV_NO_TIMER_READY ? -1 : (int)LV_MIN(idle, 60000)) > 0) {
 			for (w = 0; w < nw; w++)
-				if ((pf[3 + w].revents & (POLLIN | POLLHUP | POLLERR)) &&
+				if ((pf[3 + w].revents & (POLLIN | POLLPRI | POLLHUP | POLLERR)) &&
 				    w < nwatch && watch[w].fd == pf[3 + w].fd)
 					watch[w].cb(pf[3 + w].fd);
 			if ((pf[0].revents & POLLIN) && rt_uinput >= 0) {
