@@ -1453,7 +1453,15 @@ static lv_obj_t *pf_body_on(lv_obj_t *scr)
 	return NULL;
 }
 
-/* One picture per tick, while nothing moves and nobody touches. */
+/*
+ * One picture per tick, while nothing moves and nobody touches. With
+ * nothing left to take (all near rows taken, the budget spent, a screen
+ * without a list, or the screen dark) the timer pauses: anything that
+ * could give it work again redraws something, and pf_invalidated()
+ * resumes it.
+ */
+static lv_timer_t *pf_timer;
+
 static void pf_tick(lv_timer_t *t)
 {
 	lv_obj_t *body, *units[SC_UNITS], *best = NULL;
@@ -1463,16 +1471,21 @@ static void pf_tick(lv_timer_t *t)
 	lv_draw_buf_t *b;
 	int k;
 
-	LV_UNUSED(t);
-	if (screen_off || tr.scr || sc.owner || lv_display_get_inactive_time(NULL) < 300)
+	if (screen_off) {
+		lv_timer_pause(t);
+		return;
+	}
+	if (tr.scr || sc.owner || lv_display_get_inactive_time(NULL) < 300)
 		return;
 	body = pf_body_on(lv_screen_active());
 	if (body != pf.owner) {
 		pf_clear();
 		pf.owner = body;
 	}
-	if (!body || pf.n >= PREF_MAX || pf.bytes >= PREF_BUDGET)
+	if (!body || pf.n >= PREF_MAX || pf.bytes >= PREF_BUDGET) {
+		lv_timer_pause(t);
 		return;
+	}
 	lv_obj_update_layout(body);
 	lv_obj_get_coords(body, &bc);
 	cnt = sc_units(body, units);
@@ -1492,7 +1505,11 @@ static void pf_tick(lv_timer_t *t)
 		best = c;
 		best_d = d;
 	}
-	if (!best || !(b = sc_picture(best)))
+	if (!best) {
+		lv_timer_pause(t);
+		return;
+	}
+	if (!(b = sc_picture(best)))
 		return;
 	pf.child[pf.n] = best;
 	pf.buf[pf.n++] = b;
@@ -1513,6 +1530,8 @@ static void pf_invalidated(lv_event_t *e)
 
 	lv_indev_t *in;
 
+	if (pf_timer && pf_timer->paused && !screen_off)
+		lv_timer_resume(pf_timer);
 	if (!pf.n || !a)
 		return;
 	for (in = lv_indev_get_next(NULL); in; in = lv_indev_get_next(in))
@@ -1539,7 +1558,7 @@ static void pf_init(void)
 		return;
 	lv_display_add_event_cb(lv_display_get_default(), pf_invalidated,
 				LV_EVENT_INVALIDATE_AREA, NULL);
-	lv_timer_create(pf_tick, 80, NULL);
+	pf_timer = lv_timer_create(pf_tick, 80, NULL);
 }
 
 static void sc_event(lv_event_t *e)
@@ -2951,11 +2970,18 @@ static lv_draw_buf_t *shade_pic;
 static bool shade_pic_dirty = true;
 static long shade_pic_min;
 
+static lv_timer_t *shade_warm_timer;
+
 static void shade_changed(lv_obj_t *o)
 {
 	for (; o; o = lv_obj_get_parent(o))
 		if (o == shade) {
 			shade_pic_dirty = true;
+			/* the warmer, resting till the next minute, looks again soon */
+			if (shade_warm_timer && shade_warm_timer->period != 1000) {
+				lv_timer_set_period(shade_warm_timer, 1000);
+				lv_timer_reset(shade_warm_timer);
+			}
 			return;
 		}
 }
@@ -4283,6 +4309,8 @@ static void za_close(void)
 }
 
 /* The application has gone (reaped). */
+static void app_pidfd_close(void);
+
 static void app_closed(void)
 {
 	bool was_ending = za.kill_timer != NULL;
@@ -4297,6 +4325,7 @@ static void app_closed(void)
 	sd_settle_now();
 
 	app_pid = 0;
+	app_pidfd_close();
 	vc_stop();
 	if (app_timer) {
 		lv_timer_delete(app_timer);
@@ -4326,6 +4355,24 @@ static void app_poll(lv_timer_t *t)
 				WIFSIGNALED(st) ? WTERMSIG(st) : WEXITSTATUS(st));
 		app_closed();
 	}
+}
+
+/* The application's pidfd turned readable: it has ended (no 200 ms look). */
+static int app_pidfd = -1;
+
+static void app_pidfd_ev(int fd)
+{
+	LV_UNUSED(fd);
+	app_poll(NULL);
+}
+
+static void app_pidfd_close(void)
+{
+	if (app_pidfd < 0)
+		return;
+	ui_unwatch(app_pidfd);
+	close(app_pidfd);
+	app_pidfd = -1;
 }
 
 static void app_kill_cb(lv_timer_t *t)
@@ -4399,6 +4446,17 @@ static void za_spawn_cb(lv_timer_t *t)
 	posix_spawnattr_destroy(&at);
 	free(envp);
 	app_pid = pid;
+	if (pid > 0) {
+		/* its end as an event: a pidfd in the main loop's poll() */
+		app_pidfd_close();
+		app_pidfd = syscall(SYS_pidfd_open, pid, 0);
+		if (app_pidfd >= 0) {
+			fcntl(app_pidfd, F_SETFD, FD_CLOEXEC);
+			ui_watch(app_pidfd, app_pidfd_ev);
+		} else if (!app_timer) {
+			app_timer = lv_timer_create(app_poll, 200, NULL);	/* (no pidfd: look) */
+		}
+	}
 	/* idle while the card grows (the attribute alone did not take here);
 	 * za_next gives it full priority when the grow ends */
 }
@@ -4479,7 +4537,6 @@ static void app_launch_cb(lv_event_t *e)
 
 		lv_timer_set_repeat_count(st, 1);
 	}
-	app_timer = lv_timer_create(app_poll, 200, NULL);
 	app_pid = -1;		/* (starting: no second launch meanwhile) */
 
 	za_build();
@@ -4907,9 +4964,12 @@ static void shade_pic_warm(lv_timer_t *t)
 	    lv_anim_count_running() || (touch_indev &&
 	    lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
 		return;
-	if (shade_pic && !shade_pic_dirty && shade_pic_min == bp_minute())
-		return;
-	shade_pic_get();
+	if (!(shade_pic && !shade_pic_dirty && shade_pic_min == bp_minute()))
+		shade_pic_get();
+	/* up to date: nothing to do before the minute changes (a change of
+	 * the shade's contents brings it back, shade_changed) */
+	if (shade_pic && !shade_pic_dirty)
+		lv_timer_set_period(t, (uint32_t)(60 - time(NULL) % 60) * 1000 + 100);
 }
 
 static lv_obj_t *home_apps;		/* the tile grid */
@@ -4985,8 +5045,8 @@ static void build_home(void)
 	app_bar_build();	/* the bar over applications and pages */
 
 	status_refresh(true);
-	home_timer = lv_timer_create(home_update, 2000, NULL);
-	shade_warm_timer = lv_timer_create(shade_pic_warm, 1000, NULL);
+	home_timer = awake_timer(home_update, 2000, NULL);
+	shade_warm_timer = awake_timer(shade_pic_warm, 1000, NULL);
 	home_update(NULL);
 	if (app_pid <= 0 && !home_build_quiet)	/* (a turn keeps what shows) */
 		lv_screen_load(home_scr);
@@ -5965,6 +6025,7 @@ static void idle_cb(lv_event_t *e)
 
 	if (i < sizeof(idle_opts) / sizeof(idle_opts[0])) {
 		conf.idle_s = idle_opts[i];
+		idle_kick();
 		conf_save();
 	}
 }
@@ -7704,7 +7765,7 @@ static void rot_conf_changed(void)
 
 static void rot_init(void)
 {
-	rot_timer = lv_timer_create(rot_poll, 200, NULL);
+	rot_timer = awake_timer(rot_poll, 200, NULL);	/* (dark: no accelerometer reads) */
 	if (conf.autorot != ROT_PORTRAIT)
 		rot_seen = rot_read();
 	if (rot_seen > 0)
@@ -8290,6 +8351,6 @@ static void ui_apply_saved(void)
 		job_run("n72-wifi off", NULL, NULL, NULL);
 	if (conf.bt == 0 && have_tool("bluetoothctl"))
 		job_run(BT_OFF_CMD, NULL, bt_set_done, NULL);
-	lv_timer_create(bt_auto_tick, 30000, NULL);	/* Connect automatically */
+	awake_timer(bt_auto_tick, 30000, NULL);	/* Connect automatically */
 	bz_start(NULL);		/* BlueZ's signals: the Bluetooth views follow */
 }

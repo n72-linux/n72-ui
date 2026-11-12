@@ -44,6 +44,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <linux/netlink.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/klog.h>
@@ -51,6 +52,7 @@
 #include <sys/reboot.h>
 #include <sys/resource.h>
 #include <sys/sysinfo.h>
+#include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <ucontext.h>
@@ -522,6 +524,36 @@ static void rt_reset(void);
 
 static void ui_lock(void);
 
+/*
+ * Timers that only matter while the screen is lit (the clock, the shade's
+ * picture, the accelerometer, the idle timeout, ...): paused while it is
+ * dark, so a dark screen (sound playing, or on USB power) wakes nothing.
+ */
+#define NAWAKE 12
+static lv_timer_t *awake_t[NAWAKE];
+static int nawake;
+
+static lv_timer_t *awake_timer(lv_timer_cb_t cb, uint32_t ms, void *ud)
+{
+	lv_timer_t *t = lv_timer_create(cb, ms, ud);
+
+	if (t && nawake < NAWAKE)
+		awake_t[nawake++] = t;
+	return t;
+}
+
+static void awake_set(bool on)
+{
+	for (int i = 0; i < nawake; i++) {
+		if (on) {
+			lv_timer_resume(awake_t[i]);
+			lv_timer_ready(awake_t[i]);
+		} else {
+			lv_timer_pause(awake_t[i]);
+		}
+	}
+}
+
 static void screen_set(bool on)
 {
 	bool fade;
@@ -529,6 +561,8 @@ static void screen_set(bool on)
 	if (!on && screen_off)
 		return;
 	fade = bl_fades() && screen_off == on;	/* only on a change (on again: no fade) */
+	if (screen_off == on)
+		awake_set(on);		/* (on a change only) */
 	screen_off = !on;
 	if (fade && !on)
 		backlight_fade_out();
@@ -563,7 +597,7 @@ static void screen_set(bool on)
  * timers that look (the headphone jack, a file in /run changing, BlueZ's
  * D-Bus signals). Each has a callback, run when it is readable.
  */
-#define NWATCH 6
+#define NWATCH 8
 static struct { int fd; void (*cb)(int fd); } watch[NWATCH];
 static int nwatch;
 
@@ -582,6 +616,9 @@ static void ui_watch(int fd, void (*cb)(int fd))
 		nwatch++;
 	}
 }
+
+static lv_timer_t *idle_timer;
+static void idle_kick(void);
 
 static void ui_unwatch(int fd)
 {
@@ -1183,6 +1220,7 @@ static bool audio_playing(void)
  * the display and USB and idle at the system clock's slowest divider.
  */
 static bool screen_off_for_sound;
+static lv_timer_t *playback_timer;	/* runs only while screen_off_for_sound */
 
 static void screen_off_or_sleep(void)
 {
@@ -1196,6 +1234,8 @@ static void screen_off_or_sleep(void)
 	if (audio_playing()) {
 		screen_off_for_sound = true;
 		screen_set(false);
+		if (playback_timer)
+			lv_timer_resume(playback_timer);
 		return;
 	}
 	if (!system_sleep())
@@ -1206,9 +1246,9 @@ static void playback_check(lv_timer_t *t)
 {
 	static int quiet;
 
-	LV_UNUSED(t);
 	if (!screen_off || !screen_off_for_sound) {
 		quiet = 0;
+		lv_timer_pause(t);
 		return;
 	}
 	if (audio_playing()) {
@@ -1240,42 +1280,112 @@ static void screen_dark(void)
 
 #define LOCK_IDLE_MS	8000	/* the lock screen, not unlocked: dark again */
 
-static void idle_check(lv_timer_t *t)
+/*
+ * USB power in or out. The PMU interrupts on both and the kernel sends a
+ * power_supply uevent ("usb"), read here from a netlink socket in the main
+ * loop's poll(); only without one does idle_check look every second.
+ */
+static int uevent_fd = -1;
+
+static void plug_changed(void)
 {
-	long idle_ms = conf.idle_s * 1000L;	/* Settings > Display */
-	uint32_t inactive = lv_display_get_inactive_time(NULL);
 	static int last_plug = -1;
 	int plug = usb_powered();
 
-	LV_UNUSED(t);
-	if (last_plug >= 0 && plug != last_plug) {
+	if (last_plug < 0 || plug == last_plug) {
 		last_plug = plug;
-		if (screen_off && conf.wake_plug) {	/* Settings > Display */
-			screen_off_for_sound = false;
-			screen_set(true);
-			lv_display_trigger_activity(NULL);
-			return;
-		}
-		if (screen_off && !plug && !screen_off_for_sound) {
-			screen_off_or_sleep();	/* dark on USB, now on battery: sleep */
-			return;
-		}
-		lv_display_trigger_activity(NULL);
+		return;
 	}
 	last_plug = plug;
+	if (screen_off && conf.wake_plug) {	/* Settings > Display */
+		screen_off_for_sound = false;
+		screen_set(true);
+		lv_display_trigger_activity(NULL);
+		return;
+	}
+	if (screen_off && !plug && !screen_off_for_sound) {
+		screen_off_or_sleep();	/* dark on USB, now on battery: sleep */
+		return;
+	}
+	lv_display_trigger_activity(NULL);
+}
+
+static void uevent_ev(int fd)
+{
+	char buf[2048];
+	bool usb = false;
+	ssize_t n;
+
+	while ((n = recv(fd, buf, sizeof(buf) - 1, MSG_DONTWAIT)) > 0) {
+		buf[n] = 0;
+		for (char *p = buf; p < buf + n; p += strlen(p) + 1)
+			if (!strcmp(p, "POWER_SUPPLY_NAME=usb"))
+				usb = true;
+	}
+	if (usb)
+		plug_changed();
+}
+
+static void uevent_init(void)
+{
+	struct sockaddr_nl a = { .nl_family = AF_NETLINK, .nl_groups = 1 };
+	int fd = socket(AF_NETLINK, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+			NETLINK_KOBJECT_UEVENT);
+
+	if (fd >= 0 && bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+		close(fd);
+		fd = -1;
+	}
+	uevent_fd = fd;
+	if (fd >= 0)
+		ui_watch(fd, uevent_ev);
+	plug_changed();		/* (the state now) */
+}
+
+/*
+ * The idle timeout: the timer runs when the next deadline is due (the
+ * lock screen's or Settings > Display's), not every second; input in the
+ * meantime only moves the deadline later, which the run then finds.
+ * Paused while the screen is dark (an awake timer).
+ */
+static void idle_check(lv_timer_t *t)
+{
+	long idle_ms = conf.idle_s * 1000L;	/* Settings > Display */
+	uint32_t inactive = lv_display_get_inactive_time(NULL), next = 60000;
+
+	if (uevent_fd < 0) {
+		plug_changed();
+		next = 1000;
+	}
 	if (screen_off)
 		return;
 	if (video_playing()) {		/* a video is watched, not idle */
 		lv_display_trigger_activity(NULL);
+		lv_timer_set_period(t, LV_MIN(next, 5000));
 		return;
 	}
-	if (locked && inactive >= LOCK_IDLE_MS) {
-		screen_dark();
-		return;
+	if (locked) {
+		if (inactive >= LOCK_IDLE_MS) {
+			screen_dark();
+			return;
+		}
+		next = LV_MIN(next, LOCK_IDLE_MS - inactive);
 	}
-	if (!idle_ms || inactive < (uint32_t)idle_ms)
-		return;
-	screen_dark();
+	if (idle_ms) {
+		if (inactive >= (uint32_t)idle_ms) {
+			screen_dark();
+			return;
+		}
+		next = LV_MIN(next, (uint32_t)idle_ms - inactive);
+	}
+	lv_timer_set_period(t, LV_MAX(next + 20, 250));
+}
+
+/* Settings changed the timeout, or the lock screen went up: look now. */
+static void idle_kick(void)
+{
+	if (idle_timer && !screen_off)
+		lv_timer_ready(idle_timer);
 }
 
 /* -------------------------------------------------------------- buttons */
@@ -1756,8 +1866,10 @@ int main(int argc, char **argv)
 	if (keys)
 		keys_fd = open(keys, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 	/* (the buttons: their fd in the main loop's poll, no timer) */
-	lv_timer_create(idle_check, 1000, NULL);
-	lv_timer_create(playback_check, 2000, NULL);
+	idle_timer = awake_timer(idle_check, 1000, NULL);
+	playback_timer = lv_timer_create(playback_check, 2000, NULL);
+	lv_timer_pause(playback_timer);		/* (screen_off_or_sleep starts it) */
+	uevent_init();
 
 	build_home();
 	rot_init();
@@ -1789,7 +1901,7 @@ int main(int argc, char **argv)
 			{ .fd = keys_fd, .events = POLLIN },
 			{ .fd = notify_fd, .events = POLLIN },
 		};
-		int nw = nwatch, w;
+		int nw, w;
 		uint64_t th0;
 		uint32_t idle;
 
@@ -1826,6 +1938,7 @@ int main(int argc, char **argv)
 		if (fps_on && mono_us() - th0 > 30000)
 			fprintf(stderr, "timers: %.1f ms\n", (mono_us() - th0) / 1000.0);
 
+		nw = nwatch;	/* (after the timers, which may have changed it) */
 		for (w = 0; w < nw; w++) {
 			pf[3 + w].fd = watch[w].fd;
 			pf[3 + w].events = POLLIN;
