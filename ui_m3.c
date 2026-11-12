@@ -7665,7 +7665,17 @@ static void rot_poll(lv_timer_t *t)
 {
 	int r, want;
 
-	LV_UNUSED(t);
+	{
+		/* 5 a second only while a turn can happen (each read is an I2C
+		 * transfer and a wake-up); else every 2 s, to notice */
+		bool need = !screen_off && !locked &&
+			    (conf.autorot != ROT_PORTRAIT || (app_pid > 0 && app_is_video()) ||
+			     ui_rot != 0);
+		uint32_t period = need ? 200 : 2000;
+
+		if (t->period != period)
+			lv_timer_set_period(t, period);
+	}
 	if (screen_off || locked)
 		return;
 	if (conf.autorot != ROT_PORTRAIT || (app_pid > 0 && app_is_video())) {

@@ -59,6 +59,7 @@
 #include "lvgl/lvgl.h"
 #include "lvgl/src/indev/lv_indev_private.h"
 #include "lvgl/src/display/lv_display_private.h"
+#include "lvgl/src/misc/lv_timer_private.h"
 #include "mbx_gpu.h"
 
 /* the screen as the UI lays it out: 320 x 480, or 480 x 320 turned */
@@ -752,6 +753,8 @@ static void rt_feed(int fd, lv_indev_t *indev)
 					rt_frame_us = mono_us();
 					lv_indev_read(indev);
 				}
+				if (rt_down)	/* (long presses need reads between frames) */
+					lv_timer_resume(lv_indev_get_read_timer(indev));
 				if (!lat_event_us && rt_owner != RT_APP)
 					lat_event_us = (uint64_t)e->input_event_sec * 1000000 +
 						       e->input_event_usec;
@@ -770,6 +773,9 @@ static void rt_timer_cb(lv_timer_t *t)
 	if (rt_ui_down && mono_us() - rt_frame_us < 40000)
 		return;
 	lv_indev_read(lv_timer_get_user_data(t));
+	/* no finger: no reads until one comes (rt_feed resumes it) */
+	if (!rt_ui_down && !rt_down)
+		lv_timer_pause(t);
 }
 
 /* Set up the router on the touch screen fd; false: no uinput. */
@@ -1749,7 +1755,7 @@ int main(int argc, char **argv)
 		keys = find_input("gpio-keys");
 	if (keys)
 		keys_fd = open(keys, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-	lv_timer_create(keys_poll, 30, NULL);
+	/* (the buttons: their fd in the main loop's poll, no timer) */
 	lv_timer_create(idle_check, 1000, NULL);
 	lv_timer_create(playback_check, 2000, NULL);
 
@@ -1762,7 +1768,7 @@ int main(int argc, char **argv)
 	crash_handlers();
 	signal(SIGUSR1, on_usr1);
 	signal(SIGUSR2, on_usr2);
-	lv_timer_create(shot_poll, 100, NULL);
+	/* (screenshots: the signal breaks the main loop's poll; shot_poll there) */
 	if (argc > 2 && !strcmp(argv[1], "--bench") && !strcmp(argv[2], "text"))
 		return bench_text(argc > 3 ? atoi(argv[3]) : 30, false);
 	if (argc > 2 && !strcmp(argv[1], "--bench") && !strcmp(argv[2], "label"))
@@ -1795,11 +1801,24 @@ int main(int argc, char **argv)
 		 * refreshes. While a frame waits, the refresh timer rests;
 		 * the hand-over (notify_fd) wakes it.
 		 */
+		/*
+		 * (Only what was paused here is resumed: LVGL pauses the timer
+		 * itself when there is nothing to draw and resumes it on an
+		 * invalidation; resuming it every turn woke this loop 60 times
+		 * a second for nothing, screen on or off.)
+		 */
 		if (refr_timer && notify_fd >= 0) {
-			if (mbx_gpu_frame_waiting())
-				lv_timer_pause(refr_timer);
-			else
+			static bool held;
+
+			if (mbx_gpu_frame_waiting()) {
+				if (!refr_timer->paused) {
+					lv_timer_pause(refr_timer);
+					held = true;
+				}
+			} else if (held) {
 				lv_timer_resume(refr_timer);
+				held = false;
+			}
 		}
 		th0 = mono_us();
 		idle = lv_timer_handler();
@@ -1811,7 +1830,8 @@ int main(int argc, char **argv)
 			pf[3 + w].fd = watch[w].fd;
 			pf[3 + w].events = POLLIN;
 		}
-		if (poll(pf, 3 + nw, LV_MIN(idle, LV_DEF_REFR_PERIOD)) > 0) {
+		/* until LVGL's next timer, or an event: no fixed tick */
+		if (poll(pf, 3 + nw, idle == LV_NO_TIMER_READY ? -1 : (int)LV_MIN(idle, 60000)) > 0) {
 			for (w = 0; w < nw; w++)
 				if ((pf[3 + w].revents & (POLLIN | POLLHUP | POLLERR)) &&
 				    w < nwatch && watch[w].fd == pf[3 + w].fd)
@@ -1862,6 +1882,10 @@ int main(int argc, char **argv)
 			}
 			if (pf[1].revents & POLLIN)
 				keys_poll(NULL);
+		}
+		if (shot_wanted || scans_wanted)
+			shot_poll(NULL);	/* (asked by SIGUSR1/2) */
+		{
 		}
 	}
 	return 0;
