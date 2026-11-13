@@ -597,19 +597,21 @@ static struct {
 
 static void yt_search_run(const char *q);
 
+/* The system keyboard came or went: the list ends above it. */
+static void yt_kb_vis(bool shown, int32_t h)
+{
+	if (ys.body)
+		lv_obj_set_height(ys.body, H - 56 - (shown ? h : 0));
+}
+
 static void yt_kb_show(bool on)
 {
-	if (!ys.kb)
+	if (!ys.ta)
 		return;
-	if (on) {
-		lv_obj_remove_flag(ys.kb, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_add_state(ys.ta, LV_STATE_FOCUSED);
-		lv_obj_set_height(ys.body, H - 56 - lv_obj_get_height(ys.kb));
-	} else {
-		lv_obj_add_flag(ys.kb, LV_OBJ_FLAG_HIDDEN);
-		lv_obj_remove_state(ys.ta, LV_STATE_FOCUSED);
-		lv_obj_set_height(ys.body, H - 56);
-	}
+	if (on)
+		kbd_show_for(ys.ta, yt_kb_vis);
+	else if (kbd.ta == ys.ta)
+		kbd_hide();
 }
 
 static void yt_kb_cb(lv_event_t *e)
@@ -629,12 +631,6 @@ static void yt_kb_cb(lv_event_t *e)
 		else
 			go_back();
 	}
-}
-
-static void yt_ta_cb(lv_event_t *e)
-{
-	LV_UNUSED(e);
-	yt_kb_show(true);
 }
 
 static void yt_recent_cb(lv_event_t *e)
@@ -879,23 +875,10 @@ static void yt_open_search(const char *query)
 	 */
 	lv_obj_set_style_anim_duration(ys.ta, 0, LV_PART_CURSOR);
 	lv_textarea_set_text(ys.ta, "");	/* (the one started at creation goes) */
-	lv_obj_add_event_cb(ys.ta, yt_ta_cb, LV_EVENT_CLICKED, NULL);
-
-	ys.kb = lv_keyboard_create(ys.scr);
-	obj_track(&ys.kb);
-	lv_obj_set_size(ys.kb, W, LV_MIN(200, H * 5 / 12));
-	lv_obj_align(ys.kb, LV_ALIGN_BOTTOM_MID, 0, 0);
-	lv_obj_set_style_bg_color(ys.kb, M.surface_c, 0);
-	lv_obj_set_style_radius(ys.kb, 0, 0);
-	lv_obj_set_style_border_width(ys.kb, 0, 0);
-	lv_obj_set_style_bg_color(ys.kb, M.surface_c_highest, LV_PART_ITEMS);
-	lv_obj_set_style_text_color(ys.kb, M.on_surface, LV_PART_ITEMS);
-	lv_obj_set_style_radius(ys.kb, 8, LV_PART_ITEMS);
-	lv_obj_set_style_border_width(ys.kb, 0, LV_PART_ITEMS);
-	lv_obj_set_style_shadow_width(ys.kb, 0, LV_PART_ITEMS);
-	lv_keyboard_set_textarea(ys.kb, ys.ta);
-	lv_obj_add_event_cb(ys.kb, yt_kb_cb, LV_EVENT_READY, NULL);
-	lv_obj_add_event_cb(ys.kb, yt_kb_cb, LV_EVENT_CANCEL, NULL);
+	/* the system keyboard (kbd.c): Enter searches, its Hide is Cancel */
+	kbd_attach(ys.ta, yt_kb_vis, false);
+	lv_obj_add_event_cb(ys.ta, yt_kb_cb, LV_EVENT_READY, NULL);
+	lv_obj_add_event_cb(ys.ta, yt_kb_cb, LV_EVENT_CANCEL, NULL);
 	lv_obj_add_event_cb(ys.body, yt_body_scroll, LV_EVENT_SCROLL, NULL);
 
 	if (query && *query) {

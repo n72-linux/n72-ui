@@ -29,6 +29,11 @@
 extern char **environ;
 
 static bool system_sleep(void);
+static void kbd_toggle_app(void);	/* the system keyboard (kbd.c) */
+static void kbd_app_gone(void);
+static void kbd_hide_now(bool anim);
+static void kbd_turned(void);
+static void kbd_init(void);
 
 /* turning and the video controls (at the end) */
 static int ui_rot, video_rot;
@@ -3012,6 +3017,13 @@ static void app_gesture_cb(lv_event_t *e)
 	}
 }
 
+static void app_bar_kbd_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	app_bar_set(false);
+	kbd_toggle_app();
+}
+
 static void app_bar_build(void)
 {
 	if (app_bar)
@@ -3032,6 +3044,20 @@ static void app_bar_build(void)
 	lv_obj_add_event_cb(app_bar, app_bar_touch_cb, LV_EVENT_CLICKED, NULL);
 	lv_obj_remove_flag(app_bar, LV_OBJ_FLAG_GESTURE_BUBBLE);	/* its own */
 	status_row(app_bar, &app_bar_time, &app_bar_wifi, &app_bar_bt, &app_bar_batt);
+	{	/* the keyboard, for an application that does not ask for it */
+		lv_obj_t *b = lv_obj_create(app_bar);
+
+		plain(b);
+		lv_obj_set_size(b, 40, 32);
+		lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
+		lv_obj_set_style_bg_color(b, M.surface_c_highest, 0);
+		lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+		lv_obj_set_style_bg_color(b, M.secondary_c, LV_STATE_PRESSED);
+		lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_GESTURE_BUBBLE);
+		lv_obj_center(m3_label(b, LV_SYMBOL_KEYBOARD, &lv_font_montserrat_16, M.on_surface));
+		lv_obj_add_event_cb(b, app_bar_kbd_cb, LV_EVENT_CLICKED, NULL);
+		lv_obj_move_to_index(b, 2);	/* after the time and the spacer */
+	}
 	net_ui_sync();
 	lv_obj_add_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
 	/* gestures on the bar, the shade and the scrim bubble up to here */
@@ -3057,10 +3083,14 @@ static bool in_obj(lv_obj_t *o, int x, int y)
 	return x >= a.x1 && x <= a.x2 && y >= a.y1 && y <= a.y2;
 }
 
+#include "kbd.c"		/* the system keyboard */
+
 /* Does a touch that begins at (x, y) belong to the launcher? */
 static bool ui_wants_touch(int x, int y)
 {
 	if (locked || app_pid <= 0 || lv_screen_active() != app_scr)
+		return true;
+	if (kbd_wants(x, y))
 		return true;
 	if (app_is_video())
 		return true;		/* the player has no touch input: its controls */
@@ -3548,6 +3578,7 @@ static void ui_lock(void)
 
 	if (locked || !home_scr)
 		return;
+	kbd_hide_now(false);	/* (the lock screen has no field) */
 	za_finish();
 	sd_settle_now();
 	tr_finish();
@@ -4499,6 +4530,7 @@ static void app_closed(void)
 
 	app_pid = 0;
 	app_pidfd_close();
+	kbd_app_gone();
 	rot_kick();		/* (a player gone: no reads needed) */
 	vc_stop();
 	if (app_timer) {
@@ -4596,7 +4628,7 @@ static void za_spawn_cb(lv_timer_t *t)
 	za_fill_layer0(za.col);
 	while (environ[n])
 		n++;
-	envp = calloc(n + 2, sizeof(*envp));
+	envp = calloc(n + 3, sizeof(*envp));	/* (N72_TOUCH, N72_KBD, the end) */
 	if (!envp) {
 		app_pid = 0;
 		return;
@@ -4607,7 +4639,16 @@ static void za_spawn_cb(lv_timer_t *t)
 		snprintf(touch, sizeof(touch), "N72_TOUCH=%s", rt_node);
 		for (i = 0; i < n && strncmp(envp[i], "N72_TOUCH=", 10); i++)
 			;
+		if (i == n)
+			n++;
 		envp[i] = touch;
+	}
+	{	/* where it asks for the keyboard */
+		for (i = 0; i < n && strncmp(envp[i], "N72_KBD=", 8); i++)
+			;
+		if (i == n)
+			n++;
+		envp[i] = "N72_KBD=" KBD_FIFO;
 	}
 	posix_spawnattr_init(&at);
 	posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP);
@@ -5408,7 +5449,7 @@ static void pw_done_cb(lv_event_t *e)
 static void wifi_ask_password(const char *ssid)
 {
 	nav_mark(NULL, NULL);	/* (not reopened by a turn) */
-	lv_obj_t *body, *kb;
+	lv_obj_t *body;
 
 	snprintf(pw_ssid, sizeof(pw_ssid), "%s", ssid);
 	body = m3_page(ssid, &pw_scr);
@@ -5420,13 +5461,11 @@ static void wifi_ask_password(const char *ssid)
 	lv_textarea_set_password_mode(pw_ta, true);
 	lv_obj_set_width(pw_ta, lv_pct(100));
 	lv_obj_set_style_radius(pw_ta, 12, 0);
-	kb = lv_keyboard_create(pw_scr);
-	lv_obj_set_size(kb, W, 200);
-	lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
-	lv_keyboard_set_textarea(kb, pw_ta);
-	lv_obj_add_event_cb(kb, pw_done_cb, LV_EVENT_READY, NULL);
-	lv_obj_add_event_cb(kb, pw_done_cb, LV_EVENT_CANCEL, NULL);
+	lv_obj_set_style_anim_duration(pw_ta, 0, LV_PART_CURSOR);	/* (see the YouTube field) */
+	lv_obj_add_event_cb(pw_ta, pw_done_cb, LV_EVENT_READY, NULL);
+	lv_obj_add_event_cb(pw_ta, pw_done_cb, LV_EVENT_CANCEL, NULL);
 	push(pw_scr);
+	kbd_attach(pw_ta, NULL, true);	/* the system keyboard, up */
 }
 
 struct wifi_net { char ssid[64]; int signal; bool secure; bool saved; int id; };
@@ -7413,7 +7452,8 @@ static void ui_reopen(void)
 		shade_set(true, false);
 	else if (!strcmp(p, "paint"))
 		open_paint(NULL);
-	else if (strcmp(p, "logs") && strcmp(p, "about") && strcmp(p, "volume"))
+	else if (strcmp(p, "logs") && strcmp(p, "about") && strcmp(p, "volume") &&
+		 strcmp(p, "keyboard"))
 		open_settings(NULL);
 	if (!strcmp(p, "display"))
 		open_display(NULL);
@@ -7431,6 +7471,8 @@ static void ui_reopen(void)
 		open_logs(NULL);
 	else if (!strcmp(p, "volume"))	/* (screenshots of the volume pop-up) */
 		vol_hud_show();
+	else if (!strcmp(p, "keyboard"))	/* (screenshots: the keyboard as an application gets it) */
+		kbd_show_for(NULL, NULL);
 	unsetenv("N72_UI_OPEN");
 }
 
@@ -7742,6 +7784,7 @@ static void ui_rebuild_overlays(void)
 	net_ui_sync();
 	qs_rot_sync();
 	vc_turned();
+	kbd_turned();
 }
 
 /*
@@ -8009,6 +8052,7 @@ static bool ui_turn(int rot)
 	} else {
 		ui_rebuild(true);
 	}
+	kbd_turned();		/* (every way above) */
 	turn_fade_start(old_pic, from, rot);
 	fprintf(stderr, "n72-ui: turned %d -> %d in %u ms (%d pages%s)\n", from, rot,
 		(unsigned)lv_tick_elaps(t0), nav_n, over_app ? ", over an application" : "");

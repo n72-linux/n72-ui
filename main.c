@@ -601,7 +601,7 @@ static void screen_set(bool on)
  * timers that look (the headphone jack, a file in /run changing, BlueZ's
  * D-Bus signals). Each has a callback, run when it is readable.
  */
-#define NWATCH 8
+#define NWATCH 12
 static struct { int fd; short events; void (*cb)(int fd); } watch[NWATCH];
 static int nwatch;
 
@@ -1992,6 +1992,7 @@ int main(int argc, char **argv)
 	uevent_init();
 
 	build_home();
+	kbd_init();
 	rot_init();
 	drags_init();
 	sound_ui_init();
