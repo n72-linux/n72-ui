@@ -7098,6 +7098,41 @@ static void sound_ui_init(void)
 		snd_refresh_ui();
 }
 
+/*
+ * Settings > Refresh app list: n72-ios-tiles writes a manifest for every
+ * iOS application there is (and removes those of applications gone); it
+ * runs once at boot and otherwise only when asked here (nothing watches
+ * the applications for it). Exit 10: something changed, the tiles are made
+ * again (the apps folder's watch does that too; this does not wait for it).
+ */
+#define IOS_TILES "/usr/sbin/n72-ios-tiles"
+static lv_obj_t *apps_refresh_sub;
+static bool apps_refreshing;
+
+static void apps_refresh_done(const char *out, void *ud)
+{
+	int st = out && *out ? atoi(out) : -1;
+
+	LV_UNUSED(ud);
+	apps_refreshing = false;
+	if (st == 10)
+		apps_reload();
+	if (apps_refresh_sub)
+		label_set_if_changed(apps_refresh_sub, st == 10 ? "Updated" :
+				     st == 0 ? "Up to date" : "Could not look");
+}
+
+static void apps_refresh_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	if (apps_refreshing)
+		return;
+	apps_refreshing = true;
+	if (apps_refresh_sub)
+		label_set_if_changed(apps_refresh_sub, "Looking for apps...");
+	job_run(IOS_TILES " >/dev/null 2>&1; echo $?", NULL, apps_refresh_done, NULL);
+}
+
 static void open_settings(lv_event_t *e)
 {
 	nav_mark(open_settings, NULL);
@@ -7143,6 +7178,13 @@ static void open_settings(lv_event_t *e)
 	m3_row(c, LV_SYMBOL_EYE_OPEN, "About", "Device, memory, battery",
 	       open_about, NULL, NULL);
 	m3_row(c, LV_SYMBOL_FILE, "Logs", "Kernel messages", open_logs, NULL, NULL);
+	if (!access(IOS_TILES, X_OK)) {
+		m3_row_ex(c, LV_SYMBOL_REFRESH, M.secondary_c, M.on_secondary_c,
+			  "Refresh app list", apps_refreshing ? "Looking for apps..." :
+			  "Find iOS apps added or removed", apps_refresh_cb, NULL,
+			  &apps_refresh_sub, false);
+		obj_track(&apps_refresh_sub);
+	}
 	push(scr);
 }
 
