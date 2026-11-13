@@ -5066,8 +5066,13 @@ static void apps_watch(void)
 
 	if (fd < 0)
 		return;
-	if (inotify_add_watch(fd, APPS_DIR, IN_CREATE | IN_DELETE | IN_CLOSE_WRITE |
-			      IN_MOVED_TO | IN_MOVED_FROM) < 0) {
+	/* our manifests, and the .desktop entries of installed programs (apk) */
+	bool any = inotify_add_watch(fd, APPS_DIR, IN_CREATE | IN_DELETE | IN_CLOSE_WRITE |
+				     IN_MOVED_TO | IN_MOVED_FROM) >= 0;
+
+	any |= inotify_add_watch(fd, DESKTOP_DIR, IN_CREATE | IN_DELETE | IN_CLOSE_WRITE |
+				 IN_MOVED_TO | IN_MOVED_FROM) >= 0;
+	if (!any) {
 		close(fd);
 		return;
 	}
@@ -8801,6 +8806,6 @@ static void ui_apply_saved(void)
 	if (conf.bt == 0 && have_tool("bluetoothctl"))
 		job_run(BT_OFF_CMD, NULL, bt_set_done, NULL);
 	awake_timer(bt_auto_tick, 30000, NULL);	/* Connect automatically */
-	apps_watch();		/* the home tiles follow APPS_DIR */
+	apps_watch();		/* the home tiles follow APPS_DIR and DESKTOP_DIR */
 	bz_start(NULL);		/* BlueZ's signals: the Bluetooth views follow */
 }
