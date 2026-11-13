@@ -1,9 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * Build MBX 3D-blit commands (MBX2D.framework's format, see
- * include/uapi/linux/apple-mbx.h) for ARGB8888 surfaces: no rotation, no
- * scaling, no clipping. Layout checked word for word against MBX2D running in
- * an emulator (n72-ramboot/tools/emu); blend words measured on the iPod.
+ * Build MBX 3D-blit commands (see <drm/apple_mbx_drm.h>) for ARGB8888
+ * surfaces: no rotation, no scaling, no clipping. Blend words measured on
+ * the hardware.
  */
 #ifndef N72_MBX_CMD_H
 #define N72_MBX_CMD_H
@@ -134,6 +133,47 @@ static inline int mbx_cmd_copy(uint32_t *p, int blend, uint32_t dstride, uint32_
 	p[46] = MBX_COPY_BLEND_W46;
 	p[47] = MBX_COPY_BLEND_W47;
 	return 48;
+}
+
+/*
+ * Type 8 copy, scaled: the source rectangle (sx0, sy0)-(sx1, sy1), in
+ * fractional pixels, stretched over the destination (dx0, dy0)-(dx1, dy1)
+ * (ends exclusive). Opaque, point sampled (the filtering word, p[31], stays
+ * 0: its encoding for bilinear is not known yet). For pinch-zoom previews.
+ */
+static inline int mbx_cmd_copy_scaled(uint32_t *p, uint32_t dstride, uint32_t sstride,
+				      float sx0, float sy0, float sx1, float sy1,
+				      int dx0, int dy0, int dx1, int dy1)
+{
+	uint32_t spx = sstride / 4, right = (uint32_t)(sx1 + 0.999f), bottom = (uint32_t)(sy1 + 0.999f);
+	float tw, th;
+	int lw, lh, i;
+
+	if (spx > 8 && !(spx & (spx - 1)))
+		right = spx;	/* power-of-two stride: texture as wide as a row */
+	lw = mbx_log2_ceil8(right);
+	lh = mbx_log2_ceil8(bottom);
+	tw = (float)(1u << lw);
+	th = (float)(1u << lh);
+
+	mbx_cmd_dst(p, dstride, dx0, dy0, dx1, dy1);
+	p[10] = 0;
+	p[11] = lw - 3;
+	p[12] = lh - 3;
+	p[13] = 0x18000;			/* source ARGB8888 */
+	p[14] = spx;
+	p[15] = mbx_f(dx0); p[16] = mbx_f(dy1); p[17] = mbx_f(dx0); p[18] = mbx_f(dy0);
+	p[19] = mbx_f(dx1); p[20] = mbx_f(dy1); p[21] = mbx_f(dx1); p[22] = mbx_f(dy0);
+	p[23] = mbx_f(sx0 / tw); p[24] = mbx_f(sy1 / th);
+	p[25] = mbx_f(sx0 / tw); p[26] = mbx_f(sy0 / th);
+	p[27] = mbx_f(sx1 / tw); p[28] = mbx_f(sy1 / th);
+	p[29] = mbx_f(sx1 / tw); p[30] = mbx_f(sy0 / th);
+	p[31] = 0;				/* no filtering */
+	p[32] = 0xffffffff;
+	p[33] = 0;
+	for (i = 34; i < 38; i++)
+		p[i] = 0x3f800000;
+	return 38;
 }
 
 /*

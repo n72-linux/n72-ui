@@ -58,4 +58,15 @@ lv_draw_buf_t *mbx_gpu_turn_buf(const lv_draw_buf_t *src, int deg);
 /* straight alpha to premultiplied, in place; flags the picture so */
 void mbx_gpu_premultiply_buf(lv_draw_buf_t *b);
 
+/*
+ * Opt in, for one image draw: the GPU may stretch the whole picture (d->src,
+ * an XRGB8888 lv_draw_buf_t in the GPU pool, drawn opaque) over d->image_area
+ * when the two differ in size (the area is the destination; leave LVGL's
+ * scale_x/scale_y at LV_SCALE_NONE). Point sampled. Draws without the mark
+ * are unchanged. Without the GPU (or a picture outside the pool) LVGL draws
+ * it 1:1, unscaled: callers check that the GPU display is in use.
+ * (The browser's pinch-zoom: page tiles drawn bigger or smaller.)
+ */
+void mbx_gpu_image_dsc_scaled(lv_draw_image_dsc_t *d);
+
 #endif

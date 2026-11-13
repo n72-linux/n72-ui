@@ -366,6 +366,39 @@ static bool image_ok(const lv_draw_task_t *t)
 	       d->clip_radius == 0 && !d->bitmap_mask_src;
 }
 
+/*
+ * The opt-in scaled copy (mbx_gpu_image_dsc_scaled): a marked draw of an
+ * opaque XRGB8888 pool picture whose destination differs in size from it.
+ * image_ok() is untouched: it still rejects every draw that is not 1:1.
+ */
+static int scaled_tag;
+
+void mbx_gpu_image_dsc_scaled(lv_draw_image_dsc_t *d)
+{
+	d->base.user_data = &scaled_tag;
+}
+
+static bool image_scaled_ok(const lv_draw_task_t *t)
+{
+	const lv_draw_image_dsc_t *d = t->draw_dsc;
+	const lv_image_dsc_t *img = d->src;
+
+	if (d->base.user_data != &scaled_tag)
+		return false;
+	if (lv_image_src_get_type(d->src) != LV_IMAGE_SRC_VARIABLE || !img->data ||
+	    !in_pool(img->data) || (gpu_addr(img->data) & 127) ||
+	    (img->header.stride & 31) || d->tile || img->header.cf != LV_COLOR_FORMAT_XRGB8888 ||
+	    !img->header.w || !img->header.h)
+		return false;
+	if (lv_area_get_width(&d->image_area) == img->header.w &&
+	    lv_area_get_height(&d->image_area) == img->header.h)
+		return false;	/* 1:1: image_ok()'s plain copy */
+	return d->opa >= LV_OPA_MAX && d->rotation == 0 && d->scale_x == LV_SCALE_NONE &&
+	       d->scale_y == LV_SCALE_NONE && d->skew_x == 0 && d->skew_y == 0 &&
+	       d->recolor_opa <= LV_OPA_MIN && d->blend_mode == LV_BLEND_MODE_NORMAL &&
+	       d->clip_radius == 0 && !d->bitmap_mask_src;
+}
+
 /* GPU text (below) */
 static int gtext = -1;
 static bool gt_cpu_only;
@@ -451,7 +484,11 @@ static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 	} else if (t->type == LV_DRAW_TASK_TYPE_IMAGE) {
 		const lv_draw_image_dsc_t *d = t->draw_dsc;
 
-		if (size < 4096 || !image_ok(t))
+		if (image_scaled_ok(t)) {
+			/* (opt-in scaled copy: into the XRGB8888 display buffer only) */
+			if (dcf != LV_COLOR_FORMAT_XRGB8888)
+				return 0;
+		} else if (size < 4096 || !image_ok(t))
 			return 0;
 		/*
 		 * Transparent mode: a premultiplied picture at full opacity
@@ -885,9 +922,46 @@ static bool mbx_image_premul(lv_draw_unit_t *u, lv_draw_task_t *t, lv_draw_buf_t
 	return true;
 }
 
+/*
+ * The opt-in scaled copy: the whole picture over d->image_area, the part in
+ * the clip area only (its source rectangle in fractional pixels).
+ */
+static bool gpu_copy_scaled(lv_draw_unit_t *u, lv_draw_task_t *t, const lv_draw_buf_t *sb)
+{
+	const lv_draw_image_dsc_t *d = t->draw_dsc;
+	lv_layer_t *layer = u->target_layer;
+	lv_draw_buf_t *b = layer->draw_buf;
+	const lv_area_t *ia = &d->image_area;
+	float fx = (float)sb->header.w / lv_area_get_width(ia);
+	float fy = (float)sb->header.h / lv_area_get_height(ia);
+	lv_area_t a, da;
+	uint32_t w[48];
+	int n;
+
+	if (!lv_area_intersect(&a, ia, u->clip_area))
+		return true;
+	if (!in_pool(b->data) || (b->header.stride & 31))
+		return false;
+	da = a;
+	lv_area_move(&da, -layer->buf_area.x1, -layer->buf_area.y1);
+	buf_invalidate(b, &da);
+	n = mbx_cmd_copy_scaled(w, b->header.stride, sb->header.stride,
+				(a.x1 - ia->x1) * fx, (a.y1 - ia->y1) * fy,
+				(a.x2 + 1 - ia->x1) * fx, (a.y2 + 1 - ia->y1) * fy,
+				da.x1, da.y1, da.x2 + 1, da.y2 + 1);
+	mbx_gpu_stats.images++;
+	return !blit3d(8, gpu_addr(b->data), gpu_addr(sb->data), w, n);
+}
+
 static void mbx_image(lv_draw_unit_t *u, lv_draw_task_t *t)
 {
 	lv_draw_image_dsc_t *d = t->draw_dsc;
+
+	if (image_scaled_ok(t)) {
+		if (!gpu_copy_scaled(u, t, (lv_draw_buf_t *)d->src))
+			lv_draw_sw_image(u, d, &t->area);	/* (1:1, unscaled) */
+		return;
+	}
 
 	if (u->target_layer->draw_buf->header.cf == LV_COLOR_FORMAT_ARGB8888) {
 		if (!mbx_image_premul(u, t, (lv_draw_buf_t *)d->src))
