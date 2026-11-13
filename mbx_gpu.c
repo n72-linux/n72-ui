@@ -195,7 +195,12 @@ static int gpu_done(uint32_t seq)
 
 	if (mbx_wait_jobs(mbx, &w))
 		return 1;
-	return (int32_t)(w.seq_done - seq) >= 0;
+	/*
+	 * Submits return 31-bit sequence numbers (an ioctl's return value is
+	 * not negative); the kernel's seq_done counts on in 32 bits. Compared
+	 * in 31 bits, the answer holds across both wraps.
+	 */
+	return (int32_t)((w.seq_done - seq) << 1) >= 0;
 }
 
 static int submit(const uint32_t *w, int n)
