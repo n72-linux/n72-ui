@@ -1163,6 +1163,30 @@ static bool dark_linger(void)
 	}
 }
 
+/*
+ * Before a sleep: tell the kernel the wakeup events seen so far
+ * (/sys/power/wakeup_count). False when one came in meanwhile (an alarm
+ * that rang, a key): the sleep would miss it, so do not sleep now. Without
+ * the file, sleep anyway.
+ */
+static bool wakeup_count_arm(void)
+{
+	char buf[32];
+	ssize_t n;
+	int fd = open("/sys/power/wakeup_count", O_RDWR | O_CLOEXEC);
+	bool ok = true;
+
+	if (fd < 0)
+		return true;
+	n = read(fd, buf, sizeof(buf) - 1);	/* (waits while an event is being handled) */
+	if (n > 0) {
+		buf[n] = 0;
+		ok = lseek(fd, 0, SEEK_SET) == 0 && write(fd, buf, strlen(buf)) > 0;
+	}
+	close(fd);
+	return ok;
+}
+
 /* the RTC's wake alarm: "+N" seconds from now, or 0 to clear it */
 static void wake_alarm(const char *v)
 {
@@ -1254,9 +1278,13 @@ static bool system_sleep(void)
 		if (own)
 			before.alarm = 0;	/* ours: not a wake for the screen */
 		/* (the caller has switched the panel off: screen_set(false)) */
-		ok = deep && write_sleep_state("mem");
-		if (!ok)	/* not deep, or the PMU refused: suspend to idle */
-			ok = write_sleep_state("freeze");
+		if (!wakeup_count_arm()) {
+			ok = true;	/* an event came first: look at it, as after a wake */
+		} else {
+			ok = deep && write_sleep_state("mem");
+			if (!ok)	/* not deep, or the PMU refused: suspend to idle */
+				ok = write_sleep_state("freeze");
+		}
 		woke_us = mono_us();
 		if (!ok || woke_for_screen(&before))
 			break;
