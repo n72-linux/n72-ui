@@ -1163,45 +1163,124 @@ static bool dark_linger(void)
 	}
 }
 
+/* the RTC's wake alarm: "+N" seconds from now, or 0 to clear it */
+static void wake_alarm(const char *v)
+{
+	int fd = open("/sys/class/rtc/rtc0/wakealarm", O_WRONLY | O_CLOEXEC);
+
+	if (fd < 0)
+		return;
+	if (write(fd, "0", 1) < 0 || (strcmp(v, "0") && write(fd, v, strlen(v)) < 0))
+		fprintf(stderr, "n72-ui: wakealarm %s: %s\n", v, strerror(errno));
+	close(fd);
+}
+
+/* seconds since boot, counting the time asleep */
+static time_t boot_s(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_BOOTTIME, &ts);
+	return ts.tv_sec;
+}
+
+static bool audio_playing(void);
+
+/*
+ * Suspend to RAM (the SoC powers off) once the system has slept this long
+ * in suspend to idle, which wakes quickly and keeps Wi-Fi associated.
+ */
+#define DEEP_AFTER_S	180
+
+/*
+ * May the sleep go deep now? Not on USB power, where the charger's events
+ * wake the PMU straight out of hibernate; not while sound plays (that keeps
+ * the system up anyway) or an application is open; not with N72_SLEEP=freeze.
+ * The kernel offers "mem" once n72_sleep.deep is set.
+ */
+static bool deep_allowed(void)
+{
+	const char *e = getenv("N72_SLEEP");
+	int fd;
+
+	if ((e && !strcmp(e, "freeze")) || usb_powered() || audio_playing() || app_pid > 0)
+		return false;
+	fd = open("/sys/module/n72_sleep/parameters/deep", O_WRONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		if (write(fd, "Y", 1) != 1)
+			fprintf(stderr, "n72-ui: n72_sleep.deep: %s\n", strerror(errno));
+		close(fd);
+	}
+	return sleep_offered("mem");
+}
+
 /*
  * Sleep until Power or Home is pressed, the cable goes in or out, or a set
- * alarm rings. On battery, suspend to RAM when the kernel offers it (the
- * SoC powers off); on USB power suspend to idle, since the charger's
- * events wake the PMU straight out of hibernate. Whatever else wakes the
- * system is served with the screen dark, and the sleep goes on
- * (woke_for_screen, dark_linger). N72_SLEEP=0 turns sleep
- * off, N72_SLEEP=freeze always uses suspend to idle. Returns false when
- * sleep is unavailable or refused, so the caller can fall back to
- * blanking the screen.
+ * alarm rings: suspend to idle first, and after DEEP_AFTER_S suspend to RAM
+ * when deep_allowed (an RTC alarm of our own wakes the system for the
+ * change, and again every DEEP_AFTER_S while deep sleep is not allowed;
+ * it is left alone when somebody else has set one). Whatever else wakes
+ * the system is served with the screen dark, and the sleep goes on
+ * (woke_for_screen, dark_linger). N72_SLEEP=0 turns sleep off,
+ * N72_SLEEP=freeze always uses suspend to idle. Returns false when sleep
+ * is unavailable or refused, so the caller can fall back to blanking the
+ * screen.
  */
 static bool system_sleep(void)
 {
 	const char *e = getenv("N72_SLEEP");
-	bool deep, ok;
+	time_t start = boot_s();
+	bool ok, own = false;	/* the alarm set is ours */
 
 	if (e && !strcmp(e, "0"))
 		return false;
 	for (;;) {
 		struct wake_marks before;
+		bool deep = boot_s() - start >= DEEP_AFTER_S && deep_allowed();
 
-		deep = !(e && !strcmp(e, "freeze")) && !usb_powered() && sleep_offered("mem");
+		if (deep && own) {	/* nothing to wake for in deep sleep */
+			wake_alarm("0");
+			own = false;
+		}
 		wake_marks(&before);
+		if (!deep && !before.alarm) {
+			char at[16];
+			time_t in = DEEP_AFTER_S - (boot_s() - start);
+
+			snprintf(at, sizeof(at), "+%ld", (long)(in > 0 ? in : DEEP_AFTER_S));
+			wake_alarm(at);
+			own = true;
+		}
+		if (own)
+			before.alarm = 0;	/* ours: not a wake for the screen */
 		/* (the caller has switched the panel off: screen_set(false)) */
 		ok = deep && write_sleep_state("mem");
-		if (ok) {
-			deep = true;
-		} else {	/* not deep, or the PMU refused: suspend to idle */
-			deep = false;
+		if (!ok)	/* not deep, or the PMU refused: suspend to idle */
 			ok = write_sleep_state("freeze");
-		}
 		woke_us = mono_us();
-		if (!ok || woke_for_screen(&before) || dark_linger())
+		if (!ok || woke_for_screen(&before))
+			break;
+		if (own) {
+			struct wake_marks now;
+
+			wake_marks(&now);
+			if (!now.alarm) {	/* ours rang (the RTC disarms it): sleep on */
+				own = false;
+				continue;
+			}
+		}
+		if (dark_linger())
 			break;
 	}
+	if (own)
+		wake_alarm("0");
 
 	/* the wake press and anything touched meanwhile are not input */
 	drain(keys_fd);
 	screen_set(true);
+	/* the idle and lock timeouts count from the wake, not from the press
+	 * that put it to sleep (which a long sleep has long outlasted) */
+	lv_display_trigger_activity(NULL);
 	return ok;
 }
 

@@ -33,14 +33,24 @@ static bool snd_open(void)
 	return snd_fd >= 0;
 }
 
-/* id of the named control; false if the card has none */
+/*
+ * id of the named control; false if the card has none. Found once: the
+ * card's list is read only on a name's first use (a volume drag sets two
+ * controls per step).
+ */
 static bool snd_ctl_id(const char *name, struct snd_ctl_elem_id *out)
 {
+	static struct { const char *name; struct snd_ctl_elem_id id; } known[8];
 	struct snd_ctl_elem_list list;
 	struct snd_ctl_elem_id *ids;
 	unsigned int i;
 	bool ok = false;
 
+	for (i = 0; i < 8 && known[i].name; i++)
+		if (!strcmp(known[i].name, name)) {
+			*out = known[i].id;
+			return true;
+		}
 	if (!snd_open())
 		return false;
 	memset(&list, 0, sizeof(list));
@@ -61,6 +71,12 @@ static bool snd_ctl_id(const char *name, struct snd_ctl_elem_id *out)
 		}
 	}
 	free(ids);
+	for (i = 0; ok && i < 8; i++)
+		if (!known[i].name) {
+			known[i].name = name;	/* (string constants) */
+			known[i].id = *out;
+			break;
+		}
 	return ok;
 }
 

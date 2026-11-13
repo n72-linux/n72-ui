@@ -290,6 +290,42 @@ static lv_obj_t *m3_label(lv_obj_t *parent, const char *text, const lv_font_t *f
 	return l;
 }
 
+/*
+ * A slider in a row (after the row's gap is set): its knob reaches half its
+ * size past the track's ends, into the gaps beside it, so those grow by as
+ * much (and the row's end padding too when the slider is last). The knob
+ * then keeps the row's spacing to what is beside it, at 0 as at the maximum.
+ */
+static lv_obj_t *row_slider(lv_obj_t *parent, bool last)
+{
+	lv_obj_t *s = lv_slider_create(parent);
+	int32_t over = lv_obj_get_style_height(s, LV_PART_MAIN) / 2 +
+		       lv_obj_get_style_pad_right(s, LV_PART_KNOB);
+
+	lv_obj_set_style_pad_column(parent, lv_obj_get_style_pad_column(parent, 0) + over, 0);
+	if (last)
+		lv_obj_set_style_pad_right(parent, lv_obj_get_style_pad_right(parent, 0) + over, 0);
+	lv_obj_set_flex_grow(s, 1);
+	return s;
+}
+
+/*
+ * The value beside a slider ("60%", "Mute"): as wide as its widest text,
+ * right-aligned, so the slider keeps its length while it is dragged (a
+ * label that grew from "99%" to "100%" shortened it under the finger, and
+ * the knob jumped and the end padding changed).
+ */
+static lv_obj_t *slider_value(lv_obj_t *parent)
+{
+	const lv_font_t *f = &lv_font_montserrat_14;
+	lv_obj_t *l = m3_label(parent, "", f, M.on_surface_v);
+	int32_t w = LV_MAX(lv_text_get_width("100%", 4, f, 0), lv_text_get_width("Mute", 4, f, 0));
+
+	lv_obj_set_width(l, w);
+	lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_RIGHT, 0);
+	return l;
+}
+
 /* A round icon "badge" in a tonal container, as Material 3 list items use. */
 static lv_obj_t *m3_badge(lv_obj_t *parent, const char *icon, lv_color_t bg,
 			  lv_color_t fg, int size)
@@ -2783,8 +2819,7 @@ static void build_shade(void)
 	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_column(row, 14, 0);
 	m3_label(row, LV_SYMBOL_IMAGE, &lv_font_montserrat_16, M.on_surface_v);
-	home_bright = lv_slider_create(row);
-	lv_obj_set_flex_grow(home_bright, 1);
+	home_bright = row_slider(row, true);
 	lv_slider_set_range(home_bright, 5, 100);
 	lv_slider_set_value(home_bright, backlight_get(), LV_ANIM_OFF);
 	lv_obj_add_event_cb(home_bright, home_bright_cb, LV_EVENT_VALUE_CHANGED, NULL);
@@ -6302,12 +6337,11 @@ static void open_display(lv_event_t *e)
 	lv_obj_set_flex_align(c, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_column(c, 12, 0);
 	m3_label(c, LV_SYMBOL_IMAGE, &lv_font_montserrat_20, M.on_surface_v);
-	s = lv_slider_create(c);
-	lv_obj_set_flex_grow(s, 1);
+	s = row_slider(c, false);
 	lv_slider_set_range(s, 5, 100);
 	lv_slider_set_value(s, backlight_get(), LV_ANIM_OFF);
 	lv_obj_add_event_cb(s, bright_cb, LV_EVENT_VALUE_CHANGED, NULL);
-	bright_val = m3_label(c, "", &lv_font_montserrat_14, M.on_surface_v);
+	bright_val = slider_value(c);
 	obj_track(&bright_val);
 	lv_label_set_text_fmt(bright_val, "%d%%", backlight_get());
 
@@ -6912,8 +6946,7 @@ static void vol_hud_show(void)
 		vol_hud_icon = m3_label(vol_hud, LV_SYMBOL_VOLUME_MAX, &lv_font_montserrat_16,
 					M.on_surface_v);
 		lv_obj_set_width(vol_hud_icon, 20);
-		vol_hud_slider = lv_slider_create(vol_hud);
-		lv_obj_set_flex_grow(vol_hud_slider, 1);
+		vol_hud_slider = row_slider(vol_hud, true);
 		lv_slider_set_range(vol_hud_slider, 0, 100);
 		lv_obj_add_event_cb(vol_hud_slider, vol_hud_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
 		lv_obj_remove_flag(vol_hud_slider, LV_OBJ_FLAG_GESTURE_BUBBLE);
@@ -6941,7 +6974,7 @@ static void volume_set(int pct, bool hud)
 		bta_volume(conf.vol);
 	else
 		snd_apply_volume(conf.vol);
-	conf_save();
+	conf_save_later();	/* not a flash write per step of a drag */
 	if (hud)
 		vol_hud_show();
 	else
@@ -7012,13 +7045,12 @@ static void open_sound(lv_event_t *e)
 	lv_obj_set_flex_align(c, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_column(c, 12, 0);
 	m3_label(c, LV_SYMBOL_VOLUME_MAX, &lv_font_montserrat_20, M.on_surface_v);
-	snd_slider = lv_slider_create(c);
+	snd_slider = row_slider(c, false);
 	obj_track(&snd_slider);
-	lv_obj_set_flex_grow(snd_slider, 1);
 	lv_slider_set_range(snd_slider, 0, 100);
 	lv_slider_set_value(snd_slider, conf.vol, LV_ANIM_OFF);
 	lv_obj_add_event_cb(snd_slider, snd_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
-	snd_val = m3_label(c, "", &lv_font_montserrat_14, M.on_surface_v);
+	snd_val = slider_value(c);
 	obj_track(&snd_val);
 
 	m3_section(body, "Output");
@@ -7389,6 +7421,8 @@ static void ui_reopen(void)
 		open_wifi(NULL);
 	else if (!strcmp(p, "bt"))
 		open_bt(NULL);
+	else if (!strcmp(p, "sound"))
+		open_sound(NULL);
 	else if (!strcmp(p, "power"))
 		open_power(NULL);
 	else if (!strcmp(p, "about"))
