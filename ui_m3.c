@@ -2364,6 +2364,108 @@ static lv_obj_t *qs_tile(lv_obj_t *parent, const char *icon, const char *title,
 }
 
 /* An app tile on the home screen. */
+/*
+ * An application's own picture (a manifest's image=): .n72i, "N72I", u16
+ * width, u16 height (little endian), then width x height pixels as B, G, R,
+ * A bytes (LVGL's ARGB8888, straight alpha). Loaded once per path; the
+ * tiles' reload (apps_reload) lets them all go.
+ */
+struct app_icon {
+	char path[160];
+	lv_image_dsc_t dsc;
+	lv_color_t avg;		/* its colour, for the card of the open animation */
+};
+#define APP_ICONS 48
+static struct app_icon app_icons[APP_ICONS];
+static int app_nicons;
+
+static struct app_icon *app_icon_load(const char *path)
+{
+	struct app_icon *ic;
+	uint8_t hd[8], *px;
+	uint32_t w, h, n, i, r = 0, g = 0, b = 0, a = 0;
+	FILE *f;
+
+	for (i = 0; i < (uint32_t)app_nicons; i++)
+		if (!strcmp(app_icons[i].path, path))
+			return &app_icons[i];
+	if (app_nicons >= APP_ICONS || !(f = fopen(path, "rb")))
+		return NULL;
+	if (fread(hd, 1, 8, f) != 8 || memcmp(hd, "N72I", 4)) {
+		fclose(f);
+		return NULL;
+	}
+	w = hd[4] | hd[5] << 8;
+	h = hd[6] | hd[7] << 8;
+	n = w * h * 4;
+	if (!w || !h || w > 256 || h > 256 || !(px = malloc(n))) {
+		fclose(f);
+		return NULL;
+	}
+	if (fread(px, 1, n, f) != n) {
+		fclose(f);
+		free(px);
+		return NULL;
+	}
+	fclose(f);
+	for (i = 0; i < n; i += 4) {	/* (weighted by alpha: the corners do not count) */
+		b += px[i] * px[i + 3];
+		g += px[i + 1] * px[i + 3];
+		r += px[i + 2] * px[i + 3];
+		a += px[i + 3];
+	}
+	ic = &app_icons[app_nicons++];
+	memset(ic, 0, sizeof(*ic));
+	snprintf(ic->path, sizeof(ic->path), "%s", path);
+	ic->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+	ic->dsc.header.cf = LV_COLOR_FORMAT_ARGB8888;
+	ic->dsc.header.w = w;
+	ic->dsc.header.h = h;
+	ic->dsc.header.stride = w * 4;
+	ic->dsc.data_size = n;
+	ic->dsc.data = px;
+	ic->avg = a ? lv_color_make(r / a, g / a, b / a) : lv_color_black();
+	return ic;
+}
+
+static void app_icons_free(void)
+{
+	for (int i = 0; i < app_nicons; i++) {
+		lv_image_cache_drop(&app_icons[i].dsc);
+		free((void *)app_icons[i].dsc.data);
+	}
+	app_nicons = 0;
+}
+
+static void app_tile(lv_obj_t *parent, const char *icon, const char *name,
+		     lv_color_t bg, lv_color_t fg, lv_event_cb_t cb);
+
+/*
+ * A tile with the application's picture where the symbol badge is: a clear
+ * 60 px box (its background colour the picture's, for the open animation's
+ * card) with the picture in it, scaled down only if larger.
+ */
+static void app_tile_img(lv_obj_t *parent, struct app_icon *ic, const char *name,
+			 lv_event_cb_t cb)
+{
+	lv_obj_t *t, *box, *im;
+	uint32_t before = lv_obj_get_child_count(parent);
+	int32_t side = LV_MAX(ic->dsc.header.w, ic->dsc.header.h);
+
+	app_tile(parent, "", name, ic->avg, lv_color_white(), cb);
+	if (lv_obj_get_child_count(parent) <= before)
+		return;
+	t = lv_obj_get_child(parent, before);
+	box = lv_obj_get_child(t, 0);
+	lv_obj_clean(box);
+	lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
+	im = lv_image_create(box);
+	lv_image_set_src(im, &ic->dsc);
+	if (side > 60)
+		lv_image_set_scale(im, 256 * 60 / side);
+	lv_obj_center(im);
+}
+
 static void app_tile(lv_obj_t *parent, const char *icon, const char *name,
 		     lv_color_t bg, lv_color_t fg, lv_event_cb_t cb)
 {
@@ -2381,7 +2483,14 @@ static void app_tile(lv_obj_t *parent, const char *icon, const char *name,
 
 	lv_obj_set_style_radius(b, 20, 0);	/* squircle-ish */
 	lv_obj_set_style_transform_scale(t, 240, LV_STATE_PRESSED);
-	m3_label(t, name, &lv_font_montserrat_14, M.on_surface);
+	{
+		/* a long name ends in an ellipsis, as on iOS */
+		lv_obj_t *l = m3_label(t, name, &lv_font_montserrat_14, M.on_surface);
+
+		lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+		lv_obj_set_width(l, 74);
+		lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+	}
 	lv_obj_add_event_cb(t, cb, LV_EVENT_CLICKED, NULL);
 }
 
@@ -2709,7 +2818,9 @@ static void build_shade(void)
  * N72_TOUCH.
  *
  * Manifests: APPS_DIR/<x>.app with the lines "name=<title>" and
- * "exec=<shell command>"; each becomes a tile on the home screen.
+ * "exec=<shell command>"; each becomes a tile on the home screen. Also
+ * icon=<symbol name>, color=#rrggbb, or image=<path of a .n72i picture>
+ * (app_icon_load). The tiles follow the folder (apps_watch).
  */
 #define APPS_DIR "/usr/share/n72-ui/apps"
 
@@ -3808,8 +3919,12 @@ static void za_look(lv_opa_t card, lv_opa_t sym)
 {
 	if (lv_obj_get_style_bg_opa(za.card, 0) != card)
 		lv_obj_set_style_bg_opa(za.card, card, 0);
-	if (lv_obj_get_style_text_opa(za.sym, 0) != sym)
+	if (lv_obj_check_type(za.sym, &lv_image_class)) {
+		if (lv_obj_get_style_image_opa(za.sym, 0) != sym)
+			lv_obj_set_style_image_opa(za.sym, sym, 0);
+	} else if (lv_obj_get_style_text_opa(za.sym, 0) != sym) {
 		lv_obj_set_style_text_opa(za.sym, sym, 0);
+	}
 }
 
 static void za_exec(void *var, int32_t v)
@@ -3890,11 +4005,18 @@ static void za_build(void)
 	lv_obj_set_style_bg_color(za.card, za.col, 0);
 	lv_obj_set_style_bg_opa(za.card, LV_OPA_COVER, 0);
 	lv_obj_set_style_pad_all(za.card, 0, 0);
-	/* the badge's own symbol: the card starts, and ends, as the icon */
+	/* the badge's own symbol, or the application's picture: the card
+	 * starts, and ends, as the icon */
 	l = lv_obj_get_child(badge, 0);
-	za.sym = m3_label(za.card, l ? lv_label_get_text(l) : "",
-			  l ? lv_obj_get_style_text_font(l, 0) : &lv_font_montserrat_24,
-			  l ? lv_obj_get_style_text_color(l, 0) : lv_color_white());
+	if (l && lv_obj_check_type(l, &lv_image_class)) {
+		za.sym = lv_image_create(za.card);
+		lv_image_set_src(za.sym, lv_image_get_src(l));
+		lv_image_set_scale(za.sym, lv_image_get_scale(l));
+	} else {
+		za.sym = m3_label(za.card, l ? lv_label_get_text(l) : "",
+				  l ? lv_obj_get_style_text_font(l, 0) : &lv_font_montserrat_24,
+				  l ? lv_obj_get_style_text_color(l, 0) : lv_color_white());
+	}
 	lv_obj_center(za.sym);
 }
 
@@ -4259,9 +4381,14 @@ static bool page_home_over_app(void)
 static void ui_rebuild(bool load);
 static bool layout_stale;
 
+static bool apps_stale;
+static void apps_reload(void);
+
 static void app_home_ui(void)
 {
 	vc_stop();
+	if (apps_stale)
+		apps_reload();	/* (the folder changed while it ran) */
 	if (layout_stale)
 		ui_rebuild(false);	/* (turned over a video: home and pages now) */
 	else
@@ -4559,8 +4686,13 @@ static void app_launch_cb(lv_event_t *e)
 
 /* One tile for every manifest in APPS_DIR. */
 /* A tile that starts @cmd: icon=<name> picks a symbol, @rgb the badge. */
+static void app_cmd_free_cb(lv_event_t *e)
+{
+	free(lv_event_get_user_data(e));
+}
+
 static void app_tile_cmd(lv_obj_t *parent, const char *name, const char *cmd,
-			 const char *icon, bool have_rgb, unsigned rgb)
+			 const char *icon, const char *image, bool have_rgb, unsigned rgb)
 {
 	static const struct { const char *n, *sym; } syms[] = {
 		{ "video", LV_SYMBOL_VIDEO }, { "image", LV_SYMBOL_IMAGE },
@@ -4576,37 +4708,58 @@ static void app_tile_cmd(lv_obj_t *parent, const char *name, const char *cmd,
 	const char *sym = LV_SYMBOL_PLAY;
 	size_t k;
 
+	struct app_icon *ic = image && image[0] ? app_icon_load(image) : NULL;
+
 	for (k = 0; k < sizeof(syms) / sizeof(syms[0]); k++)
 		if (!strcmp(icon, syms[k].n))
 			sym = syms[k].sym;
-	app_tile(parent, sym, name,
-		 have_rgb ? lv_color_hex(rgb) : M.secondary_c,
-		 have_rgb ? lv_color_white() : M.on_secondary_c, app_launch_cb);
+	if (ic)
+		app_tile_img(parent, ic, name, app_launch_cb);
+	else
+		app_tile(parent, sym, name,
+			 have_rgb ? lv_color_hex(rgb) : M.secondary_c,
+			 have_rgb ? lv_color_white() : M.on_secondary_c, app_launch_cb);
 	/* the command rides on the tile's click */
 	if (lv_obj_get_child_count(parent) > before) {
 		lv_obj_t *t = lv_obj_get_child(parent, before);
+		char *c = strdup(cmd);
 
 		lv_obj_remove_event_cb(t, app_launch_cb);
-		lv_obj_add_event_cb(t, app_launch_cb, LV_EVENT_CLICKED, strdup(cmd));
+		lv_obj_add_event_cb(t, app_launch_cb, LV_EVENT_CLICKED, c);
+		lv_obj_add_event_cb(t, app_cmd_free_cb, LV_EVENT_DELETE, c);
 	}
 }
 
-/* Our manifests: /usr/share/n72-ui/apps/NAME.app (name=, exec=, icon=, color=#). */
+/* Our manifests: /usr/share/n72-ui/apps/NAME.app (name=, exec=, icon=, image=, color=#). */
+struct app_manifest {
+	char name[40], cmd[400], icon[24], image[160];
+	unsigned rgb;
+	bool have_rgb;
+};
+
+static int app_manifest_cmp(const void *a, const void *b)
+{
+	return strcasecmp(((const struct app_manifest *)a)->name,
+			  ((const struct app_manifest *)b)->name);
+}
+
+/* (tiles in the order of their names, whatever the folder's order) */
 static void app_tiles_n72(lv_obj_t *parent)
 {
 	DIR *d = opendir(APPS_DIR);
+	struct app_manifest *m = NULL;
 	struct dirent *de;
+	int n = 0, cap = 0, i;
 
 	if (!d)
 		return;
 	while ((de = readdir(d))) {
-		char path[300], line[400], name[40] = "", cmd[400] = "", icon[24] = "";
-		unsigned rgb = 0;
-		bool have_rgb = false;
-		size_t n = strlen(de->d_name);
+		char path[300], line[400];
+		struct app_manifest a = { 0 };
+		size_t len = strlen(de->d_name);
 		FILE *f;
 
-		if (n < 5 || strcmp(de->d_name + n - 4, ".app"))
+		if (len < 5 || strcmp(de->d_name + len - 4, ".app"))
 			continue;
 		snprintf(path, sizeof(path), APPS_DIR "/%s", de->d_name);
 		f = fopen(path, "r");
@@ -4615,19 +4768,36 @@ static void app_tiles_n72(lv_obj_t *parent)
 		while (fgets(line, sizeof(line), f)) {
 			line[strcspn(line, "\n")] = 0;
 			if (!strncmp(line, "name=", 5))
-				snprintf(name, sizeof(name), "%s", line + 5);
+				snprintf(a.name, sizeof(a.name), "%s", line + 5);
 			else if (!strncmp(line, "exec=", 5))
-				snprintf(cmd, sizeof(cmd), "%s", line + 5);
+				snprintf(a.cmd, sizeof(a.cmd), "%s", line + 5);
 			else if (!strncmp(line, "icon=", 5))
-				snprintf(icon, sizeof(icon), "%s", line + 5);
+				snprintf(a.icon, sizeof(a.icon), "%s", line + 5);
+			else if (!strncmp(line, "image=", 6))
+				snprintf(a.image, sizeof(a.image), "%s", line + 6);
 			else if (!strncmp(line, "color=#", 7))
-				have_rgb = sscanf(line + 7, "%x", &rgb) == 1;
+				a.have_rgb = sscanf(line + 7, "%x", &a.rgb) == 1;
 		}
 		fclose(f);
-		if (name[0] && cmd[0])
-			app_tile_cmd(parent, name, cmd, icon, have_rgb, rgb);
+		if (!a.name[0] || !a.cmd[0])
+			continue;
+		if (n == cap) {
+			struct app_manifest *g = realloc(m, (cap ? cap * 2 : 8) * sizeof(*m));
+
+			if (!g)
+				break;
+			m = g;
+			cap = cap ? cap * 2 : 8;
+		}
+		m[n++] = a;
 	}
 	closedir(d);
+	if (n)
+		qsort(m, n, sizeof(*m), app_manifest_cmp);
+	for (i = 0; i < n; i++)
+		app_tile_cmd(parent, m[i].name, m[i].cmd, m[i].icon, m[i].image,
+			     m[i].have_rgb, m[i].rgb);
+	free(m);
 }
 
 /*
@@ -4749,7 +4919,7 @@ static void app_tiles_desktop(lv_obj_t *parent)
 		snprintf(arg0, sizeof(arg0), "%.*s", (int)strcspn(cmd, " \t"), cmd);
 		if (!prog_path(arg0, prog, sizeof(prog)) || needs_desktop(prog))
 			continue;
-		app_tile_cmd(parent, name, cmd, icon, have_rgb, rgb);
+		app_tile_cmd(parent, name, cmd, icon, NULL, have_rgb, rgb);
 	}
 	closedir(d);
 }
@@ -4760,6 +4930,72 @@ static void app_tiles(lv_obj_t *parent)
 		return;
 	app_tiles_n72(parent);
 	app_tiles_desktop(parent);
+}
+
+/*
+ * The folder of manifests changed (an application added, renamed or
+ * removed; n72-ios-tiles rewrites iOS applications' manifests): the tiles
+ * after the built-in ones are made again. Not while an application runs
+ * or a card animates (the card's way back is a tile): then once home is
+ * back (app_home_ui). A burst of changes is one rebuild, 300 ms after the
+ * last.
+ */
+static uint32_t home_apps_builtin;	/* tiles of our own, before the manifests' */
+static lv_timer_t *apps_timer;
+
+static void apps_reload(void)
+{
+	if (!home_apps || app_pid != 0 || za.phase) {
+		apps_stale = true;
+		return;
+	}
+	apps_stale = false;
+	while (lv_obj_get_child_count(home_apps) > home_apps_builtin) {
+		lv_obj_t *t = lv_obj_get_child(home_apps, -1);
+
+		if (za.tile == t)
+			za.tile = NULL;
+		lv_obj_delete(t);
+	}
+	app_icons_free();
+	app_tiles(home_apps);
+	bp_changed(home_scr);
+	lv_obj_invalidate(home_scr);
+}
+
+static void apps_timer_cb(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	apps_timer = NULL;
+	apps_reload();
+}
+
+static void apps_ev(int fd)
+{
+	char buf[1024] __attribute__((aligned(__alignof__(struct inotify_event))));
+
+	while (read(fd, buf, sizeof(buf)) > 0)
+		;
+	if (apps_timer) {
+		lv_timer_reset(apps_timer);
+		return;
+	}
+	apps_timer = lv_timer_create(apps_timer_cb, 300, NULL);
+	lv_timer_set_repeat_count(apps_timer, 1);
+}
+
+static void apps_watch(void)
+{
+	int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+
+	if (fd < 0)
+		return;
+	if (inotify_add_watch(fd, APPS_DIR, IN_CREATE | IN_DELETE | IN_CLOSE_WRITE |
+			      IN_MOVED_TO | IN_MOVED_FROM) < 0) {
+		close(fd);
+		return;
+	}
+	ui_watch(fd, apps_ev);
 }
 
 /* -------------------------------------------------------------- files */
@@ -5052,6 +5288,7 @@ static void build_home(void)
 	page_tile_anim(apps, open_files);
 	app_tile(apps, LV_SYMBOL_PLAY, "YouTube", M.tertiary_c, M.on_tertiary_c, open_youtube);
 	page_tile_anim(apps, open_youtube);
+	home_apps_builtin = lv_obj_get_child_count(apps);
 	app_tiles(apps);
 
 	build_shade();
@@ -8444,5 +8681,6 @@ static void ui_apply_saved(void)
 	if (conf.bt == 0 && have_tool("bluetoothctl"))
 		job_run(BT_OFF_CMD, NULL, bt_set_done, NULL);
 	awake_timer(bt_auto_tick, 30000, NULL);	/* Connect automatically */
+	apps_watch();		/* the home tiles follow APPS_DIR */
 	bz_start(NULL);		/* BlueZ's signals: the Bluetooth views follow */
 }
