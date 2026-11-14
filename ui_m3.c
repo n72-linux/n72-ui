@@ -706,7 +706,7 @@ static bool tr_start(lv_draw_buf_t *bg, lv_draw_buf_t *fg, int kind, lv_obj_t *t
 	lv_anim_set_exec_cb(&a, tr_exec);
 	lv_anim_set_values(&a, from_v, to_v);
 	lv_anim_set_duration(&a, TR_MS);
-	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+	lv_anim_set_path_cb(&a, ios_path_ease_out);
 	lv_anim_set_completed_cb(&a, tr_done_cb);
 	lv_anim_start(&a);
 	return true;
@@ -1706,7 +1706,7 @@ static void sb_fade(lv_obj_t *obj, bool in)
 	lv_anim_set_values(&a, now, in ? LV_OPA_COVER : LV_OPA_TRANSP);
 	lv_anim_set_duration(&a, in ? SB_IN_MS : SB_OUT_MS);
 	lv_anim_set_delay(&a, in ? 0 : SB_HOLD_MS);
-	lv_anim_set_path_cb(&a, in ? lv_anim_path_ease_out : lv_anim_path_ease_in_out);
+	lv_anim_set_path_cb(&a, in ? ios_path_ease_out : ios_path_ease_in_out);
 	lv_anim_start(&a);
 }
 
@@ -2927,7 +2927,7 @@ static void app_slide(lv_obj_t *obj, int32_t to, lv_anim_completed_cb_t done)
 	lv_anim_set_exec_cb(&a, app_y);
 	lv_anim_set_values(&a, lv_obj_get_style_y(obj, LV_PART_MAIN), to);
 	lv_anim_set_duration(&a, 200);
-	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+	lv_anim_set_path_cb(&a, ios_path_ease_out);
 	if (done)
 		lv_anim_set_completed_cb(&a, done);
 	lv_anim_start(&a);
@@ -3320,7 +3320,7 @@ static bool sd_animate(bool open)
 	lv_anim_set_exec_cb(&a, sd_anim_exec);
 	lv_anim_set_values(&a, sd.y, open ? 0 : -SHADE_H);
 	lv_anim_set_duration(&a, 240);
-	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+	lv_anim_set_path_cb(&a, ios_path_ease_out);
 	lv_anim_set_completed_cb(&a, sd_anim_done);
 	lv_anim_start(&a);
 	return true;
@@ -3485,7 +3485,7 @@ static void sd_release(void)
 	lv_anim_set_exec_cb(&a, sd_anim_exec);
 	lv_anim_set_values(&a, sd.y, to);
 	lv_anim_set_duration(&a, 60 + 180 * dist / SHADE_H);
-	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+	lv_anim_set_path_cb(&a, ios_path_ease_out);
 	lv_anim_set_completed_cb(&a, sd_anim_done);
 	lv_anim_start(&a);
 }
@@ -3729,7 +3729,7 @@ static void ul_release(void)
 	lv_anim_set_exec_cb(&a, ul_exec);
 	lv_anim_set_values(&a, ul.y, to);
 	lv_anim_set_duration(&a, LV_MAX(80, 300 * dist / H));
-	lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+	lv_anim_set_path_cb(&a, ios_path_ease_out);
 	lv_anim_set_completed_cb(&a, ul_done);
 	lv_anim_start(&a);
 }
@@ -4141,7 +4141,7 @@ static void za_next(void)
 				return;
 			}
 			lv_image_set_src(za.bg, za.page_pic);
-			za_run(6, LV_OPA_COVER, LV_OPA_TRANSP, ZA_REVEAL_MS, lv_anim_path_ease_out);
+			za_run(6, LV_OPA_COVER, LV_OPA_TRANSP, ZA_REVEAL_MS, ios_path_ease_out);
 			return;
 		case 6:
 			za.phase = 0;
@@ -4173,7 +4173,7 @@ static void za_next(void)
 		/* the card alone: one GPU fill a frame (mbx_fill_straight) */
 		lv_obj_add_flag(za.sym, LV_OBJ_FLAG_HIDDEN);
 		mbx_gpu_set_transparent(true);
-		za_run(3, LV_OPA_COVER, LV_OPA_TRANSP, ZA_REVEAL_MS, lv_anim_path_ease_out);
+		za_run(3, LV_OPA_COVER, LV_OPA_TRANSP, ZA_REVEAL_MS, ios_path_ease_out);
 		break;
 	case 3:
 		za.phase = 0;
@@ -4375,7 +4375,7 @@ static void qs_to_page(void (*open)(lv_event_t *))
 		lv_anim_set_exec_cb(&a, sd_anim_exec);
 		lv_anim_set_values(&a, 0, -SHADE_H);
 		lv_anim_set_duration(&a, 300);
-		lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+		lv_anim_set_path_cb(&a, ios_path_ease_in_out);
 		lv_anim_set_completed_cb(&a, sd_anim_done);
 		lv_anim_start(&a);
 	}
@@ -4430,7 +4430,7 @@ static bool page_back_to_app(void)
 	lv_anim_set_exec_cb(&a, pb_exec);
 	lv_anim_set_values(&a, 0, H);
 	lv_anim_set_duration(&a, 280);
-	lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+	lv_anim_set_path_cb(&a, ios_path_ease_in);
 	lv_anim_set_completed_cb(&a, pb_done);
 	lv_anim_start(&a);
 	return true;
@@ -7057,7 +7057,7 @@ static void vol_hud_fade(bool in)
 	lv_anim_set_exec_cb(&a, vol_hud_opa);
 	lv_anim_set_values(&a, lv_obj_get_style_opa(vol_hud, 0), in ? LV_OPA_COVER : LV_OPA_TRANSP);
 	lv_anim_set_duration(&a, 150);
-	lv_anim_set_path_cb(&a, in ? lv_anim_path_ease_out : lv_anim_path_ease_in);
+	lv_anim_set_path_cb(&a, in ? ios_path_ease_out : ios_path_ease_in);
 	if (!in)
 		lv_anim_set_completed_cb(&a, vol_hud_gone);
 	lv_anim_start(&a);
@@ -8014,7 +8014,7 @@ static void turn_fade_start(lv_draw_buf_t *old, int from, int to)
 	lv_anim_set_exec_cb(&a, turn_fade_exec);
 	lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
 	lv_anim_set_duration(&a, TURN_FADE_MS);
-	lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+	lv_anim_set_path_cb(&a, ios_path_ease_in_out);
 	lv_anim_set_completed_cb(&a, turn_fade_done);
 	lv_anim_start(&a);
 }
@@ -8653,7 +8653,7 @@ static void vc_show(bool on)
 	lv_anim_set_exec_cb(&a, vc_opa_exec);
 	lv_anim_set_values(&a, on ? LV_OPA_TRANSP : LV_OPA_COVER, on ? LV_OPA_COVER : LV_OPA_TRANSP);
 	lv_anim_set_duration(&a, VC_FADE_MS);
-	lv_anim_set_path_cb(&a, on ? lv_anim_path_ease_out : lv_anim_path_ease_in);
+	lv_anim_set_path_cb(&a, on ? ios_path_ease_out : ios_path_ease_in);
 	lv_anim_set_completed_cb(&a, vc_fade_done);
 	lv_anim_start(&a);
 	vc_hide_later();

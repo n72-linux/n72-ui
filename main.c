@@ -63,6 +63,8 @@
 #include "lvgl/src/display/lv_display_private.h"
 #include "lvgl/src/misc/lv_timer_private.h"
 #include "mbx_gpu.h"
+#include "lvgl/src/misc/lv_anim_private.h"	/* (ios_motion.h reads act_time) */
+#include "ios_motion.h"
 
 /* the screen as the UI lays it out: 320 x 480, or 480 x 320 turned */
 static int32_t ui_w = 320, ui_h = 480;
@@ -546,7 +548,7 @@ static void backlight_fade_in_start(void)
 	lv_anim_set_exec_cb(&a, bl_fade_exec);
 	lv_anim_set_values(&a, 1, to);
 	lv_anim_set_duration(&a, BL_FADE_IN_MS);
-	lv_anim_set_path_cb(&a, lv_anim_path_ease_in);	/* square law, as above */
+	lv_anim_set_path_cb(&a, ios_path_ease_in);	/* square law, as above */
 	lv_anim_start(&a);
 }
 

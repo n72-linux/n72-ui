@@ -867,7 +867,7 @@ static void kbd_show_for(lv_obj_t *ta, void (*vis_cb)(bool shown, int32_t h))
 		lv_anim_set_exec_cb(&a, kbd_y);
 		lv_anim_set_values(&a, lv_obj_get_y(kbd.obj), H - kbd.h);
 		lv_anim_set_duration(&a, 250);
-		lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+		lv_anim_set_path_cb(&a, ios_path_ease_out);
 		lv_anim_start(&a);
 	} else {
 		lv_obj_set_y(kbd.obj, H - kbd.h);
@@ -904,7 +904,7 @@ static void kbd_hide_now(bool anim)
 		lv_anim_set_exec_cb(&a, kbd_y);
 		lv_anim_set_values(&a, lv_obj_get_y(kbd.obj), H);
 		lv_anim_set_duration(&a, 200);
-		lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+		lv_anim_set_path_cb(&a, ios_path_ease_in);
 		lv_anim_set_completed_cb(&a, kbd_gone);
 		lv_anim_start(&a);
 	} else {
