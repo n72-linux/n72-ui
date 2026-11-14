@@ -635,6 +635,7 @@ static void awake_set(bool on)
 }
 
 static void rot_motion_off(void);
+static void wp_apply_kick(void);
 
 static void screen_set(bool on)
 {
@@ -672,6 +673,7 @@ static void screen_set(bool on)
 	if (on) {
 		home_wake();
 		lv_obj_invalidate(lv_screen_active());
+		wp_apply_kick();	/* (new wallpaper frames that waited for this) */
 	}
 }
 

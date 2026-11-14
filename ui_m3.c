@@ -99,6 +99,7 @@ static bool wp_put(lv_obj_t *scr, int kind);
 static bool home_wp;		/* home is built over a wallpaper */
 static lv_draw_buf_t *wp_pic(int kind);
 static bool wp_hold(lv_obj_t *img, lv_draw_buf_t *b);
+static void wp_apply_kick(void);	/* (something in the way of new wallpaper frames ended) */
 static bool pg_drag(int phase, int x, int y);
 static void pg_fb0_dirty(void);
 static void pg_abort(void);
@@ -724,6 +725,7 @@ static void tr_finish(void)
 	tr.from = NULL;
 	tr.done = NULL;
 	tr.keep_for = NULL;
+	wp_apply_kick();
 	lv_anim_delete(&tr, tr_exec);
 	lv_screen_load(tr.to);
 	lv_obj_delete(scr);
@@ -1288,6 +1290,7 @@ static void sc_restore(bool delete_pics)
 	sc.n = 0;
 	sc.bytes = 0;
 	sc.owner = NULL;
+	wp_apply_kick();
 }
 
 static void sc_settle(lv_timer_t *t)
@@ -4426,6 +4429,7 @@ static void ul_finish(bool open)
 	if (open) {
 		locked = false;
 		rot_kick();	/* (unlocked: a turn may be due) */
+		wp_apply_kick();
 		lv_screen_load(lock_from && lv_obj_is_valid(lock_from) ? lock_from : home_scr);
 		ul_free();
 		if (lock_from == app_scr && app_pid > 0)
@@ -5243,6 +5247,7 @@ static void apps_reload(void);
 
 static void app_home_ui(void)
 {
+	wp_apply_kick();	/* (a restart for the palette waits for no application) */
 	vc_stop();
 	if (apps_stale)
 		apps_reload();	/* (the folder changed while it ran) */

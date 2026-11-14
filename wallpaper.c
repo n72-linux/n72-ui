@@ -695,7 +695,8 @@ static void open_wallpaper(lv_event_t *e);
  * only a restart makes: that waits for no application as well (a restart
  * would lose it, and the lock).
  */
-static lv_timer_t *wp_apply_t;
+static lv_timer_t *wp_apply_t;	/* (a try, once, just after an event) */
+static bool wp_apply_due;		/* new frames wait to be shown */
 static bool wp_apply_restart;
 
 static bool wp_apply_try(void)
@@ -714,10 +715,27 @@ static bool wp_apply_try(void)
 
 static void wp_apply_cb(lv_timer_t *t)
 {
-	if (wp_apply_try()) {
-		lv_timer_delete(t);
-		wp_apply_t = NULL;
-	}
+	LV_UNUSED(t);
+	wp_apply_t = NULL;	/* (one run: LVGL deletes it) */
+	if (!wp_apply_due)
+		return;
+	wp_apply_due = false;	/* (the rebuild passes the kicks: no second try) */
+	if (!wp_apply_try())
+		wp_apply_due = true;	/* (the next event tries again) */
+}
+
+/*
+ * Something that kept the new frames waiting may have ended (the screen
+ * lit, an unlock, a slide's or swipe's end, a scroll let go, an
+ * application closed): one try, a moment later, outside the caller.
+ * Nothing runs in between: no timer looks while dark or locked.
+ */
+static void wp_apply_kick(void)
+{
+	if (!wp_apply_due || wp_apply_t)
+		return;
+	wp_apply_t = lv_timer_create(wp_apply_cb, 30, NULL);
+	lv_timer_set_repeat_count(wp_apply_t, 1);
 }
 
 static void wp_status(const char *text)
@@ -746,8 +764,8 @@ static void wp_done(const char *out, void *ud)
 	}
 	wp_status("");
 	wp_apply_restart |= home && conf.wp_accent;
-	if (!wp_apply_t && !wp_apply_try())
-		wp_apply_t = lv_timer_create(wp_apply_cb, 500, NULL);
+	wp_apply_due = true;
+	wp_apply_kick();
 }
 
 static void wp_run(const char *src, const char *what)

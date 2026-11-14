@@ -547,6 +547,7 @@ static void pg_frames_end(int p)
 	pg.on = pg.settling = false;
 	lv_anim_delete(&pg, NULL);
 	pg_show_page(p);
+	wp_apply_kick();
 	if (!scr)
 		return;
 	pg.scr = NULL;
