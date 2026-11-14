@@ -761,6 +761,17 @@ static lv_draw_buf_t *snap(lv_obj_t *obj, lv_color_format_t cf)
  * 350 ms) then cost nothing more per frame.
  */
 #define PSL_MAX 2
+#define PSL_SIG 160
+
+/*
+ * @sig (optional): a short text that changes whenever the object's look
+ * does. With it the picture is kept between slides (taken again only when
+ * the text changed, ahead of time by psl_warm), and after a slide in the
+ * picture stays on display in the object's place: the object itself comes
+ * back (one redraw) only when psl_wake() is called, for a touch or a
+ * change. A show and hide then draw the object not at all.
+ */
+typedef void (*psl_sig_fn)(char *buf, size_t len);
 
 struct psl {
 	lv_obj_t *live, *img;
@@ -768,6 +779,9 @@ struct psl {
 	int32_t ext;		/* the picture's margin (shadows) */
 	int32_t to;
 	bool hide;		/* hidden at the end (a slide out) */
+	bool resting;		/* the picture shows in the object's place */
+	psl_sig_fn sig;
+	char pic_sig[PSL_SIG];	/* what the picture shows */
 };
 
 static struct psl psl[PSL_MAX];
@@ -779,17 +793,32 @@ static void psl_y(void *var, int32_t v)
 	lv_obj_set_y(s->img, v - s->ext);
 }
 
+static void psl_img_free(struct psl *s)
+{
+	if (s->img) {
+		lv_obj_delete(s->img);
+		s->img = NULL;
+	}
+}
+
 static void psl_finish(struct psl *s)
 {
 	if (!s->live)
 		return;
 	lv_anim_delete(s, psl_y);
 	lv_obj_set_y(s->live, s->to);
+	if (!s->hide && s->sig) {	/* the picture stays in its place */
+		s->resting = true;
+		return;
+	}
 	if (!s->hide)
 		lv_obj_remove_flag(s->live, LV_OBJ_FLAG_HIDDEN);
-	lv_obj_delete(s->img);
-	tr_free(&s->pic);
-	s->live = s->img = NULL;
+	psl_img_free(s);
+	s->resting = false;
+	if (!s->sig) {
+		tr_free(&s->pic);
+		s->live = NULL;
+	}
 }
 
 static void psl_done(lv_anim_t *a)
@@ -813,10 +842,51 @@ static bool psl_covers(lv_obj_t *live, int x, int y)
 	struct psl *s = psl_of(live);
 	lv_area_t a;
 
-	if (!s || s->hide)
+	if (!s || !s->img || s->hide)
 		return false;
 	lv_obj_get_coords(live, &a);	/* (already at the end, hidden) */
 	return x >= a.x1 && x <= a.x2 && y >= a.y1 && y <= a.y2;
+}
+
+/* A new picture of @live into @s (true: there is one). */
+static bool psl_take(struct psl *s, lv_obj_t *live)
+{
+	bool hidden = lv_obj_has_flag(live, LV_OBJ_FLAG_HIDDEN);
+	char sig[PSL_SIG] = "";
+
+	if (s->sig)
+		s->sig(sig, sizeof(sig));
+	if (s->pic && s->sig && !strcmp(sig, s->pic_sig))
+		return true;		/* (still what it shows) */
+	tr_free(&s->pic);
+	lv_obj_remove_flag(live, LV_OBJ_FLAG_HIDDEN);	/* (a hidden object draws nothing) */
+	s->pic = snap(live, LV_COLOR_FORMAT_ARGB8888);
+	if (hidden)
+		lv_obj_add_flag(live, LV_OBJ_FLAG_HIDDEN);
+	if (!s->pic)
+		return false;
+	mbx_gpu_premultiply_buf(s->pic);	/* exact copy on the transparent display */
+	s->ext = lv_obj_get_ext_draw_size(live);
+	snprintf(s->pic_sig, sizeof(s->pic_sig), "%s", sig);
+	return true;
+}
+
+static struct psl *psl_slot(lv_obj_t *live, psl_sig_fn sig)
+{
+	struct psl *s = psl_of(live);
+	int i;
+
+	if (s)
+		return s;
+	for (i = 0; i < PSL_MAX && psl[i].live; i++)
+		;
+	if (i == PSL_MAX)
+		return NULL;
+	s = &psl[i];
+	memset(s, 0, sizeof(*s));
+	s->live = live;
+	s->sig = sig;
+	return s;
 }
 
 /*
@@ -824,40 +894,43 @@ static bool psl_covers(lv_obj_t *live, int x, int y)
  * @ms on @path; @hide: hidden once there. False if there was no memory for
  * the picture: the caller moves the object itself.
  */
-static bool psl_start(lv_obj_t *live, int32_t to, uint32_t ms, lv_anim_path_cb_t path, bool hide)
+static bool psl_start_sig(lv_obj_t *live, int32_t to, uint32_t ms, lv_anim_path_cb_t path,
+			  bool hide, psl_sig_fn sig)
 {
-	struct psl *s = psl_of(live);
+	struct psl *s = psl_slot(live, sig);
 	int32_t from;
 	lv_anim_t a;
-	int i;
 
-	if (s) {	/* sliding already: from where its picture is now */
+	if (!s)
+		return false;
+	if (s->img) {
+		/* sliding, or resting as its picture: from where that is now */
 		from = lv_obj_get_style_y(s->img, LV_PART_MAIN) + s->ext;
 		lv_anim_delete(s, psl_y);
-		lv_obj_delete(s->img);
-		tr_free(&s->pic);
-		s->live = s->img = NULL;
+		if (s->resting) {	/* (the picture may be old: the object again) */
+			char now[PSL_SIG] = "";
+
+			s->sig(now, sizeof(now));
+			if (strcmp(now, s->pic_sig))
+				psl_img_free(s);
+		}
 	} else {
 		from = lv_obj_get_style_y(live, LV_PART_MAIN);
-		for (i = 0; i < PSL_MAX && psl[i].live; i++)
-			;
-		if (i == PSL_MAX)
-			return false;
-		s = &psl[i];
 	}
-	lv_obj_remove_flag(live, LV_OBJ_FLAG_HIDDEN);	/* (a hidden object draws nothing) */
-	lv_obj_set_y(live, from);
-	s->pic = snap(live, LV_COLOR_FORMAT_ARGB8888);
-	if (!s->pic)
-		return false;
-	mbx_gpu_premultiply_buf(s->pic);	/* exact copy on the transparent display */
-	s->ext = lv_obj_get_ext_draw_size(live);
-	s->img = lv_image_create(lv_obj_get_parent(live));
-	lv_image_set_src(s->img, s->pic);
-	lv_obj_remove_flag(s->img, LV_OBJ_FLAG_CLICKABLE);
-	lv_obj_move_to_index(s->img, lv_obj_get_index(live) + 1);
-	lv_obj_set_pos(s->img, lv_obj_get_x(live) - s->ext, from - s->ext);
-	s->live = live;
+	s->resting = false;
+	if (!s->img) {
+		lv_obj_set_y(live, from);
+		if (!psl_take(s, live)) {
+			if (!s->sig)
+				s->live = NULL;
+			return false;
+		}
+		s->img = lv_image_create(lv_obj_get_parent(live));
+		lv_image_set_src(s->img, s->pic);
+		lv_obj_remove_flag(s->img, LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_move_to_index(s->img, lv_obj_get_index(live) + 1);
+		lv_obj_set_pos(s->img, lv_obj_get_x(live) - s->ext, from - s->ext);
+	}
 	s->to = to;
 	s->hide = hide;
 	lv_obj_add_flag(live, LV_OBJ_FLAG_HIDDEN);
@@ -873,13 +946,61 @@ static bool psl_start(lv_obj_t *live, int32_t to, uint32_t ms, lv_anim_path_cb_t
 	return true;
 }
 
-/* Stop @live's slide where it ends (a rebuild, a jump). */
+static bool psl_start(lv_obj_t *live, int32_t to, uint32_t ms, lv_anim_path_cb_t path, bool hide)
+{
+	return psl_start_sig(live, to, ms, path, hide, NULL);
+}
+
+/* @live itself again in place of its resting picture (a touch, a change). */
+static void psl_wake(lv_obj_t *live)
+{
+	struct psl *s = psl_of(live);
+
+	if (!s || !s->resting)
+		return;
+	s->resting = false;
+	psl_img_free(s);
+	lv_obj_remove_flag(live, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Resting, and its look changed since the picture: the object again. */
+static void psl_check(lv_obj_t *live)
+{
+	struct psl *s = psl_of(live);
+	char now[PSL_SIG] = "";
+
+	if (!s || !s->resting)
+		return;
+	s->sig(now, sizeof(now));
+	if (strcmp(now, s->pic_sig))
+		psl_wake(live);
+}
+
+/* Hidden and still: its picture ready for the next slide (with a @sig). */
+static void psl_warm(lv_obj_t *live, psl_sig_fn sig)
+{
+	struct psl *s;
+
+	if (!lv_obj_has_flag(live, LV_OBJ_FLAG_HIDDEN) || !(s = psl_slot(live, sig)) || s->img)
+		return;
+	psl_take(s, live);
+}
+
+/* Stop @live's slide where it ends, and forget it (a rebuild, a jump). */
 static void psl_stop(lv_obj_t *live)
 {
 	struct psl *s = psl_of(live);
 
-	if (s)
+	if (!s)
+		return;
+	if (s->img && !s->resting)
 		psl_finish(s);
+	if (s->resting) {
+		psl_img_free(s);
+		lv_obj_remove_flag(live, LV_OBJ_FLAG_HIDDEN);
+	}
+	tr_free(&s->pic);
+	memset(s, 0, sizeof(*s));
 }
 
 /* The screen on display: copied from the display buffer when it is current. */
@@ -3466,6 +3587,18 @@ static void app_shade_slide(bool open)
 
 static void app_bar_set(bool show);
 
+/*
+ * What the bar shows, for its kept picture (psl_start_sig): it is taken
+ * again only when this changes (the minute, the battery, the icons).
+ */
+static void app_bar_sig(char *buf, size_t len)
+{
+	snprintf(buf, len, "%s|%s|%d%d|%d", app_bar_time ? lv_label_get_text(app_bar_time) : "",
+		 app_bar_batt ? lv_label_get_text(app_bar_batt) : "",
+		 app_bar_wifi && !lv_obj_has_flag(app_bar_wifi, LV_OBJ_FLAG_HIDDEN),
+		 app_bar_bt && !lv_obj_has_flag(app_bar_bt, LV_OBJ_FLAG_HIDDEN), (int)W);
+}
+
 static void app_bar_expire(lv_timer_t *t)
 {
 	LV_UNUSED(t);
@@ -3491,14 +3624,14 @@ static void app_bar_set(bool show)
 		if (app_bar_shown)
 			return;
 		home_update(NULL);
-		if (!psl_start(app_bar, 0, APP_BAR_SLIDE_MS, ios_path_ease_in_out, false)) {
+		if (!psl_start_sig(app_bar, 0, APP_BAR_SLIDE_MS, ios_path_ease_in_out, false, app_bar_sig)) {
 			lv_obj_remove_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
 			app_slide(app_bar, 0, NULL);
 		}
 	} else {
 		if (!app_bar_shown)
 			return;
-		if (!psl_start(app_bar, -APP_BAR_H, APP_BAR_SLIDE_MS, ios_path_ease_in_out, true))
+		if (!psl_start_sig(app_bar, -APP_BAR_H, APP_BAR_SLIDE_MS, ios_path_ease_in_out, true, app_bar_sig))
 			app_slide(app_bar, -APP_BAR_H, app_hide_done);
 	}
 	app_bar_shown = show;
@@ -3615,6 +3748,12 @@ static void app_bar_update(void)
 		return;
 	label_set_if_changed(app_bar_time, lv_label_get_text(status_time));
 	label_set_if_changed(app_bar_batt, lv_label_get_text(batt_lbl));
+	/* showing as its picture: the bar itself if that is old now; hidden:
+	 * the picture for the next slide, while nothing moves */
+	psl_check(app_bar);
+	if (!app_bar_shown && !lv_anim_count_running() && !(touch_indev &&
+	    lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
+		psl_warm(app_bar, app_bar_sig);
 }
 
 static bool in_obj(lv_obj_t *o, int x, int y)
@@ -4318,6 +4457,8 @@ static bool ui_drag(int phase, int x, int y)
 
 	if (locked || ul.scr)
 		return ul_drag(phase, y);
+	if (phase == 0 && app_bar && y < APP_BAR_H)
+		psl_wake(app_bar);	/* (the bar itself takes its touches) */
 	if (pg_drag(phase, x, y))	/* sideways on home: the pages */
 		return true;
 	if (phase == 0) {
