@@ -2919,6 +2919,104 @@ static void app_tile_img(lv_obj_t *parent, struct app_icon *ic, const char *name
 	lv_obj_center(im);
 }
 
+/*
+ * Icon shadows, over a wallpaper only (Material 3 shows depth by tone on a
+ * plain background): one soft shadow of the 60 px badge (radius 20), made
+ * once by blurring its shape (three box passes, ~ a gaussian of 5 px),
+ * 3 px down. Each tile draws it under its badge from its own draw event,
+ * so it costs a small image blend when a page is drawn, nothing a frame
+ * while pages slide (it is in their pictures). Darker over a light picture,
+ * lighter over a dark one, where it would not show anyway (mean luma under
+ * the grid, wallpaper.meta).
+ */
+#define SHADOW_R	10	/* blur reach around the badge */
+#define SHADOW_DY	3
+
+static lv_draw_buf_t *icon_shadow;
+
+static void blur_box(uint8_t *a, uint8_t *tmp, int w, int h, int r)
+{
+	int x, y, k;
+
+	for (y = 0; y < h; y++) {		/* rows */
+		int sum = 0;
+
+		for (k = -r; k <= r; k++)
+			sum += a[y * w + LV_CLAMP(0, k, w - 1)];
+		for (x = 0; x < w; x++) {
+			tmp[y * w + x] = (uint8_t)(sum / (2 * r + 1));
+			sum += a[y * w + LV_MIN(x + r + 1, w - 1)] - a[y * w + LV_MAX(x - r, 0)];
+		}
+	}
+	for (x = 0; x < w; x++) {		/* columns */
+		int sum = 0;
+
+		for (k = -r; k <= r; k++)
+			sum += tmp[LV_CLAMP(0, k, h - 1) * w + x];
+		for (y = 0; y < h; y++) {
+			a[y * w + x] = (uint8_t)(sum / (2 * r + 1));
+			sum += tmp[LV_MIN(y + r + 1, h - 1) * w + x] - tmp[LV_MAX(y - r, 0) * w + x];
+		}
+	}
+}
+
+static lv_draw_buf_t *icon_shadow_make(void)
+{
+	const int side = 60, rad = 20, n = side + 2 * SHADOW_R;
+	uint8_t *a = calloc(n * n, 1), *tmp = malloc(n * n);
+	int x, y, i, peak = 40 + 70 * LV_CLAMP(0, wp.luma[WP_HOME], 255) / 255;	/* 16..43 % */
+	lv_draw_buf_t *b = NULL;
+
+	if (!a || !tmp)
+		goto out;
+	for (y = 0; y < side; y++)		/* the badge's shape (anti-aliased corners) */
+		for (x = 0; x < side; x++) {
+			float dx = LV_MAX(0, LV_MAX(rad - x - 0.5f, x + 0.5f - (side - rad))),
+			      dy = LV_MAX(0, LV_MAX(rad - y - 0.5f, y + 0.5f - (side - rad)));
+			float d = sqrtf(dx * dx + dy * dy) - rad;
+
+			a[(y + SHADOW_R) * n + x + SHADOW_R] = d <= -0.5f ? 255 : d >= 0.5f ? 0 :
+				(uint8_t)(255 * (0.5f - d));
+		}
+	for (i = 0; i < 3; i++)
+		blur_box(a, tmp, n, n, 3);
+	b = lv_draw_buf_create(n, n, LV_COLOR_FORMAT_ARGB8888, 0);
+	if (!b)
+		goto out;
+	for (y = 0; y < n; y++) {
+		uint32_t *row = (uint32_t *)(b->data + (size_t)y * b->header.stride);
+
+		for (x = 0; x < n; x++)
+			row[x] = (uint32_t)(a[y * n + x] * peak / 255) << 24;	/* black */
+	}
+	lv_draw_buf_flush_cache(b, NULL);
+out:
+	free(a);
+	free(tmp);
+	return b;
+}
+
+static void tile_shadow_cb(lv_event_t *e)
+{
+	lv_obj_t *t = lv_event_get_current_target(e), *badge;
+	lv_draw_image_dsc_t d;
+	lv_area_t a;
+
+	if (lv_event_get_code(e) == LV_EVENT_REFR_EXT_DRAW_SIZE) {
+		lv_event_set_ext_draw_size(e, SHADOW_R);
+		return;
+	}
+	if (!icon_shadow || !(badge = lv_obj_get_child(t, 0)))
+		return;
+	lv_obj_get_coords(badge, &a);
+	lv_area_set(&a, a.x1 - SHADOW_R, a.y1 - SHADOW_R + SHADOW_DY,
+		    a.x1 - SHADOW_R + icon_shadow->header.w - 1,
+		    a.y1 - SHADOW_R + SHADOW_DY + icon_shadow->header.h - 1);
+	lv_draw_image_dsc_init(&d);
+	d.src = icon_shadow;
+	lv_draw_image(lv_event_get_layer(e), &d, &a);
+}
+
 static void app_tile(lv_obj_t *parent, const char *icon, const char *name,
 		     lv_color_t bg, lv_color_t fg, lv_event_cb_t cb)
 {
@@ -2936,6 +3034,13 @@ static void app_tile(lv_obj_t *parent, const char *icon, const char *name,
 
 	lv_obj_set_style_radius(b, 20, 0);	/* squircle-ish */
 	lv_obj_set_style_transform_scale(t, 240, LV_STATE_PRESSED);
+	if (home_wp) {
+		if (!icon_shadow)
+			icon_shadow = icon_shadow_make();
+		lv_obj_add_event_cb(t, tile_shadow_cb, LV_EVENT_DRAW_MAIN_BEGIN, NULL);
+		lv_obj_add_event_cb(t, tile_shadow_cb, LV_EVENT_REFR_EXT_DRAW_SIZE, NULL);
+		lv_obj_refresh_ext_draw_size(t);
+	}
 	{
 		/* a long name ends in an ellipsis, as on iOS */
 		lv_obj_t *l = m3_label(t, name, &lv_font_montserrat_14, home_wp ? WP_TEXT : M.on_surface);

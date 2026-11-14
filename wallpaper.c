@@ -510,6 +510,11 @@ static void wp_load(void)
 				wp.pic[k][t] = NULL;
 			}
 	wp_meta_read();
+	if (icon_shadow) {	/* (its strength follows the picture) */
+		lv_image_cache_drop(icon_shadow);
+		lv_draw_buf_destroy(icon_shadow);
+		icon_shadow = NULL;
+	}
 	for (k = 0; k < WP_KINDS; k++) {
 		char path[96];
 
