@@ -3401,7 +3401,8 @@ static void build_shade(void)
  * icon=<symbol name>, color=#rrggbb, or image=<path of a .n72i picture>
  * (app_icon_load). The tiles follow the folder (apps_watch).
  */
-#define APPS_DIR "/usr/share/n72-ui/apps"
+/* (tests: N72_APPS_DIR, another folder of manifests) */
+#define APPS_DIR (getenv("N72_APPS_DIR") ? getenv("N72_APPS_DIR") : "/usr/share/n72-ui/apps")
 
 static lv_timer_t *app_timer;
 
@@ -5390,7 +5391,7 @@ static void app_tiles_n72(lv_obj_t *parent)
 
 		if (len < 5 || strcmp(de->d_name + len - 4, ".app"))
 			continue;
-		snprintf(path, sizeof(path), APPS_DIR "/%s", de->d_name);
+		snprintf(path, sizeof(path), "%s/%s", APPS_DIR, de->d_name);
 		f = fopen(path, "r");
 		if (!f)
 			continue;
