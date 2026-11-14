@@ -50,7 +50,37 @@
 
 enum { PG_MODE_LAYER0, PG_MODE_OPAQUE, PG_MODE_BLEND };
 
-static lv_obj_t *home_bar, *home_dots;
+static void dock_fly_stop(void);
+static lv_obj_t *home_bar, *home_dots, *home_view;	/* home_view: the pages' window */
+
+/*
+ * The dock (dock.c) holds a side of the screen: the bottom upright, and
+ * turned the side that is the bottom in the hand (the left at 90, the
+ * right at 270), its icons upright. The pages, the bar and the dots have
+ * the rest: PX, PW (the page's width) and PB (their bottom).
+ */
+#define DOCK_T		76		/* the dock's thickness */
+#define DOCK_M		8		/* from the screen's edge */
+#define DOCK_SPACE	(DOCK_T + DOCK_M + 4)
+enum { DOCK_BOTTOM, DOCK_LEFT, DOCK_RIGHT };
+static int home_px, home_pw, home_pb;
+#define PX	home_px
+#define PW	home_pw
+#define PB	home_pb
+
+static int dock_side(void)
+{
+	return ui_rot == 90 ? DOCK_LEFT : ui_rot == 270 ? DOCK_RIGHT : DOCK_BOTTOM;
+}
+
+static void home_geom(void)
+{
+	int side = dock_side();
+
+	home_px = side == DOCK_LEFT ? DOCK_SPACE : 0;
+	home_pw = side == DOCK_BOTTOM ? W : W - DOCK_SPACE;
+	home_pb = side == DOCK_BOTTOM ? H - DOCK_SPACE : H;
+}
 
 static struct {
 	int n, cur;			/* pages, the one at rest */
@@ -75,9 +105,9 @@ static struct {
 	int mode;
 	int off;			/* the strip's offset now, px */
 	int time_lv;			/* the time's picture showing */
-	lv_obj_t *scr, *strip_img, *strip_img2, *bar_img, *bar_r_img, *time_img, *dots_img, *wp_img;
+	lv_obj_t *scr, *view, *strip_img, *strip_img2, *bar_img, *bar_r_img, *time_img, *dots_img, *wp_img;
 	int strip_k;			/* the page strip_img shows; strip_img2 the next */
-	lv_draw_buf_t *page_pic[PG_PAGES_MAX], *bar_pic, *bar_l, *bar_r, *dots_pic, *time_pic[PG_TIME_LEVELS + 1];
+	lv_draw_buf_t *page_pic[PG_PAGES_MAX], *dock_pic, *bar_pic, *bar_l, *bar_r, *dots_pic, *time_pic[PG_TIME_LEVELS + 1];
 	lv_area_t time_area;		/* the time's place in the bar */
 	unsigned long pic_ver;		/* home_ver they show */
 	unsigned long fail_ver;		/* (no memory for them at this home_ver) */
@@ -152,7 +182,7 @@ static void pg_show_page(int p)
 
 	pg.cur = LV_CLAMP(0, p, pg.n - 1);
 	if (home_apps)
-		lv_obj_set_x(home_apps, -pg.cur * W);
+		lv_obj_set_x(home_apps, -pg.cur * PW);
 	pg_dots_update();
 	pg_time_show(pg.cur > 0);
 	bp_changed(home_scr);	/* (pictures of home as it shows) */
@@ -166,17 +196,17 @@ static void pg_show_page(int p)
  */
 static void pg_layout(void)
 {
-	int bottom = H - PG_TOP - PG_DOTS_H, per0, pern, i, k, page, slot, cnt;
+	int bottom = PB - PG_TOP - PG_DOTS_H, per0, pern, i, k, page, slot, cnt;
 	int x0;
 
 	if (!home_apps)
 		return;
-	pg.cols = LV_MAX(1, (W - 16) / PG_TILE_W);
+	pg.cols = LV_MAX(1, (PW - 16) / PG_TILE_W);
 	pg.rows0 = LV_MAX(1, (bottom - PG_GRID0 + PG_ROW_GAP) / (PG_TILE_H + PG_ROW_GAP));
 	pg.rowsn = LV_MAX(1, (bottom - PG_GRIDN + PG_ROW_GAP) / (PG_TILE_H + PG_ROW_GAP));
 	per0 = pg.cols * pg.rows0;
 	pern = pg.cols * pg.rowsn;
-	x0 = (W - pg.cols * PG_TILE_W) / 2;
+	x0 = (PW - pg.cols * PG_TILE_W) / 2;
 	cnt = (int)lv_obj_get_child_count(home_apps) - 1;	/* (the card) */
 	for (i = 0; i < cnt; i++) {
 		lv_obj_t *t = lv_obj_get_child(home_apps, i + 1);
@@ -193,11 +223,11 @@ static void pg_layout(void)
 		}
 		row = slot / pg.cols;
 		col = slot % pg.cols;
-		lv_obj_set_pos(t, page * W + x0 + col * PG_TILE_W, top + row * (PG_TILE_H + PG_ROW_GAP));
+		lv_obj_set_pos(t, page * PW + x0 + col * PG_TILE_W, top + row * (PG_TILE_H + PG_ROW_GAP));
 	}
 	k = cnt <= per0 ? 1 : 1 + (cnt - per0 + pern - 1) / pern;
 	pg.n = LV_MIN(k, PG_MAX);
-	lv_obj_set_size(home_apps, pg.n * W, H - PG_TOP - PG_DOTS_H);	/* (not over the dots: see pg_frames_begin) */
+	lv_obj_set_size(home_apps, pg.n * PW, bottom);	/* (not over the dots: see pg_frames_begin) */
 	pg_show_page(pg.cur);
 }
 
@@ -209,6 +239,7 @@ static void pg_pics_free(void)
 
 	for (int k = 0; k < PG_PAGES_MAX; k++)
 		tr_free(&pg.page_pic[k]);
+	tr_free(&pg.dock_pic);
 	tr_free(&pg.bar_pic);
 	tr_free(&pg.bar_l);
 	tr_free(&pg.bar_r);
@@ -399,16 +430,17 @@ static bool pg_pics_take(void)
 		lv_area_t s, a;
 		int k;
 
-		lv_obj_get_coords(home_apps, &s);	/* (page 0 at x 0 - cur * W) */
+		lv_obj_get_coords(home_apps, &s);	/* (page 0 at x PX - cur * PW) */
 		for (k = 0; k < pg.n && k < PG_PAGES_MAX; k++) {
 			a = s;
-			a.x1 = s.x1 + k * W;
-			a.x2 = a.x1 + W - 1;
+			a.x1 = s.x1 + k * PW;
+			a.x2 = a.x1 + PW - 1;
 			if (!(pg.page_pic[k] = pg_snap_area(home_apps, mode, &a)))
 				break;
 		}
 	}
 	pg.bar_pic = pg_snap(home_bar, mode);
+	pg.dock_pic = home_dock ? pg_snap(home_dock, mode) : NULL;
 	pg.dots_pic = pg.n > 1 ? pg_snap(home_dots, mode) : NULL;
 	pg_time_show(pg.cur > 0);
 	pg_time_pics(mode);
@@ -502,7 +534,7 @@ static void pg_fb0_dirty(void)
 
 static int pg_max_off(void)
 {
-	return (pg.n - 1) * W;
+	return (pg.n - 1) * PW;
 }
 
 /* The pictures where the strip's offset @off puts them. */
@@ -515,7 +547,7 @@ static void pg_frame(int off)
 		return;
 	{
 		/* pages k and k + 1 in view (k -1 or the last: pulled past an end) */
-		int k = off >= 0 ? off / W : -1, n = LV_MIN(pg.n, PG_PAGES_MAX);
+		int k = off >= 0 ? off / PW : -1, n = LV_MIN(pg.n, PG_PAGES_MAX);
 
 		if (k != pg.strip_k) {
 			pg.strip_k = k;
@@ -532,11 +564,11 @@ static void pg_frame(int off)
 				lv_obj_add_flag(pg.strip_img2, LV_OBJ_FLAG_HIDDEN);
 			}
 		}
-		lv_obj_set_x(pg.strip_img, k * W - off);
-		lv_obj_set_x(pg.strip_img2, (k + 1) * W - off);
+		lv_obj_set_x(pg.strip_img, k * PW - off);
+		lv_obj_set_x(pg.strip_img2, (k + 1) * PW - off);
 	}
 	/* the time: nothing on page 0, all of it a page on */
-	lv = LV_CLAMP(0, (off * PG_TIME_LEVELS + W / 2) / W, PG_TIME_LEVELS);
+	lv = LV_CLAMP(0, (off * PG_TIME_LEVELS + PW / 2) / PW, PG_TIME_LEVELS);
 	if (pg.time_img && lv != pg.time_lv && pg.time_pic[lv]) {
 		pg.time_lv = lv;		/* (a new picture only when the level moves) */
 		lv_image_set_src(pg.time_img, pg.time_pic[lv]);
@@ -592,9 +624,25 @@ static bool pg_frames_begin(void)
 	 * slower, and soft edges too dark). The strip ends above the dots, the
 	 * bar is cut around the time.
 	 */
-	/* the page in view and the next: one GPU copy each, side by side */
-	pg.strip_img = pg_img(pg.page_pic[pg.cur], 0, PG_TOP);
-	pg.strip_img2 = pg_img(pg.page_pic[pg.cur], W, PG_TOP);
+	/*
+	 * The page in view and the next: one GPU copy each, side by side, in
+	 * a window of the pages' place (turned, the dock is beside them).
+	 */
+	pg.view = lv_obj_create(pg.scr);
+	lv_obj_remove_style_all(pg.view);
+	lv_obj_remove_flag(pg.view, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_pos(pg.view, PX, PG_TOP);
+	lv_obj_set_size(pg.view, PW, PB - PG_TOP - PG_DOTS_H);
+	pg.strip_img = lv_image_create(pg.view);
+	lv_image_set_src(pg.strip_img, pg.page_pic[pg.cur]);
+	pg.strip_img2 = lv_image_create(pg.view);
+	lv_image_set_src(pg.strip_img2, pg.page_pic[pg.cur]);
+	if (pg.dock_pic) {
+		lv_area_t d;
+
+		lv_obj_get_coords(home_dock, &d);
+		pg_img(pg.dock_pic, d.x1, d.y1);
+	}
 	pg.strip_k = -2;
 	{
 		lv_area_t b;
@@ -620,7 +668,7 @@ static bool pg_frames_begin(void)
 	if (mode == PG_MODE_LAYER0)
 		mbx_gpu_set_transparent(true);
 	pg.time_lv = -1;
-	pg_frame(pg.cur * W);
+	pg_frame(pg.cur * PW);
 	lv_screen_load(pg.scr);
 	return true;
 }
@@ -639,7 +687,7 @@ static void pg_frames_end(int p)
 	if (!scr)
 		return;
 	pg.scr = NULL;
-	pg.strip_img = pg.strip_img2 = pg.bar_img = pg.bar_r_img = pg.time_img = pg.dots_img = pg.wp_img = NULL;
+	pg.view = pg.strip_img = pg.strip_img2 = pg.bar_img = pg.bar_r_img = pg.time_img = pg.dots_img = pg.wp_img = NULL;
 	if (pg.mode == PG_MODE_LAYER0)
 		mbx_gpu_set_transparent(false);
 	n72_trace("pg-opaque", 0);
@@ -657,17 +705,17 @@ static int pg_decide(double v)
 	double x = pg.off;
 	int t;
 
-	if (pg.off % W == 0) {
-		t = pg.off / W;		/* aligned: stays */
+	if (pg.off % PW == 0) {
+		t = pg.off / PW;		/* aligned: stays */
 	} else if (v > PG_FLICK) {
 		/* on from where it is; a flick again during the settle: one more */
-		t = (int)ceil((pg.dir > 0 ? (pg.target + 1) * (double)W : x) / W);
+		t = (int)ceil((pg.dir > 0 ? (pg.target + 1) * (double)PW : x) / PW);
 		pg.dir = 1;
 	} else if (v < -PG_FLICK) {
-		t = (int)floor((pg.dir < 0 ? (pg.target - 1) * (double)W : x) / W);
+		t = (int)floor((pg.dir < 0 ? (pg.target - 1) * (double)PW : x) / PW);
 		pg.dir = -1;
 	} else {
-		t = (int)floor(x / W + 0.5);
+		t = (int)floor(x / PW + 0.5);
 		pg.dir = 0;
 	}
 	return LV_CLAMP(0, t, pg.n - 1);
@@ -736,7 +784,7 @@ static void pg_settle_late(lv_anim_t *a)
 	LV_UNUSED(a);
 	if (!pg.settling)
 		return;
-	pg_frame(pg.target * W);
+	pg_frame(pg.target * PW);
 	pg.dir = 0;
 	pg_frames_end(pg.target);
 }
@@ -752,11 +800,11 @@ static void pg_settle(double v)
 		pg.vel = pg.prev_vel = 0;	/* (_endPanWithEvent) */
 	v0 = pg.prev_vel != 0 ? 0.75 * pg.prev_vel + 0.25 * pg.vel : pg.vel;	/* (_startTimer) */
 	LV_UNUSED(v);
-	ios_pager_init(&pg.sp, (float)W);
+	ios_pager_init(&pg.sp, (float)PW);
 	pg.sp.x = (float)pg.off;
 	pg.sp.v = v0;
-	pg.sp.target = (float)(pg.target * W);
-	if (pg.off == pg.target * W) {
+	pg.sp.target = (float)(pg.target * PW);
+	if (pg.off == pg.target * PW) {
 		pg_frames_end(pg.target);
 		return;
 	}
@@ -848,6 +896,8 @@ static bool pg_drag(int phase, int x, int y)
 		if (pg.n < 2 || lv_screen_active() != home_scr || tr.scr || za.phase ||
 		    shade_open || sd.on || screen_off)
 			return false;
+		if (home_dock && in_obj(home_dock, x, y))
+			return false;	/* (the dock stays: no swipe from it, as iOS) */
 		pg.cand = true;
 		pg.x0 = x;
 		pg.y0 = y;
@@ -872,7 +922,7 @@ static bool pg_drag(int phase, int x, int y)
 			pg.lost = true;
 			return true;
 		}
-		pg_take(x, pg.cur * W);
+		pg_take(x, pg.cur * PW);
 		pg.tx0 = pg.x0 + (dx > 0 ? PG_SLOP : -PG_SLOP);	/* no jump by the slop */
 		pg.dir = 0;	/* (a fresh drag: no settle to add to) */
 	}
@@ -920,6 +970,7 @@ static void pg_warm(lv_timer_t *t)
 /* Home is being built again (a turn, a theme): its pictures go with it. */
 static void pg_home_gone(void)
 {
+	dock_fly_stop();	/* (its picture flies over the old home) */
 	if (pg_warm_timer) {
 		awake_timer_delete(pg_warm_timer);
 		pg_warm_timer = NULL;
@@ -946,5 +997,5 @@ static void pg_abort(void)
 	if (!pg.scr)
 		return;
 	pg.dir = 0;
-	pg_frames_end(pg.settling ? pg.target : LV_CLAMP(0, (pg.off + W / 2) / W, pg.n - 1));
+	pg_frames_end(pg.settling ? pg.target : LV_CLAMP(0, (pg.off + PW / 2) / PW, pg.n - 1));
 }

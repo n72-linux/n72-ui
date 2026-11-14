@@ -41,6 +41,7 @@ static void kbd_init(void);
 static int ui_rot, video_rot;
 static char *app_cmd;		/* the running application's command */
 static lv_obj_t *home_apps;
+static lv_obj_t *home_dock;	/* (dock.c) */
 #define QS_COLS (W > H ? 3 : 2)	/* quick-settings tiles a row */
 static bool app_is_video(void);
 static bool cmd_is_video(const char *cmd);
@@ -76,7 +77,9 @@ static struct {
 	int bright;		/* brightness %, 0 = as it is */
 	int wifi, bt;		/* left on (1) or off (0); -1 not set */
 	bool wp_accent;		/* the colours from the home wallpaper (wallpaper.c) */
-} conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1, false };
+	char dock[200];		/* the dock's icons, names joined by '|' (dock.c) */
+	bool dock_set;		/* (no "dock=" line: the default) */
+} conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1, false, "", false };
 
 /*
  * Auto-rotate on: the screen turns with the iPod. Off: it stays as it was
@@ -115,7 +118,7 @@ static void pg_abort(void);
 
 static void conf_load(void)
 {
-	char line[64];
+	char line[240];
 	FILE *f = fopen(CONF_PATH, "r");
 	const char *e = getenv("N72_IDLE_SLEEP");
 
@@ -155,6 +158,11 @@ static void conf_load(void)
 			conf.bt = !!v;
 		else if (sscanf(line, "wpaccent=%d", &v) == 1)
 			conf.wp_accent = !!v;
+		else if (!strncmp(line, "dock=", 5)) {
+			snprintf(conf.dock, sizeof(conf.dock), "%s", line + 5);
+			conf.dock[strcspn(conf.dock, "\r\n")] = 0;
+			conf.dock_set = true;
+		}
 	}
 	fclose(f);
 }
@@ -171,6 +179,8 @@ static void conf_save(void)
 		"bright=%d\nwifi=%d\nbt=%d\nwpaccent=%d\n", conf.dark, conf.accent, conf.idle_s, conf.vol,
 		conf.spk, conf.wake_plug, conf.autorot, conf.rotlock, conf.bright, conf.wifi, conf.bt,
 		conf.wp_accent);
+	if (conf.dock_set)	/* (only once changed: the file is as it was till then) */
+		fprintf(f, "dock=%s\n", conf.dock);
 	if (fflush(f) == 0)
 		fsync(fileno(f));
 	fclose(f);
@@ -3257,6 +3267,11 @@ static void tile_shadow_cb(lv_event_t *e)
 	lv_draw_image(lv_event_get_layer(e), &d, &a);
 }
 
+static void tile_name_free(lv_event_t *e)
+{
+	free(lv_obj_get_user_data(lv_event_get_current_target(e)));
+}
+
 static void app_tile(lv_obj_t *parent, const char *icon, const char *name,
 		     lv_color_t bg, lv_color_t fg, lv_event_cb_t cb)
 {
@@ -3307,6 +3322,9 @@ static void app_tile(lv_obj_t *parent, const char *icon, const char *name,
 		lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
 	}
 	lv_obj_add_event_cb(t, cb, LV_EVENT_CLICKED, NULL);
+	/* its name, kept (the label's own text may be cut to "..." at any time) */
+	lv_obj_set_user_data(t, strdup(name));
+	lv_obj_add_event_cb(t, tile_name_free, LV_EVENT_DELETE, NULL);
 }
 
 static lv_obj_t *home_bright, *shade, *scrim, *qs_settings_btn;
@@ -5505,11 +5523,13 @@ static void app_launch(const char *cmd, lv_obj_t *tile)
 	if (ui_rot && !cmd_is_video(cmd) && !cmd_is_game(cmd)) {
 		/* applications draw for an upright panel: turn first, and
 		 * find the tile again in the new home */
-		int idx = lv_obj_get_parent(tile) == home_apps ? (int)lv_obj_get_index(tile) : -1;
+		lv_obj_t *par = lv_obj_get_parent(tile);
+		bool docked = home_dock && par == home_dock;	/* (the dock is rebuilt in its order) */
+		int idx = par == home_apps || docked ? (int)lv_obj_get_index(tile) : -1;
 
 		if (idx < 0 || !ui_turn(0))
 			return;
-		tile = lv_obj_get_child(home_apps, idx);
+		tile = lv_obj_get_child(docked ? home_dock : home_apps, idx);
 		if (!tile)
 			return;
 	}
@@ -5835,6 +5855,7 @@ static void app_tiles(lv_obj_t *parent)
  * last.
  */
 #include "paging.c"	/* home pages: layout, the swipe, its frames */
+#include "dock.c"	/* the dock under them */
 
 static uint32_t home_apps_builtin;	/* tiles of our own, before the manifests' */
 static lv_timer_t *apps_timer;
@@ -5846,6 +5867,7 @@ static void apps_reload(void)
 		return;
 	}
 	apps_stale = false;
+	dock_before_reload();	/* (every tile back in the grid's order) */
 	while (lv_obj_get_child_count(home_apps) > home_apps_builtin) {
 		lv_obj_t *t = lv_obj_get_child(home_apps, -1);
 
@@ -5855,6 +5877,7 @@ static void apps_reload(void)
 	}
 	app_icons_free();
 	app_tiles(home_apps);
+	dock_after_reload();
 	pg_layout();
 	bp_changed(home_scr);
 	lv_obj_invalidate(home_scr);
@@ -6267,11 +6290,13 @@ static void build_home(void)
 	m3_screen(home_scr);
 	home_wp = wp_put(home_scr, WP_HOME);
 	lv_obj_add_event_cb(home_scr, home_gesture_cb, LV_EVENT_GESTURE, NULL);
+	home_geom();	/* (the dock's side: the rest is the bar's, the pages', the dots') */
 
 	/* status bar: time, Wi-Fi and Bluetooth, battery; a tap opens the shade */
 	bar = lv_obj_create(home_scr);
 	plain(bar);
-	lv_obj_set_size(bar, W, 40);
+	lv_obj_set_size(bar, PW, 40);
+	lv_obj_set_pos(bar, PX, 0);
 	lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_radius(bar, 0, 0);
 	lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
@@ -6294,10 +6319,16 @@ static void build_home(void)
 	 * them; its first child the card (page 0), then the tiles, placed
 	 * by pg_layout(). Dots at the bottom when there is more than one.
 	 */
-	apps = home_apps = lv_obj_create(home_scr);
+	/* (in a window of their place: turned, the dock is beside it) */
+	home_view = lv_obj_create(home_scr);
+	lv_obj_remove_style_all(home_view);
+	lv_obj_remove_flag(home_view, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_pos(home_view, PX, PG_TOP);
+	lv_obj_set_size(home_view, PW, PB - PG_TOP - PG_DOTS_H);
+	apps = home_apps = lv_obj_create(home_view);
 	plain(apps);
-	lv_obj_set_pos(apps, 0, PG_TOP);
-	lv_obj_set_size(apps, W, H - PG_TOP - PG_DOTS_H);
+	lv_obj_set_pos(apps, 0, 0);
+	lv_obj_set_size(apps, PW, PB - PG_TOP - PG_DOTS_H);
 	lv_obj_set_style_bg_opa(apps, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_pad_all(apps, 0, 0);
 	lv_obj_remove_flag(apps, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
@@ -6307,7 +6338,7 @@ static void build_home(void)
 		lv_obj_t *c = lv_obj_create(apps);
 
 		plain(c);
-		lv_obj_set_size(c, W - 32, PG_CARD_H);
+		lv_obj_set_size(c, PW - 32, PG_CARD_H);
 		lv_obj_set_pos(c, 16, 4);
 		lv_obj_set_style_radius(c, 24, 0);
 		lv_obj_set_style_bg_color(c, M.surface_c_high, 0);
@@ -6338,15 +6369,15 @@ static void build_home(void)
 
 	home_dots = lv_obj_create(home_scr);
 	plain(home_dots);
-	lv_obj_set_size(home_dots, W, PG_DOTS_H);
-	lv_obj_set_pos(home_dots, 0, H - PG_DOTS_H);
+	lv_obj_set_size(home_dots, PW, PG_DOTS_H);
+	lv_obj_set_pos(home_dots, PX, PB - PG_DOTS_H);
 	lv_obj_set_style_bg_opa(home_dots, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_pad_all(home_dots, 0, 0);
 	lv_obj_set_style_pad_column(home_dots, 9, 0);
 	lv_obj_remove_flag(home_dots, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 	lv_obj_set_flex_flow(home_dots, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(home_dots, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-	pg_layout();
+	dock_build();	/* (and the pages' layout) */
 
 	build_shade();
 	app_bar_build();	/* the bar over applications and pages */
@@ -8986,7 +9017,7 @@ static void ui_rebuild(bool load)
 		lv_obj_t **gone[] = {
 			&status_time, &status_wifi, &status_bt, &batt_lbl,
 			&home_clock, &home_date, &home_batt, &home_net,
-			&settings_tile, &home_apps, &home_bar, &home_dots,
+			&settings_tile, &home_apps, &home_bar, &home_dots, &home_dock, &home_view,
 		};
 
 		for (i = 0; i < (int)(sizeof(gone) / sizeof(gone[0])); i++)
@@ -9063,7 +9094,7 @@ static void home_fresh(void)
 		lv_obj_t **gone[] = {
 			&status_time, &status_wifi, &status_bt, &batt_lbl,
 			&home_clock, &home_date, &home_batt, &home_net,
-			&settings_tile, &home_apps, &home_bar, &home_dots,
+			&settings_tile, &home_apps, &home_bar, &home_dots, &home_dock, &home_view,
 		};
 
 		for (i = 0; i < (int)(sizeof(gone) / sizeof(gone[0])); i++)
