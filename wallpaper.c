@@ -109,7 +109,7 @@ static int wp_load_png(const char *path, struct wp_img *im)
 {
 	unsigned char *rgba = NULL, *data = NULL;
 	unsigned w, h;
-	size_t len = 0, i;
+	size_t len = 0;
 	FILE *f = fopen(path, "rb");
 	long n;
 
@@ -135,26 +135,42 @@ static int wp_load_png(const char *path, struct wp_img *im)
 		}
 		lodepng_state_cleanup(&st);
 	}
-	if (lodepng_decode32(&rgba, &w, &h, data, len)) {
-		free(data);
-		return -2;
+	{
+		unsigned err = lodepng_decode32(&rgba, &w, &h, data, len);
+
+		if (err) {
+			free(data);
+			fprintf(stderr, "wallpaper: %s: %s\n", path, lodepng_error_text(err));
+			return -2;
+		}
 	}
 	free(data);
-	im->w = (int)w;
-	im->h = (int)h;
-	im->rgb = malloc((size_t)w * h * 3);
-	if (!im->rgb) {
-		lv_free(rgba);
-		return -3;
-	}
-	for (i = 0; i < (size_t)w * h; i++) {
-		unsigned a = rgba[i * 4 + 3];
+	/* (LVGL's lodepng: an ARGB8888 draw buffer, B G R A bytes, straight alpha) */
+	{
+		lv_draw_buf_t *db = (lv_draw_buf_t *)rgba;
+		unsigned y, x;
 
-		im->rgb[i * 3] = (uint8_t)(rgba[i * 4] * a / 255);
-		im->rgb[i * 3 + 1] = (uint8_t)(rgba[i * 4 + 1] * a / 255);
-		im->rgb[i * 3 + 2] = (uint8_t)(rgba[i * 4 + 2] * a / 255);
+		im->w = (int)w;
+		im->h = (int)h;
+		im->rgb = malloc((size_t)w * h * 3);
+		if (!im->rgb) {
+			lv_draw_buf_destroy(db);
+			return -3;
+		}
+		for (y = 0; y < h; y++) {
+			const uint8_t *q = db->data + (size_t)y * db->header.stride;
+			uint8_t *o = im->rgb + (size_t)y * w * 3;
+
+			for (x = 0; x < w; x++, q += 4, o += 3) {
+				unsigned a = q[3];
+
+				o[0] = (uint8_t)(q[2] * a / 255);
+				o[1] = (uint8_t)(q[1] * a / 255);
+				o[2] = (uint8_t)(q[0] * a / 255);
+			}
+		}
+		lv_draw_buf_destroy(db);
 	}
-	lv_free(rgba);
 	return 0;
 }
 
@@ -405,6 +421,7 @@ static int wp_convert_main(int argc, char **argv)
 	int k, t, r;
 	size_t n = strlen(src);
 
+	lv_init();	/* (lodepng gives its picture as an LVGL draw buffer) */
 	mkdir(WP_DIR, 0755);
 	wp_meta_read();
 	if (!strncmp(what, "none-", 5)) {	/* (removal) */
