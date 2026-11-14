@@ -637,7 +637,13 @@ static void pg_settle(double v)
 	lv_anim_init(&a);
 	lv_anim_set_var(&a, &pg);
 	lv_anim_set_exec_cb(&a, pg_settle_exec);
-	lv_anim_set_values(&a, 0, 1);
+	/*
+	 * Its value the ms gone: LVGL runs an animation's step only when the
+	 * value changes (0..1 over the 3 s ran it twice, at the start and at
+	 * the end: the strip stood still after the lift, the jump came 3 s
+	 * later).
+	 */
+	lv_anim_set_values(&a, 0, 3000);
 	lv_anim_set_duration(&a, 3000);		/* (ends itself well before) */
 	lv_anim_set_completed_cb(&a, pg_settle_late);
 	lv_anim_start(&a);

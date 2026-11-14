@@ -709,7 +709,33 @@ static bool wp_apply_try(void)
 		ui_restart("wallpaper");
 	}
 	wp_load();
-	ui_rebuild(app_pid <= 0);
+	if (app_pid <= 0) {
+		/*
+		 * The rebuild shows an empty screen while home and the pages
+		 * are made again: a picture of the screen as it was lies over
+		 * it on the top layer until the new ones are there.
+		 */
+		lv_draw_buf_t *pic;
+		lv_obj_t *cover = NULL;
+
+		lv_refr_now(NULL);
+		pic = mbx_gpu_grab_screen();
+		if (pic) {
+			cover = lv_image_create(lv_layer_top());
+			lv_image_set_src(cover, pic);
+			lv_obj_remove_flag(cover, LV_OBJ_FLAG_CLICKABLE);
+			lv_obj_set_pos(cover, 0, 0);
+		}
+		ui_rebuild(true);
+		if (cover) {
+			lv_obj_delete(cover);
+			lv_image_cache_drop(pic);
+			lv_draw_buf_destroy(pic);
+		}
+		lv_obj_invalidate(lv_screen_active());
+	} else {
+		ui_rebuild(false);
+	}
 	return true;
 }
 
