@@ -1919,6 +1919,16 @@ int main(int argc, char **argv)
 	lv_init();
 	lv_tick_set_cb(tick_ms);
 	backlight_init();
+	/*
+	 * Lit, as screen_off (false) says: whatever ran before may have left
+	 * the panel off (a launcher killed while dark), and the screen would
+	 * then stay dark with Home going home unseen and Power putting it
+	 * to sleep.
+	 */
+	if (access(PANEL_POWER, W_OK) == 0)
+		write_int(PANEL_POWER, 1);
+	else
+		backlight_power(true);
 
 	disp = NULL;
 	if (!getenv("N72_GPU") || strcmp(getenv("N72_GPU"), "0"))
