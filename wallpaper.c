@@ -701,7 +701,8 @@ static bool wp_apply_restart;
 
 static bool wp_apply_try(void)
 {
-	if (screen_off || locked || tr.scr || sc.owner || pg.on || pg.settling)
+	/* (pg.scr: also the frame between a swipe's arrival and home taking over) */
+	if (screen_off || locked || tr.scr || sc.owner || pg.on || pg.settling || pg.scr)
 		return false;
 	if (wp_apply_restart) {
 		if (app_pid > 0)
