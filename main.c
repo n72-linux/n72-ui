@@ -211,9 +211,14 @@ uint64_t n72_mark_us;	/* (debug) a point to time long frames from, e.g. a slide 
 static void fps_frame(void)
 {
 	uint64_t now = mono_us(), rend = now - fps_refr_us, iv = now - fps_last_us;
+	static int frames_trace = -1;
 
 	if (n72_trace_on)
 		trace_frame(now, fps_n ? iv : 0, rend);
+	if (frames_trace < 0)
+		frames_trace = getenv("N72_FRAMES") != NULL;
+	if (frames_trace)	/* (debug) every frame: when, how long since the last, render */
+		fprintf(stderr, "F %.1f iv %.1f r %.1f\n", now / 1000.0, iv / 1000.0, rend / 1000.0);
 	if (fps_n && iv > 40000 && iv < 100000)
 		fprintf(stderr, "long frame: %.1f ms (render %.1f), %.0f ms after the mark\n",
 			iv / 1000.0, rend / 1000.0, (now - n72_mark_us) / 1000.0);

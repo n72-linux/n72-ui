@@ -85,6 +85,16 @@ static struct {
 #include <linux/fb.h>
 
 static lv_point_t rt_logical(lv_point_t p);	/* (main.c) */
+
+/* (debug, N72_FRAMES) the pages' input and steps, beside main.c's frames */
+static bool pg_trace(void)
+{
+	static int t = -1;
+
+	if (t < 0)
+		t = getenv("N72_FRAMES") != NULL;
+	return t;
+}
 static lv_timer_t *pg_warm_timer;
 
 /* ------------------------------------------------------------- layout */
@@ -687,6 +697,8 @@ static bool pg_drag(int phase, int x, int y)
 	}
 	pg_sample(x);
 	pg_frame(pg_track(x));
+	if (pg_trace())
+		fprintf(stderr, "P %.1f x %d off %d\n", mono_us() / 1000.0, x, pg.off);
 	return true;
 }
 
