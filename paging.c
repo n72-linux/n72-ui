@@ -278,8 +278,13 @@ static void pg_time_pics(int mode)
 	lv_obj_get_coords(home_bar, &bar);
 	lv_obj_get_coords(status_time, &a);
 	lv_area_move(&a, -bar.x1, -bar.y1);
-	a.x1 = LV_MAX(0, a.x1 - 2);
-	a.x2 = LV_MIN((int32_t)with->header.w - 1, a.x2 + 2);
+	/*
+	 * From the bar's left edge, and wide enough (4096 px and more) for
+	 * the GPU's exact copy: smaller pictures are drawn by the CPU, which
+	 * with layer 0 means premultiplied twice.
+	 */
+	a.x1 = 0;
+	a.x2 = LV_MIN((int32_t)with->header.w - 1, LV_MAX(a.x2 + 2, 4096 / (int32_t)with->header.h + 1));
 	a.y1 = 0;
 	a.y2 = (int32_t)with->header.h - 1;
 	pg.time_area = a;
@@ -448,6 +453,9 @@ static bool pg_frames_begin(void)
 	pg.scr = lv_obj_create(NULL);
 	if (mode == PG_MODE_LAYER0) {
 		lv_obj_remove_style_all(pg.scr);	/* nothing under the pictures */
+		/* LVGL draws its bottom layer under a screen that is not opaque,
+		 * and the theme gave it a background (also app_launch) */
+		lv_obj_remove_style_all(lv_layer_bottom());
 	} else {
 		m3_screen(pg.scr);
 		if (mode == PG_MODE_BLEND)
