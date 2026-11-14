@@ -96,6 +96,10 @@ static struct {
 static void wp_load(void);
 static bool wp_put(lv_obj_t *scr, int kind);
 static bool home_wp;		/* home is built over a wallpaper */
+static lv_draw_buf_t *wp_pic(int kind);
+static bool pg_drag(int phase, int x, int y);
+static void pg_fb0_dirty(void);
+static void pg_abort(void);
 /* text straight on a wallpaper: white (the picture is darkened under it) */
 #define WP_TEXT lv_color_white()
 
@@ -2669,6 +2673,7 @@ static void icon_show(lv_obj_t *l, bool on)
 	else
 		lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
 	shade_changed(l);
+	bp_changed(lv_obj_get_screen(l));	/* (pictures of home: the status icons) */
 }
 
 /* The sound device connected (n72-audio-route's /run/n72-audio), if any. */
@@ -3034,6 +3039,23 @@ static void app_tile(lv_obj_t *parent, const char *icon, const char *name,
 
 	lv_obj_set_style_radius(b, 20, 0);	/* squircle-ish */
 	lv_obj_set_style_transform_scale(t, 240, LV_STATE_PRESSED);
+	{
+		/*
+		 * The press shows after 150 ms, as iOS hands a touch to the
+		 * icons only then (UIScrollView delaysContentTouches): a swipe
+		 * of the pages (10 px) takes it first and no icon flinches.
+		 */
+		static const lv_style_prop_t props[] = { LV_STYLE_TRANSFORM_SCALE_X,
+							  LV_STYLE_TRANSFORM_SCALE_Y, 0 };
+		static lv_style_transition_dsc_t late;
+		static bool init;
+
+		if (!init) {
+			lv_style_transition_dsc_init(&late, props, lv_anim_path_step, 1, 150, NULL);
+			init = true;
+		}
+		lv_obj_set_style_transition(t, &late, LV_STATE_PRESSED);
+	}
 	if (home_wp) {
 		if (!icon_shadow)
 			icon_shadow = icon_shadow_make();
@@ -4104,6 +4126,7 @@ static void ui_lock(void)
 	za_finish();
 	sd_settle_now();
 	tr_finish();
+	pg_abort();
 	if (shade_open)
 		sd_end(false);
 	app_bar_set(false);
@@ -4294,6 +4317,8 @@ static bool ui_drag(int phase, int x, int y)
 
 	if (locked || ul.scr)
 		return ul_drag(phase, y);
+	if (pg_drag(phase, x, y))	/* sideways on home: the pages */
+		return true;
 	if (phase == 0) {
 		bool home = lv_screen_active() == home_scr && !tr.scr;
 		bool app = app_pid > 0 && lv_screen_active() == app_scr;
@@ -4429,6 +4454,7 @@ static void za_fill_layer0(lv_color_t c)
 	size_t len = (size_t)W * H * 4;
 	uint32_t *p, v = 0xff000000u | lv_color_to_u32(c);
 
+	pg_fb0_dirty();		/* (the home wallpaper is no longer there) */
 	if (fd < 0)
 		return;
 	p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -4726,6 +4752,7 @@ static void ui_settle_all(void)
 	sd_settle_now();
 	za_finish();
 	tr_finish();
+	pg_abort();
 }
 
 /*
@@ -5542,6 +5569,8 @@ static void app_tiles(lv_obj_t *parent)
  * back (app_home_ui). A burst of changes is one rebuild, 300 ms after the
  * last.
  */
+#include "paging.c"	/* home pages: layout, the swipe, its frames */
+
 static uint32_t home_apps_builtin;	/* tiles of our own, before the manifests' */
 static lv_timer_t *apps_timer;
 
@@ -5561,6 +5590,7 @@ static void apps_reload(void)
 	}
 	app_icons_free();
 	app_tiles(home_apps);
+	pg_layout();
 	bp_changed(home_scr);
 	lv_obj_invalidate(home_scr);
 }
@@ -5980,23 +6010,38 @@ static void build_home(void)
 	lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_add_event_cb(bar, shade_tap_cb, LV_EVENT_CLICKED, (void *)1);
 	status_row(bar, &status_time, &status_wifi, &status_bt, &batt_lbl);
+	home_bar = bar;
 	if (home_wp) {
 		lv_obj_set_style_text_color(status_time, WP_TEXT, 0);
 		lv_obj_set_style_text_color(status_wifi, WP_TEXT, 0);
 		lv_obj_set_style_text_color(status_bt, WP_TEXT, 0);
 		lv_obj_set_style_text_color(batt_lbl, WP_TEXT, 0);
 	}
-	/* the card below shows the time: the bar on home does not (the
-	 * label stays, hidden: the bar over applications copies it) */
+	/* the card on page 0 shows the time: the bar there does not (the
+	 * label stays, hidden: the bar over applications copies it; on the
+	 * other pages it shows, pg_show_page) */
 	lv_obj_add_flag(status_time, LV_OBJ_FLAG_HIDDEN);
+
+	/*
+	 * The pages (paging.c): one strip under the bar, as wide as all of
+	 * them; its first child the card (page 0), then the tiles, placed
+	 * by pg_layout(). Dots at the bottom when there is more than one.
+	 */
+	apps = home_apps = lv_obj_create(home_scr);
+	plain(apps);
+	lv_obj_set_pos(apps, 0, PG_TOP);
+	lv_obj_set_size(apps, W, H - PG_TOP);
+	lv_obj_set_style_bg_opa(apps, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_pad_all(apps, 0, 0);
+	lv_obj_remove_flag(apps, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
 	/* a widget: the time large, the date, battery and Wi-Fi */
 	{
-		lv_obj_t *c = lv_obj_create(home_scr);
+		lv_obj_t *c = lv_obj_create(apps);
 
 		plain(c);
-		lv_obj_set_size(c, W - 32, 112);
-		lv_obj_set_pos(c, 16, 44);
+		lv_obj_set_size(c, W - 32, PG_CARD_H);
+		lv_obj_set_pos(c, 16, 4);
 		lv_obj_set_style_radius(c, 24, 0);
 		lv_obj_set_style_bg_color(c, M.surface_c_high, 0);
 		/* over a wallpaper the card lets a little of it through */
@@ -6005,24 +6050,12 @@ static void build_home(void)
 		lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
 		lv_obj_add_event_cb(c, shade_tap_cb, LV_EVENT_CLICKED, (void *)1);
 		home_clock = m3_label(c, "", &lv_font_montserrat_48, M.on_surface);
-		lv_obj_align(home_clock, LV_ALIGN_TOP_LEFT, 18, 12);
+		lv_obj_align(home_clock, LV_ALIGN_TOP_LEFT, 18, 8);
 		home_date = m3_label(c, "", &lv_font_montserrat_16, M.primary);
-		lv_obj_align(home_date, LV_ALIGN_BOTTOM_LEFT, 20, -14);
+		lv_obj_align(home_date, LV_ALIGN_BOTTOM_LEFT, 20, -12);
 		/* (the right side is left for weather) */
 	}
 
-	/* apps: a launcher grid, four to a row, the whole width */
-	apps = home_apps = lv_obj_create(home_scr);
-	plain(apps);
-	lv_obj_set_size(apps, W - 16, H - 172);
-	lv_obj_set_pos(apps, 8, 172);
-	lv_obj_set_style_bg_opa(apps, LV_OPA_TRANSP, 0);
-	lv_obj_set_style_pad_all(apps, 0, 0);
-	lv_obj_set_style_pad_row(apps, 12, 0);
-	lv_obj_set_style_pad_column(apps, 0, 0);	/* 4 x 76 = the width */
-	lv_obj_remove_flag(apps, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_set_flex_flow(apps, LV_FLEX_FLOW_ROW_WRAP);
-	lv_obj_set_flex_align(apps, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 	app_tile(apps, LV_SYMBOL_SETTINGS, "Settings", M.primary_c, M.on_primary_c, open_settings);
 	settings_tile = page_tile_anim(apps, open_settings);
 	app_tile(apps, LV_SYMBOL_EDIT, "Paint", M.tertiary_c, M.on_tertiary_c, open_paint);
@@ -6034,12 +6067,25 @@ static void build_home(void)
 	home_apps_builtin = lv_obj_get_child_count(apps);
 	app_tiles(apps);
 
+	home_dots = lv_obj_create(home_scr);
+	plain(home_dots);
+	lv_obj_set_size(home_dots, W, PG_DOTS_H);
+	lv_obj_set_pos(home_dots, 0, H - PG_DOTS_H);
+	lv_obj_set_style_bg_opa(home_dots, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_pad_all(home_dots, 0, 0);
+	lv_obj_set_style_pad_column(home_dots, 9, 0);
+	lv_obj_remove_flag(home_dots, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_flex_flow(home_dots, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(home_dots, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	pg_layout();
+
 	build_shade();
 	app_bar_build();	/* the bar over applications and pages */
 
 	status_refresh(true);
 	home_timer = awake_timer(home_update, 2000, NULL);
 	shade_warm_timer = awake_timer(shade_pic_warm, 1000, NULL);
+	pg_warm_timer = awake_timer(pg_warm, 1000, NULL);
 	home_update(NULL);
 	if (app_pid <= 0 && !home_build_quiet)	/* (a turn keeps what shows) */
 		lv_screen_load(home_scr);
@@ -8662,13 +8708,14 @@ static void ui_rebuild(bool load)
 		awake_timer_delete(shade_warm_timer);
 		shade_warm_timer = NULL;
 	}
+	pg_home_gone();
 	/* what pointed into them (net_ui_sync and the status updates run
 	 * while the new ones are built: they skip what is NULL) */
 	{
 		lv_obj_t **gone[] = {
 			&status_time, &status_wifi, &status_bt, &batt_lbl,
 			&home_clock, &home_date, &home_batt, &home_net,
-			&settings_tile, &home_apps,
+			&settings_tile, &home_apps, &home_bar, &home_dots,
 		};
 
 		for (i = 0; i < (int)(sizeof(gone) / sizeof(gone[0])); i++)
@@ -8740,11 +8787,12 @@ static void home_fresh(void)
 		awake_timer_delete(shade_warm_timer);
 		shade_warm_timer = NULL;
 	}
+	pg_home_gone();
 	{
 		lv_obj_t **gone[] = {
 			&status_time, &status_wifi, &status_bt, &batt_lbl,
 			&home_clock, &home_date, &home_batt, &home_net,
-			&settings_tile, &home_apps,
+			&settings_tile, &home_apps, &home_bar, &home_dots,
 		};
 
 		for (i = 0; i < (int)(sizeof(gone) / sizeof(gone[0])); i++)
