@@ -807,8 +807,10 @@ static void kbd_gone(lv_anim_t *a)
 
 static void kbd_build(void)
 {
-	if (kbd.obj)
+	if (kbd.obj) {
+		psl_stop(kbd.obj);
 		lv_obj_delete(kbd.obj);
+	}
 	kbd_metrics();
 	kbd.obj = lv_obj_create(lv_layer_top());
 	plain(kbd.obj);
@@ -832,8 +834,11 @@ static void kbd_build(void)
 	kbd_layout();
 }
 
+/* iOS's keyboard: 300 ms ease-in-out both ways (UIInputViewAnimationStyle) */
+#define KBD_SLIDE_MS	300
+
 /*
- * Up (Material motion: 250 ms, decelerating), for a field (@vis_cb: its
+ * Up (iOS: 300 ms, ease-in-out, as a picture: psl_start), for a field (@vis_cb: its
  * page, told) or for the application (@ta NULL).
  */
 static void kbd_show_for(lv_obj_t *ta, void (*vis_cb)(bool shown, int32_t h))
@@ -862,14 +867,17 @@ static void kbd_show_for(lv_obj_t *ta, void (*vis_cb)(bool shown, int32_t h))
 		lv_obj_add_state(ta, LV_STATE_FOCUSED);
 	lv_anim_delete(kbd.obj, kbd_y);
 	if (!kbd.shown) {
-		lv_anim_init(&a);
-		lv_anim_set_var(&a, kbd.obj);
-		lv_anim_set_exec_cb(&a, kbd_y);
-		lv_anim_set_values(&a, lv_obj_get_y(kbd.obj), H - kbd.h);
-		lv_anim_set_duration(&a, 250);
-		lv_anim_set_path_cb(&a, ios_path_ease_out);
-		lv_anim_start(&a);
+		if (!psl_start(kbd.obj, H - kbd.h, KBD_SLIDE_MS, ios_path_ease_in_out, false)) {
+			lv_anim_init(&a);
+			lv_anim_set_var(&a, kbd.obj);
+			lv_anim_set_exec_cb(&a, kbd_y);
+			lv_anim_set_values(&a, lv_obj_get_y(kbd.obj), H - kbd.h);
+			lv_anim_set_duration(&a, KBD_SLIDE_MS);
+			lv_anim_set_path_cb(&a, ios_path_ease_in_out);
+			lv_anim_start(&a);
+		}
 	} else {
+		psl_stop(kbd.obj);
 		lv_obj_set_y(kbd.obj, H - kbd.h);
 	}
 	kbd.shown = true;
@@ -878,7 +886,7 @@ static void kbd_show_for(lv_obj_t *ta, void (*vis_cb)(bool shown, int32_t h))
 	kbd_state_write();
 }
 
-/* Down (200 ms, accelerating), and hidden. @anim false: at once. */
+/* Down (the same slide), and hidden. @anim false: at once. */
 static void kbd_hide_now(bool anim)
 {
 	lv_anim_t a;
@@ -898,16 +906,19 @@ static void kbd_hide_now(bool anim)
 	kbd.ta = NULL;
 	kbd.vis_cb = NULL;
 	lv_anim_delete(kbd.obj, kbd_y);
-	if (anim) {
+	if (anim && psl_start(kbd.obj, H, KBD_SLIDE_MS, ios_path_ease_in_out, true)) {
+		;
+	} else if (anim) {
 		lv_anim_init(&a);
 		lv_anim_set_var(&a, kbd.obj);
 		lv_anim_set_exec_cb(&a, kbd_y);
 		lv_anim_set_values(&a, lv_obj_get_y(kbd.obj), H);
-		lv_anim_set_duration(&a, 200);
-		lv_anim_set_path_cb(&a, ios_path_ease_in);
+		lv_anim_set_duration(&a, KBD_SLIDE_MS);
+		lv_anim_set_path_cb(&a, ios_path_ease_in_out);
 		lv_anim_set_completed_cb(&a, kbd_gone);
 		lv_anim_start(&a);
 	} else {
+		psl_stop(kbd.obj);
 		lv_obj_set_y(kbd.obj, H);
 		lv_obj_add_flag(kbd.obj, LV_OBJ_FLAG_HIDDEN);
 	}
@@ -922,7 +933,7 @@ static void kbd_hide(void)
 /* Does a touch at (x, y) (the screen's) belong to the keyboard? */
 static bool kbd_wants(int x, int y)
 {
-	return kbd.shown && in_obj(kbd.obj, x, y);
+	return kbd.shown && (in_obj(kbd.obj, x, y) || psl_covers(kbd.obj, x, y));
 }
 
 /* ---------------------------------------------------- the launcher's fields */

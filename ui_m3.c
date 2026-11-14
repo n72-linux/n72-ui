@@ -350,6 +350,73 @@ static lv_obj_t *m3_badge(lv_obj_t *parent, const char *icon, lv_color_t bg,
 }
 
 /*
+ * A row's press, as iOS's: the highlight shows for at least 120 ms however
+ * short the tap (UIButton/UITableViewCell), and goes in a 500 ms fade
+ * (deselect, ease-in-out). Only the tint's opacity changes: the row is drawn
+ * again for those frames (the tint is translucent, so a picture would not
+ * spare that), comes up at once.
+ */
+#define ROW_HOLD_MS	120
+#define ROW_FADE_MS	500
+
+static lv_obj_t *row_held;
+static uint32_t row_press_ms;
+static lv_timer_t *row_hold_timer;
+
+static void row_hold_end(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	row_hold_timer = NULL;
+	if (row_held && lv_obj_is_valid(row_held))
+		lv_obj_remove_state(row_held, LV_STATE_PRESSED);
+	row_held = NULL;
+}
+
+static void row_press_cb(lv_event_t *e)
+{
+	lv_obj_t *r = lv_event_get_current_target(e);
+	uint32_t held;
+
+	if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+		if (row_hold_timer)
+			row_hold_end(NULL);
+		row_press_ms = lv_tick_get();
+		return;
+	}
+	held = lv_tick_elaps(row_press_ms);	/* (released) */
+	if (held >= ROW_HOLD_MS || !lv_obj_is_valid(r))
+		return;
+	lv_obj_add_state(r, LV_STATE_PRESSED);	/* (LVGL took it off already) */
+	row_held = r;
+	row_hold_timer = lv_timer_create(row_hold_end, ROW_HOLD_MS - held, NULL);
+	lv_timer_set_repeat_count(row_hold_timer, 1);
+}
+
+static void row_deleted_cb(lv_event_t *e)
+{
+	if (row_held == lv_event_get_current_target(e))
+		row_held = NULL;
+}
+
+static void row_press_style(lv_obj_t *r)
+{
+	static const lv_style_prop_t props[] = { LV_STYLE_BG_OPA, 0 };
+	static lv_style_transition_dsc_t fade, none;
+	static bool init;
+
+	if (!init) {
+		lv_style_transition_dsc_init(&fade, props, ios_path_ease_in_out, ROW_FADE_MS, 0, NULL);
+		lv_style_transition_dsc_init(&none, props, lv_anim_path_linear, 0, 0, NULL);
+		init = true;
+	}
+	lv_obj_set_style_transition(r, &fade, 0);		/* into the plain state */
+	lv_obj_set_style_transition(r, &none, LV_STATE_PRESSED);	/* pressed: at once */
+	lv_obj_add_event_cb(r, row_press_cb, LV_EVENT_PRESSED, NULL);
+	lv_obj_add_event_cb(r, row_press_cb, LV_EVENT_RELEASED, NULL);
+	lv_obj_add_event_cb(r, row_deleted_cb, LV_EVENT_DELETE, NULL);
+}
+
+/*
  * A 64 px list row: badge, title and supporting text, optional trailing
  * widget area (returned in *trail). Clicking runs cb.
  */
@@ -369,6 +436,7 @@ static lv_obj_t *m3_row_ex(lv_obj_t *parent, const char *icon, lv_color_t bg, lv
 	lv_obj_set_style_bg_opa(r, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_bg_color(r, M.on_surface, LV_STATE_PRESSED);
 	lv_obj_set_style_bg_opa(r, LV_OPA_10, LV_STATE_PRESSED);
+	row_press_style(r);
 	lv_obj_set_style_radius(r, 16, 0);
 	lv_obj_set_style_pad_hor(r, 8, 0);
 	lv_obj_set_style_pad_ver(r, 0, 0);
@@ -641,6 +709,137 @@ static lv_draw_buf_t *snap(lv_obj_t *obj, lv_color_format_t cf)
 	if (b)
 		lv_draw_buf_flush_cache(b, NULL);	/* the GPU reads it */
 	return b;
+}
+
+/*
+ * Picture slides: an object that slides in or out (the keyboard, the bar
+ * over applications) moves as a picture of itself taken once at the start,
+ * not as itself: a moved object is drawn again every frame (over an
+ * application on the CPU, in the transparent mode, then premultiplied),
+ * its picture is one exact GPU copy (mbx_image_premul). The object itself
+ * is back, at its place, once the slide ends. iOS's longer timings (300 to
+ * 350 ms) then cost nothing more per frame.
+ */
+#define PSL_MAX 2
+
+struct psl {
+	lv_obj_t *live, *img;
+	lv_draw_buf_t *pic;
+	int32_t ext;		/* the picture's margin (shadows) */
+	int32_t to;
+	bool hide;		/* hidden at the end (a slide out) */
+};
+
+static struct psl psl[PSL_MAX];
+
+static void psl_y(void *var, int32_t v)
+{
+	struct psl *s = var;
+
+	lv_obj_set_y(s->img, v - s->ext);
+}
+
+static void psl_finish(struct psl *s)
+{
+	if (!s->live)
+		return;
+	lv_anim_delete(s, psl_y);
+	lv_obj_set_y(s->live, s->to);
+	if (!s->hide)
+		lv_obj_remove_flag(s->live, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_delete(s->img);
+	tr_free(&s->pic);
+	s->live = s->img = NULL;
+}
+
+static void psl_done(lv_anim_t *a)
+{
+	psl_finish(a->var);
+}
+
+static struct psl *psl_of(lv_obj_t *live)
+{
+	int i;
+
+	for (i = 0; i < PSL_MAX; i++)
+		if (psl[i].live == live)
+			return &psl[i];
+	return NULL;
+}
+
+/* Is @live sliding? Then (x, y) on its place at the end is still its own. */
+static bool psl_covers(lv_obj_t *live, int x, int y)
+{
+	struct psl *s = psl_of(live);
+	lv_area_t a;
+
+	if (!s || s->hide)
+		return false;
+	lv_obj_get_coords(live, &a);	/* (already at the end, hidden) */
+	return x >= a.x1 && x <= a.x2 && y >= a.y1 && y <= a.y2;
+}
+
+/*
+ * Slide @live (a child of a layer or screen, positioned by its y) to @to over
+ * @ms on @path; @hide: hidden once there. False if there was no memory for
+ * the picture: the caller moves the object itself.
+ */
+static bool psl_start(lv_obj_t *live, int32_t to, uint32_t ms, lv_anim_path_cb_t path, bool hide)
+{
+	struct psl *s = psl_of(live);
+	int32_t from;
+	lv_anim_t a;
+	int i;
+
+	if (s) {	/* sliding already: from where its picture is now */
+		from = lv_obj_get_style_y(s->img, LV_PART_MAIN) + s->ext;
+		lv_anim_delete(s, psl_y);
+		lv_obj_delete(s->img);
+		tr_free(&s->pic);
+		s->live = s->img = NULL;
+	} else {
+		from = lv_obj_get_style_y(live, LV_PART_MAIN);
+		for (i = 0; i < PSL_MAX && psl[i].live; i++)
+			;
+		if (i == PSL_MAX)
+			return false;
+		s = &psl[i];
+	}
+	lv_obj_remove_flag(live, LV_OBJ_FLAG_HIDDEN);	/* (a hidden object draws nothing) */
+	lv_obj_set_y(live, from);
+	s->pic = snap(live, LV_COLOR_FORMAT_ARGB8888);
+	if (!s->pic)
+		return false;
+	mbx_gpu_premultiply_buf(s->pic);	/* exact copy on the transparent display */
+	s->ext = lv_obj_get_ext_draw_size(live);
+	s->img = lv_image_create(lv_obj_get_parent(live));
+	lv_image_set_src(s->img, s->pic);
+	lv_obj_remove_flag(s->img, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_move_to_index(s->img, lv_obj_get_index(live) + 1);
+	lv_obj_set_pos(s->img, lv_obj_get_x(live) - s->ext, from - s->ext);
+	s->live = live;
+	s->to = to;
+	s->hide = hide;
+	lv_obj_add_flag(live, LV_OBJ_FLAG_HIDDEN);
+	lv_obj_set_y(live, to);		/* (touches go by its final place) */
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, s);
+	lv_anim_set_exec_cb(&a, psl_y);
+	lv_anim_set_values(&a, from, to);
+	lv_anim_set_duration(&a, ms);
+	lv_anim_set_path_cb(&a, path);
+	lv_anim_set_completed_cb(&a, psl_done);
+	lv_anim_start(&a);
+	return true;
+}
+
+/* Stop @live's slide where it ends (a rebuild, a jump). */
+static void psl_stop(lv_obj_t *live)
+{
+	struct psl *s = psl_of(live);
+
+	if (s)
+		psl_finish(s);
 }
 
 /* The screen on display: copied from the display buffer when it is current. */
@@ -2896,6 +3095,7 @@ static lv_timer_t *app_timer;
 #define APP_BAR_H	40
 #define APP_EDGE_H	24	/* the strip at the top that pulls the bar */
 #define APP_BAR_MS	3000
+#define APP_BAR_SLIDE_MS 350	/* iOS's status bar: 350 ms ease-in-out, as a picture */
 
 static lv_obj_t *app_bar, *app_bar_time, *app_bar_batt;
 static bool app_bar_shown;
@@ -2965,12 +3165,15 @@ static void app_bar_set(bool show)
 		if (app_bar_shown)
 			return;
 		home_update(NULL);
-		lv_obj_remove_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
-		app_slide(app_bar, 0, NULL);
+		if (!psl_start(app_bar, 0, APP_BAR_SLIDE_MS, ios_path_ease_in_out, false)) {
+			lv_obj_remove_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
+			app_slide(app_bar, 0, NULL);
+		}
 	} else {
 		if (!app_bar_shown)
 			return;
-		app_slide(app_bar, -APP_BAR_H, app_hide_done);
+		if (!psl_start(app_bar, -APP_BAR_H, APP_BAR_SLIDE_MS, ios_path_ease_in_out, true))
+			app_slide(app_bar, -APP_BAR_H, app_hide_done);
 	}
 	app_bar_shown = show;
 }
@@ -8049,6 +8252,7 @@ static void ui_rebuild_overlays_free(void)
 		app_bar_timer = NULL;
 	}
 	if (app_bar) {
+		psl_stop(app_bar);
 		lv_obj_delete(app_bar);
 		app_bar = NULL;
 		app_bar_shown = false;
