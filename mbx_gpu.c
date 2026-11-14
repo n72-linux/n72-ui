@@ -2574,6 +2574,12 @@ int mbx_gpu_rotation(void)
 	return rot_deg;
 }
 
+/* LVGL draws into the scan-out buffers themselves: upright, or turned by the display */
+bool mbx_gpu_draws_direct(void)
+{
+	return !rot_deg || hw_turn;
+}
+
 /*
  * @src (XRGB8888, in GPU memory) turned a quarter, 90 or 270 as LVGL turns
  * the screen, into a new buffer of the swapped size: one 3D copy. NULL if

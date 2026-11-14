@@ -487,7 +487,7 @@ static int wp_convert_main(int argc, char **argv)
 	for (k = 0; k < WP_KINDS; k++) {
 		if (!kinds[k])
 			continue;
-		for (t = 0; t < 2; t++) {
+		for (t = 0; t < 1; t++) {	/* (upright only: turned, the screen turns it) */
 			int w = t ? WP_PH : WP_PW, h = t ? WP_PW : WP_PH;
 
 			if (wp_fit(&im, px, w, h)) {
@@ -645,16 +645,37 @@ static void wp_load(void)
  * The other shape's goes (freed once nothing shows it): a turn back reads
  * it again, ~600 KB.
  */
-static lv_draw_buf_t *wp_pic(int kind)
+static lv_draw_buf_t *wp_upright(int kind)
 {
-	int t = W > H;
-
 	if (!wp.set[kind])
 		return NULL;
-	wp_drop(kind, !t);
-	if (!wp.pic[kind][t])
-		wp.pic[kind][t] = wp_read(kind, t);
-	return wp.pic[kind][t];
+	if (!wp.pic[kind][0])
+		wp.pic[kind][0] = wp_read(kind, 0);
+	return wp.pic[kind][0];
+}
+
+/*
+ * Turned, the picture does not turn with the screen: it stays as it is in
+ * the hand (the user's choice), so the screen shows the upright frame
+ * turned back a quarter (one GPU copy, ~600 KB, kept while turned). Layer
+ * 0 then holds the upright frame as it is under a turned home too, and a
+ * conversion makes no turned frame.
+ */
+static lv_draw_buf_t *wp_pic(int kind)
+{
+	lv_draw_buf_t *u = wp_upright(kind);
+
+	if (!u || !ui_rot) {
+		wp_drop(kind, 1);
+		return u;
+	}
+	if (wp.pic[kind][1] && wp.turn[kind] != ui_rot)
+		wp_drop(kind, 1);
+	if (!wp.pic[kind][1]) {
+		wp.pic[kind][1] = mbx_gpu_turn_buf(u, 360 - ui_rot);	/* (the screen's turn, undone) */
+		wp.turn[kind] = ui_rot;
+	}
+	return wp.pic[kind][1];
 }
 
 /* The wallpaper under everything on @scr (its first child); false: none set. */

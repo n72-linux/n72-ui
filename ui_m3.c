@@ -101,6 +101,7 @@ static struct {
 	bool set[WP_KINDS];
 	int luma[WP_KINDS];			/* mean luma under the app grid / clock */
 	int hue, sat;				/* the picture's own accent; hue -1: none */
+	int turn[WP_KINDS];			/* the turn pic[kind][1] was made for */
 	bool busy;				/* a conversion is running */
 	bool loaded;				/* what is set has been read (wp_load) */
 } wp = { .hue = -1 };
@@ -108,6 +109,7 @@ static void wp_load(void);
 static bool wp_put(lv_obj_t *scr, int kind);
 static bool home_wp;		/* home is built over a wallpaper */
 static lv_draw_buf_t *wp_pic(int kind);
+static lv_draw_buf_t *wp_upright(int kind);
 static bool wp_hold(lv_obj_t *img, lv_draw_buf_t *b);
 static void wp_apply_kick(void);	/* (something in the way of new wallpaper frames ended) */
 static bool pg_drag(int phase, int x, int y);

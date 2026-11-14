@@ -254,7 +254,13 @@ static int pg_mode(void)
 {
 	if (!home_wp)
 		return PG_MODE_OPAQUE;
-	if (ui_rot == 0 && app_pid <= 0 && mbx_gpu_on_shell_layer())
+	/*
+	 * Layer 0 under a transparent layer 1: upright, and turned when the
+	 * display turns layer 1 itself (then LVGL draws as upright; the
+	 * wallpaper goes onto layer 0 turned, pg_fb0_wallpaper). Not with the
+	 * GPU's turned copy of each frame.
+	 */
+	if (mbx_gpu_draws_direct() && app_pid <= 0 && mbx_gpu_on_shell_layer())
 		return PG_MODE_LAYER0;
 	return PG_MODE_BLEND;
 }
@@ -484,15 +490,15 @@ static bool pg_pics(void)
  */
 static bool pg_fb0_wallpaper(void)
 {
-	lv_draw_buf_t *wpic = wp_pic(WP_HOME);
+	lv_draw_buf_t *wpic = wp_upright(WP_HOME);	/* (layer 0 is not turned: upright always) */
 	struct fb_fix_screeninfo fi;
 	struct fb_var_screeninfo vi;
-	int fd, y, x;
+	int fd, y;
 	uint8_t *p;
 	size_t len;
 
-	if (pg.fb0_ok && pg.fb0_w == W)
-		return true;
+	if (pg.fb0_ok)
+		return true;	/* (the same upright frame whichever way the screen is) */
 	if (!wpic || (fd = open("/dev/fb0", O_RDWR | O_CLOEXEC)) < 0)
 		return false;
 	if (ioctl(fd, FBIOGET_FSCREENINFO, &fi) || ioctl(fd, FBIOGET_VSCREENINFO, &vi) ||
@@ -508,15 +514,9 @@ static bool pg_fb0_wallpaper(void)
 	for (y = 0; y < (int)vi.yres; y++) {
 		uint32_t *row = (uint32_t *)(p + (size_t)y * fi.line_length);
 
-		if (!ui_rot && (int)vi.xres == W) {
-			memcpy(row, wpic->data + (size_t)y * wpic->header.stride, (size_t)W * 4);
-			continue;
-		}
-		for (x = 0; x < (int)vi.xres; x++) {	/* (turned: as the display turns layer 1) */
-			lv_point_t l = rt_logical((lv_point_t){ x, y });
-
-			row[x] = *(const uint32_t *)(wpic->data + (size_t)l.y * wpic->header.stride + l.x * 4);
-		}
+		if (y < (int)wpic->header.h)
+			memcpy(row, wpic->data + (size_t)y * wpic->header.stride,
+			       (size_t)LV_MIN((int)vi.xres, (int)wpic->header.w) * 4);
 	}
 	munmap(p, len);
 	pg.fb0_ok = true;
