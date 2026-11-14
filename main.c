@@ -84,6 +84,7 @@ static unsigned int lat_n;
 static uint32_t lat_report_ms;
 
 static uint32_t tick_ms(void);
+void n72_trace(const char *what, long v);
 
 static uint64_t mono_us(void)
 {
@@ -103,6 +104,7 @@ static void render_now(void)
 	struct mbx_gpu_stats g0 = mbx_gpu_stats;
 
 	lat_input_frame = true;
+	n72_trace("touch-render", 0);
 	lv_refr_now(NULL);
 	lat_input_frame = false;
 	lat_event_us = 0;	/* nothing to show for this input: don't count it */
@@ -135,6 +137,51 @@ static void render_now(void)
  * time spent rendering (refresh start to flush).
  */
 static bool fps_on;
+
+/*
+ * N72_TRACE=1 (with N72_FPS=1): what the main loop did between two frames
+ * that came more than 20 ms apart, as "+ms what(value)" marks counted from
+ * the frame before, and the GPU's part of that time.
+ */
+bool n72_trace_on;
+static struct { uint64_t t; const char *what; long v; } trc[160];
+static unsigned int trc_n;
+static struct mbx_gpu_stats trc_g0;
+
+void n72_trace(const char *what, long v)
+{
+	if (!n72_trace_on || trc_n >= sizeof(trc) / sizeof(trc[0]))
+		return;
+	trc[trc_n].t = mono_us();
+	trc[trc_n].what = what;
+	trc[trc_n].v = v;
+	trc_n++;
+}
+
+static void trace_frame(uint64_t now, uint64_t iv, uint64_t rend)
+{
+	struct mbx_gpu_stats *g = &mbx_gpu_stats;
+	unsigned int i;
+
+	if (iv > 20000 && iv < 1000000) {
+		fprintf(stderr, "trace: frame after %.1f ms (render %.1f):", iv / 1000.0, rend / 1000.0);
+		for (i = 0; i < trc_n; i++) {
+			fprintf(stderr, " +%.1f %s", ((double)trc[i].t - (double)(now - iv)) / 1000.0, trc[i].what);
+			if (trc[i].v)
+				fprintf(stderr, "(%ld)", trc[i].v);
+		}
+		fprintf(stderr, "; GPU ms: sync %.1f submit %.1f 3d %.1f; tasks",
+			(g->sync_us - trc_g0.sync_us) / 1000, (g->submit_us - trc_g0.submit_us) / 1000,
+			(g->blit3d_us - trc_g0.blit3d_us) / 1000);
+		for (i = 0; i < 16; i++)
+			if (g->seen[i] != trc_g0.seen[i])
+				fprintf(stderr, " %u:%lu", i, g->seen[i] - trc_g0.seen[i]);
+		fprintf(stderr, "\n");
+	}
+	trc_n = 0;
+	trc_g0 = *g;
+}
+
 static uint64_t fps_last_us, fps_first_us, fps_refr_us, fps_int_max, fps_rend_sum, fps_rend_max;
 static unsigned int fps_n, fps_slow;
 static struct mbx_gpu_stats fps_g0;
@@ -148,7 +195,13 @@ static struct mbx_gpu_stats fps_g0;
 void n72_refr_start(void)
 {
 	fps_refr_us = mono_us();
+	n72_trace("refr", 0);
 	lv_anim_refr_now();
+	n72_trace("anims", 0);
+	if (n72_trace_on) {		/* (LVGL does this next: timed apart) */
+		lv_obj_update_layout(lv_screen_active());
+		n72_trace("layout", 0);
+	}
 }
 
 uint64_t n72_mark_us;	/* (debug) a point to time long frames from, e.g. a slide start */
@@ -157,6 +210,8 @@ static void fps_frame(void)
 {
 	uint64_t now = mono_us(), rend = now - fps_refr_us, iv = now - fps_last_us;
 
+	if (n72_trace_on)
+		trace_frame(now, fps_n ? iv : 0, rend);
 	if (fps_n && iv > 40000 && iv < 100000)
 		fprintf(stderr, "long frame: %.1f ms (render %.1f), %.0f ms after the mark\n",
 			iv / 1000.0, rend / 1000.0, (now - n72_mark_us) / 1000.0);
@@ -1989,6 +2044,7 @@ int main(int argc, char **argv)
 		}
 		lat_on = getenv("N72_LATENCY") && *getenv("N72_LATENCY") == '1';
 		fps_on = getenv("N72_FPS") && *getenv("N72_FPS") == '1';
+		n72_trace_on = fps_on && getenv("N72_TRACE") != NULL;
 	}
 
 	if (!keys)
@@ -2068,6 +2124,8 @@ int main(int argc, char **argv)
 
 		if (fps_on && mono_us() - th0 > 30000)
 			fprintf(stderr, "timers: %.1f ms\n", (mono_us() - th0) / 1000.0);
+		if (n72_trace_on && mono_us() - th0 > 1500)
+			n72_trace("timers-us", (long)(mono_us() - th0));
 
 		nw = nwatch;	/* (after the timers, which may have changed it) */
 		for (w = 0; w < nw; w++) {
@@ -2076,6 +2134,7 @@ int main(int argc, char **argv)
 		}
 		/* until LVGL's next timer, or an event: no fixed tick */
 		if (poll(pf, 3 + nw, idle == LV_NO_TIMER_READY ? -1 : (int)LV_MIN(idle, 60000)) > 0) {
+			n72_trace("poll", (pf[0].revents & POLLIN ? 1 : 0) | (pf[2].revents & POLLIN ? 4 : 0) | 8);
 			for (w = 0; w < nw; w++)
 				if ((pf[3 + w].revents & (POLLIN | POLLPRI | POLLHUP | POLLERR)) &&
 				    w < nwatch && watch[w].fd == pf[3 + w].fd)
@@ -2083,6 +2142,7 @@ int main(int argc, char **argv)
 			if ((pf[0].revents & POLLIN) && rt_uinput >= 0) {
 				lat_read_us = mono_us();
 				rt_feed(touch_wait_fd, touch_indev);	/* reads LVGL's side */
+				n72_trace("indev<", 0);
 				if (mbx_gpu_frame_waiting())
 					render_pending = true;
 				else

@@ -38,6 +38,7 @@
 
 void n72_frame_shown(void);
 void n72_refr_start(void);
+void n72_trace(const char *what, long v);
 
 #define DRAW_UNIT_ID_MBX	5
 #define POOL_SIZE		(6 * 1024 * 1024)	/* display, layers, snapshots */
@@ -1680,6 +1681,7 @@ static void render_start_cb(lv_event_t *e)
 	cur_n = 0;
 	cur_all = false;
 	pm_skip_n = 0;
+	n72_trace("draw", 0);
 	if (gpu_now_us() - dbg_t0 > 8000 && getenv("N72_FPS"))
 		fprintf(stderr, "render start: catch-up %.1f ms\n", (gpu_now_us() - dbg_t0) / 1000.0);
 }
@@ -1691,6 +1693,7 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 {
 	double dbg_t0 = gpu_now_us(), dbg_t1;
 
+	n72_trace("flush", lv_area_get_height(area));
 	if (transparent)
 		premultiply(px_map, area);
 	dbg_t1 = gpu_now_us();
@@ -1737,6 +1740,7 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 					n, bad, fx, fy);
 		}
 
+		n72_trace("cleaned", 0);
 		gpu_wait(last_seq);		/* the GPU's part of the frame is done */
 		last_seq = 0;
 		memcpy(hist[k].a, cur_areas, sizeof(cur_areas));

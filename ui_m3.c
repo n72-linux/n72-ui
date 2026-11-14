@@ -1062,7 +1062,9 @@ static void glide_start(lv_obj_t *obj, bool hor, float v)
 	gl.v0 = v;
 	gl.done = 0;
 	gl.on = true;
+	n72_trace("glide>", 0);
 	lv_obj_send_event(obj, LV_EVENT_SCROLL_BEGIN, NULL);
+	n72_trace("glide<", 0);
 	lv_anim_init(&a);
 	lv_anim_set_var(&a, &gl);
 	lv_anim_set_exec_cb(&a, glide_exec);
@@ -1186,6 +1188,7 @@ static void fling_cb(lv_event_t *e)
 		last_ms = lv_tick_get();
 		v = v * mult10 / 10;
 	}
+	n72_trace("flick", 0);
 	if (getenv("N72_FPS"))
 		fprintf(stderr, "flick: %.0f px/s (x%d.%d)\n", v, mult10 / 10, mult10 % 10);
 	if (fabsf(v) >= GLIDE_MIN_V)
@@ -1510,6 +1513,8 @@ static lv_obj_t *pf_body_on(lv_obj_t *scr)
  * resumes it.
  */
 static lv_timer_t *pf_timer;
+#define PF_QUIET_MS	150		/* nothing redrawn for this long: the screen is still */
+static uint32_t pf_moved_ms;		/* when something was last redrawn */
 
 static void pf_tick(lv_timer_t *t)
 {
@@ -1524,14 +1529,23 @@ static void pf_tick(lv_timer_t *t)
 		lv_timer_pause(t);
 		return;
 	}
-	if (tr.scr || sc.owner || lv_display_get_inactive_time(NULL) < 300)
+	/*
+	 * Not while the screen is changing either (a glide after the lift,
+	 * an animation, text being updated): a picture taken then is dropped
+	 * by the next frame's redraw and taken again, 20-30 ms each time in
+	 * the middle of the movement.
+	 */
+	if (tr.scr || sc.owner || gl.on || lv_display_get_inactive_time(NULL) < 300 ||
+	    lv_tick_elaps(pf_moved_ms) < PF_QUIET_MS)
 		return;
 	body = pf_body_on(lv_screen_active());
 	if (body != pf.owner) {
 		pf_clear();
 		pf.owner = body;
 	}
-	if (!body || pf.n >= PREF_MAX || pf.bytes >= PREF_BUDGET) {
+	/* (a body that does not scroll never shows pictures: Logs scrolls a box inside it) */
+	if (!body || !lv_obj_has_flag(body, LV_OBJ_FLAG_SCROLLABLE) ||
+	    pf.n >= PREF_MAX || pf.bytes >= PREF_BUDGET) {
 		lv_timer_pause(t);
 		return;
 	}
@@ -1579,6 +1593,7 @@ static void pf_invalidated(lv_event_t *e)
 
 	lv_indev_t *in;
 
+	pf_moved_ms = lv_tick_get();
 	if (pf_timer && pf_timer->paused && !screen_off)
 		lv_timer_resume(pf_timer);
 	if (!pf.n || !a)
@@ -7401,114 +7416,252 @@ static void open_settings(lv_event_t *e)
  * it over: the network addresses, then the tail of the ring buffer,
  * refreshed every 2 s and kept scrolled to the end. Volume keys scroll.
  */
-#define LOGS_TAIL 6144
-
-static lv_obj_t *logs_net, *logs_text, *logs_box;
-static lv_timer_t *logs_timer;
-static char *logs_buf;
-static int logs_len = -1;
-static bool logs_follow = true;
+#define LOGS_TAIL	6144	/* bytes of log on the page */
 
 /*
  * The log as labels of LOGS_CHUNK lines each: LVGL lays out and draws a
  * label by walking its text from the start, so one 6 KB label cost ~25 ms
- * a frame while scrolling. Chunks off screen are skipped whole, and an
- * update only touches the chunks whose text changed.
+ * a frame while scrolling. Chunks off screen are skipped whole. Lines are
+ * only ever added to the last chunk and whole chunks dropped from the top,
+ * so a new message measures at most LOGS_CHUNK lines again (cutting the
+ * text anew at every update moved every chunk's lines: all of them were
+ * measured again).
+ *
+ * New messages come from /dev/kmsg, which the main loop waits on: nothing
+ * runs while the kernel is quiet. (Reading the whole ring buffer every
+ * 2 s to look for news, as before, took the kernel 31 ms each time with
+ * 125 KB in it: a dropped frame or two every 2 s on this page.) The page
+ * starts with the end of the ring, which klogctl() returns for a short
+ * buffer.
  */
 #define LOGS_CHUNK	8	/* small labels: LVGL walks each one from its start */
 #define LOGS_MAXCH	96
-static lv_obj_t *logs_chunk[LOGS_MAXCH];
-static int logs_nchunks;
+#define LOGS_LINE_MAX	400	/* bytes of one line shown */
 
-static void logs_set_chunks(const char *text)
+static lv_obj_t *logs_net, *logs_box;
+static lv_timer_t *logs_timer;		/* the addresses (and the log, without /dev/kmsg) */
+static lv_timer_t *logs_show_t;		/* new lines onto the page, 10 times a second at most */
+static int logs_kmsg = -1;
+static struct {
+	lv_obj_t *label;
+	int bytes;
+} logs_chunk[LOGS_MAXCH];
+static int logs_nchunks, logs_bytes;
+static char *logs_open;			/* text of the last chunk, still filling */
+static int logs_open_len, logs_open_cap, logs_open_lines;
+static bool logs_open_dirty;
+static int32_t logs_gone_h;		/* height dropped from the top since the last logs_show() */
+static bool logs_at_end = true;		/* the view is at the end of the log */
+static char *logs_seen;			/* (without /dev/kmsg) the ring's end as last read */
+
+static void logs_put_open(void)
 {
-	const char *p = text;
-	int c = 0;
+	if (logs_open_dirty && logs_nchunks)
+		lv_label_set_text(logs_chunk[logs_nchunks - 1].label, logs_open);
+	logs_open_dirty = false;
+}
 
-	while (*p && c < LOGS_MAXCH) {
-		const char *q = p;
-		int lines = 0;
-		char *part;
-		size_t len;
+static void logs_drop_first(void)
+{
+	logs_gone_h += lv_obj_get_height(logs_chunk[0].label);
+	lv_obj_delete(logs_chunk[0].label);
+	logs_bytes -= logs_chunk[0].bytes;
+	logs_nchunks--;
+	memmove(&logs_chunk[0], &logs_chunk[1], logs_nchunks * sizeof(logs_chunk[0]));
+}
 
-		while (*q && lines < LOGS_CHUNK) {
-			if (*q == '\n')
-				lines++;
-			q++;
-		}
-		len = q - p;
-		if (len && p[len - 1] == '\n')
-			len--;			/* the label's own line break */
-		part = malloc(len + 1);
-		if (!part)
-			break;
-		memcpy(part, p, len);
-		part[len] = 0;
-		if (c == logs_nchunks) {
-			logs_chunk[c] = m3_label(logs_box, "", &lv_font_montserrat_12, M.on_surface);
-			obj_track(&logs_chunk[c]);
-			lv_obj_set_width(logs_chunk[c], lv_pct(100));
-			lv_label_set_long_mode(logs_chunk[c], LV_LABEL_LONG_WRAP);
-			logs_nchunks++;
-		}
-		if (strcmp(lv_label_get_text(logs_chunk[c]), part))
-			lv_label_set_text(logs_chunk[c], part);
-		free(part);
-		p = q;
-		c++;
+/* One more line at the end (not on the screen until logs_show()). */
+static void logs_add_line(const char *p, int len)
+{
+	if (!logs_box)
+		return;
+	len = LV_MIN(len, LOGS_LINE_MAX);
+	if (!logs_nchunks || logs_open_lines >= LOGS_CHUNK) {
+		lv_obj_t *l;
+
+		logs_put_open();
+		/* (a flood: no need to build what logs_show() would drop) */
+		while (logs_nchunks == LOGS_MAXCH || (logs_bytes > 2 * LOGS_TAIL && logs_nchunks > 1))
+			logs_drop_first();
+		l = m3_label(logs_box, "", &lv_font_montserrat_12, M.on_surface);
+		lv_obj_set_width(l, lv_pct(100));
+		lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+		logs_chunk[logs_nchunks].label = l;
+		logs_chunk[logs_nchunks].bytes = 0;
+		logs_nchunks++;
+		logs_open_len = logs_open_lines = 0;
 	}
-	while (logs_nchunks > c)		/* the log got shorter */
-		lv_obj_delete(logs_chunk[--logs_nchunks]);
+	if (logs_open_len + len + 2 > logs_open_cap) {
+		int cap = (logs_open_len + len + 2) * 2;
+		char *n = realloc(logs_open, cap);
+
+		if (!n)
+			return;
+		logs_open = n;
+		logs_open_cap = cap;
+	}
+	if (logs_open_lines)
+		logs_open[logs_open_len++] = '\n';
+	memcpy(logs_open + logs_open_len, p, len);
+	logs_open_len += len;
+	logs_open[logs_open_len] = 0;
+	logs_open_lines++;
+	logs_chunk[logs_nchunks - 1].bytes += len + 1;
+	logs_bytes += len + 1;
+	logs_open_dirty = true;
+}
+
+/*
+ * The lines added since the last time onto the page. At the end of the log
+ * the view stays at the end; scrolled back, it stays on the lines it shows
+ * (also when old chunks leave at the top).
+ */
+static void logs_show(void)
+{
+	bool at_end = logs_at_end;	/* (the scroll below asks again, half way) */
+
+	if (!logs_box)
+		return;
+	logs_put_open();
+	while (logs_bytes > LOGS_TAIL && logs_nchunks > 1)
+		logs_drop_first();
+	lv_obj_update_layout(logs_box);
+	if (at_end)
+		lv_obj_scroll_to_y(logs_box, LV_COORD_MAX, LV_ANIM_OFF);
+	else if (logs_gone_h)
+		lv_obj_scroll_to_y(logs_box, LV_MAX(lv_obj_get_scroll_y(logs_box) - logs_gone_h, 0),
+				   LV_ANIM_OFF);
+	logs_gone_h = 0;
+	logs_at_end = at_end;
+}
+
+/* Where the reader left the page: at the end of the log (new lines keep it there) or further back. */
+static void logs_scrolled_cb(lv_event_t *e)
+{
+	logs_at_end = lv_obj_get_scroll_bottom(lv_event_get_target(e)) <= 2;
+}
+
+static void logs_show_cb(lv_timer_t *t)
+{
+	logs_show();
+	lv_timer_pause(t);	/* until there are new lines (logs_kmsg_ev), or the screen lights */
+}
+
+static void logs_clear(void)
+{
+	while (logs_nchunks)
+		logs_drop_first();
+	logs_bytes = 0;
+	logs_open_len = logs_open_lines = 0;
+	logs_open_dirty = false;
+	logs_gone_h = 0;
+}
+
+/*
+ * The end of the kernel's ring buffer, as lines: SYSLOG_ACTION_READ_ALL
+ * with a buffer shorter than the log gives the newest whole records that
+ * fit. Returns false if it is what @seen holds already (then nothing is
+ * added); @seen is brought up to date.
+ */
+static bool logs_fill(char *seen)
+{
+	char *raw = malloc(LOGS_TAIL + 1);
+	int n, i, j;
+
+	if (!raw)
+		return false;
+	n72_trace("klog>", 0);
+	n = klogctl(3, raw, LOGS_TAIL);		/* SYSLOG_ACTION_READ_ALL */
+	n72_trace("klog<", n);
+	if (n < 0)
+		n = 0;
+	raw[n] = 0;
+	if (seen) {
+		if (!strcmp(seen, raw)) {
+			free(raw);
+			return false;
+		}
+		memcpy(seen, raw, n + 1);
+		logs_clear();
+	}
+	for (i = 0; i < n; i = j + 1) {
+		for (j = i; j < n && raw[j] != '\n'; j++)
+			;
+		if (raw[i] == '<') {		/* "<6>": the level */
+			int k = i + 1;
+
+			while (k < j && raw[k] >= '0' && raw[k] <= '9')
+				k++;
+			if (k < j && raw[k] == '>')
+				i = k + 1;
+		}
+		logs_add_line(raw + i, j - i);
+	}
+	free(raw);
+	return true;
+}
+
+/*
+ * New records on /dev/kmsg, one a read: "level,sequence,microseconds,flags;
+ * text\n" and then lines of " KEY=value"; a line break inside the text
+ * comes as "\x0a". Shown as dmesg and the lines above show them.
+ */
+static void logs_kmsg_ev(int fd)
+{
+	static char rec[8192];		/* (the kernel's largest record) */
+	char line[LOGS_LINE_MAX + 32];
+	bool any = false;
+	int budget;
+
+	for (budget = 256; budget; budget--) {	/* (a flood: back to the main loop in between) */
+		ssize_t r = read(fd, rec, sizeof(rec) - 1);
+		unsigned long long us = 0;
+		char *text, *end, *nl;
+		int pre;
+
+		if (r < 0 && (errno == EPIPE || errno == EINVAL))
+			continue;	/* records overwritten before we read them, or one too long */
+		if (r <= 0)
+			break;		/* EAGAIN: that was all */
+		rec[r] = 0;
+		text = strchr(rec, ';');
+		if (!text)
+			continue;
+		sscanf(rec, "%*u,%*u,%llu", &us);
+		text++;
+		end = strchr(text, '\n');
+		if (end)
+			*end = 0;
+		pre = snprintf(line, sizeof(line), "[%5llu.%06llu] ", us / 1000000, us % 1000000);
+		do {
+			int len;
+
+			nl = strstr(text, "\\x0a");
+			len = nl ? (int)(nl - text) : (int)strlen(text);
+			len = LV_MIN(len, LOGS_LINE_MAX);
+			memcpy(line + pre, text, len);
+			logs_add_line(line, pre + len);
+			text = nl ? nl + 4 : text;
+		} while (nl);
+		any = true;
+	}
+	/* dark: the lines wait in the last chunk's text for the screen (logs_show_t is an awake timer) */
+	if (any && logs_show_t && !screen_off)
+		lv_timer_resume(logs_show_t);
 }
 
 static void logs_update(lv_timer_t *t)
 {
 	char usb[32], wlan[32], buf[96];
-	int size, n, i, o, start;
-	char *raw;
 
 	LV_UNUSED(t);
 	ip_of("usb0", usb, sizeof(usb));
 	ip_of("wlan0", wlan, sizeof(wlan));
 	snprintf(buf, sizeof(buf), "usb0 %s    wlan0 %s", usb, wlan);
 	label_set_if_changed(logs_net, buf);
-
-	size = klogctl(10, NULL, 0);		/* SYSLOG_ACTION_SIZE_BUFFER */
-	if (size <= 0)
-		size = 1 << 17;
-	raw = malloc(size + 1);
-	if (!raw)
-		return;
-	n = klogctl(3, raw, size);		/* SYSLOG_ACTION_READ_ALL */
-	if (n < 0)
-		n = 0;
-	if (n == logs_len) {
-		free(raw);
-		return;
-	}
-	logs_len = n;
-	start = n > LOGS_TAIL ? n - LOGS_TAIL : 0;
-	while (start > 0 && start < n && raw[start - 1] != '\n')
-		start++;
-	for (i = start, o = 0; i < n && o < LOGS_TAIL; ) {
-		if (raw[i] == '<' && (i == start || raw[i - 1] == '\n')) {
-			int j = i + 1;
-
-			while (j < n && raw[j] >= '0' && raw[j] <= '9')
-				j++;
-			if (j < n && raw[j] == '>') {
-				i = j + 1;
-				continue;
-			}
-		}
-		logs_buf[o++] = raw[i++];
-	}
-	logs_buf[o] = 0;
-	free(raw);
-	logs_set_chunks(logs_buf);
-	lv_obj_update_layout(logs_box);
-	if (logs_follow)
-		lv_obj_scroll_to_y(logs_box, LV_COORD_MAX, LV_ANIM_OFF);
+	/* no /dev/kmsg: look at the end of the ring (cheap: the kernel formats only that) */
+	if (logs_kmsg < 0 && logs_seen && logs_fill(logs_seen))
+		logs_show();
 }
 
 static bool logs_scroll(int dir)
@@ -7516,7 +7669,6 @@ static bool logs_scroll(int dir)
 	if (!logs_box)
 		return false;
 	lv_obj_scroll_by(logs_box, 0, dir * 160, LV_ANIM_OFF);
-	logs_follow = lv_obj_get_scroll_bottom(logs_box) <= 0;
 	return true;
 }
 
@@ -7526,10 +7678,22 @@ static void logs_delete_cb(lv_event_t *e)
 	if (logs_timer)
 		lv_timer_delete(logs_timer);
 	logs_timer = NULL;
-	free(logs_buf);
-	logs_buf = NULL;
-	logs_box = NULL;
-	logs_nchunks = 0;
+	if (logs_show_t)
+		lv_timer_pause(logs_show_t);
+	if (logs_kmsg >= 0) {
+		ui_unwatch(logs_kmsg);
+		close(logs_kmsg);
+		logs_kmsg = -1;
+	}
+	free(logs_seen);
+	logs_seen = NULL;
+	free(logs_open);
+	logs_open = NULL;
+	logs_open_cap = logs_open_len = logs_open_lines = 0;
+	logs_open_dirty = false;
+	logs_box = NULL;	/* (the chunk labels go with the page) */
+	logs_nchunks = logs_bytes = 0;
+	logs_gone_h = 0;
 }
 
 static void open_logs(lv_event_t *e)
@@ -7540,12 +7704,6 @@ static void open_logs(lv_event_t *e)
 	LV_UNUSED(e);
 	if (logs_box)		/* already open */
 		return;
-	logs_buf = malloc(LOGS_TAIL + 1);
-	if (!logs_buf)
-		return;
-	logs_buf[0] = 0;
-	logs_len = -1;
-	logs_follow = true;
 	body = m3_page("Logs", &scr);
 	lv_obj_remove_flag(body, LV_OBJ_FLAG_SCROLLABLE);
 	logs_net = m3_label(body, "", &lv_font_montserrat_12, M.primary);
@@ -7563,12 +7721,29 @@ static void open_logs(lv_event_t *e)
 	fling_accel(logs_box);
 	lv_obj_set_flex_flow(logs_box, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_style_pad_row(logs_box, 0, 0);
-	logs_nchunks = 0;
+	logs_nchunks = logs_bytes = 0;
 	/*
 	 * No scroll cache here: pictures of text chunks cost as much to take
 	 * as they save (measured: 16.6 vs 15.8 ms a frame, same hitches), while
 	 * the card pages draw ~30% faster with it.
 	 */
+	/* from now on (opened before the ring's end is read: a message in between shows once) */
+	logs_at_end = true;
+	lv_obj_add_event_cb(logs_box, logs_scrolled_cb, LV_EVENT_SCROLL, NULL);
+	logs_kmsg = open("/dev/kmsg", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (logs_kmsg >= 0)
+		lseek(logs_kmsg, 0, SEEK_END);
+	else if ((logs_seen = malloc(LOGS_TAIL + 1)))
+		logs_seen[0] = 0;
+	logs_fill(logs_seen);
+	logs_show();
+	if (logs_kmsg >= 0)
+		ui_watch(logs_kmsg, logs_kmsg_ev);
+	if (!logs_show_t) {
+		logs_show_t = awake_timer(logs_show_cb, 100, NULL);
+		if (logs_show_t)
+			lv_timer_pause(logs_show_t);
+	}
 	logs_update(NULL);
 	logs_timer = lv_timer_create(logs_update, 2000, NULL);
 	lv_obj_add_event_cb(scr, logs_delete_cb, LV_EVENT_DELETE, NULL);

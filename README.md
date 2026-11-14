@@ -46,6 +46,9 @@ A touch launcher for Linux on the iPod touch 2G (N72AP), built on
 - Manifests may set `icon=` (video, image, music, gears, file, list, ...) and
   `color=#rrggbb` for the tile.
 - `N72_FPS=1` logs every burst of frames and the animation phases.
+- `N72_TRACE=1` (with `N72_FPS=1`) logs, for every frame that came more than
+  20 ms after the one before, what the main loop did in between (timers,
+  input, layout, drawing, flush) and the GPU's share.
 
 ## GPU
 
