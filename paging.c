@@ -46,6 +46,7 @@
 #define PG_FLICK	0.3		/* px/ms: on one page */
 #define PG_STILL	0.25		/* px/ms: slower is let go from rest */
 #define PG_TIME_LEVELS	16
+#define PG_PAGES_MAX	PG_MAX
 
 enum { PG_MODE_LAYER0, PG_MODE_OPAQUE, PG_MODE_BLEND };
 
@@ -74,8 +75,9 @@ static struct {
 	int mode;
 	int off;			/* the strip's offset now, px */
 	int time_lv;			/* the time's picture showing */
-	lv_obj_t *scr, *strip_img, *bar_img, *bar_r_img, *time_img, *dots_img, *wp_img;
-	lv_draw_buf_t *strip_pic, *bar_pic, *bar_l, *bar_r, *dots_pic, *time_pic[PG_TIME_LEVELS + 1];
+	lv_obj_t *scr, *strip_img, *strip_img2, *bar_img, *bar_r_img, *time_img, *dots_img, *wp_img;
+	int strip_k;			/* the page strip_img shows; strip_img2 the next */
+	lv_draw_buf_t *page_pic[PG_PAGES_MAX], *bar_pic, *bar_l, *bar_r, *dots_pic, *time_pic[PG_TIME_LEVELS + 1];
 	lv_area_t time_area;		/* the time's place in the bar */
 	unsigned long pic_ver;		/* home_ver they show */
 	unsigned long fail_ver;		/* (no memory for them at this home_ver) */
@@ -205,7 +207,8 @@ static void pg_pics_free(void)
 {
 	int i;
 
-	tr_free(&pg.strip_pic);
+	for (int k = 0; k < PG_PAGES_MAX; k++)
+		tr_free(&pg.page_pic[k]);
 	tr_free(&pg.bar_pic);
 	tr_free(&pg.bar_l);
 	tr_free(&pg.bar_r);
@@ -226,10 +229,52 @@ static int pg_mode(void)
 }
 
 /*
- * A picture of @o for the frames: opaque with the screen's colour behind it
- * (on the plain background), else with alpha (premultiplied for layer 0).
+ * A picture of @a (screen coordinates) of @obj, as lv_snapshot_take() draws
+ * all of @obj: one page of the strip at a time. (The whole strip was one
+ * picture n pages wide: past 2048 px, five pages turned, the GPU drew it
+ * as streaks.)
  */
-static lv_draw_buf_t *pg_snap(lv_obj_t *o, int mode)
+static lv_draw_buf_t *snap_area(lv_obj_t *obj, lv_color_format_t cf, const lv_area_t *a)
+{
+	lv_draw_buf_t *b;
+	lv_display_t *disp = lv_obj_get_display(obj), *disp_old;
+	lv_layer_t layer, *layer_old;
+
+	lv_obj_update_layout(obj);
+	b = lv_draw_buf_create(lv_area_get_width(a), lv_area_get_height(a), cf, 0);
+	if (!b)
+		return NULL;
+	lv_draw_buf_clear(b, NULL);
+	lv_memzero(&layer, sizeof(layer));
+	layer.draw_buf = b;
+	layer.buf_area = *a;
+	layer.color_format = cf;
+	layer._clip_area = *a;
+	layer.phy_clip_area = *a;
+#if LV_DRAW_TRANSFORM_USE_MATRIX
+	lv_matrix_identity(&layer.matrix);
+#endif
+	disp_old = lv_refr_get_disp_refreshing();
+	layer_old = disp->layer_head;
+	disp->layer_head = &layer;
+	lv_refr_set_disp_refreshing(disp);
+	lv_obj_redraw(&layer, obj);
+	while (layer.draw_task_head) {
+		lv_draw_dispatch_wait_for_request();
+		lv_draw_dispatch();
+	}
+	disp->layer_head = layer_old;
+	lv_refr_set_disp_refreshing(disp_old);
+	lv_draw_buf_flush_cache(b, NULL);	/* the GPU reads it */
+	return b;
+}
+
+/*
+ * A picture of @o (of @a of it if given) for the frames: opaque with the
+ * screen's colour behind it (on the plain background), else with alpha
+ * (premultiplied for layer 0).
+ */
+static lv_draw_buf_t *pg_snap_area(lv_obj_t *o, int mode, const lv_area_t *a)
 {
 	lv_draw_buf_t *b;
 
@@ -239,15 +284,20 @@ static lv_draw_buf_t *pg_snap(lv_obj_t *o, int mode)
 
 		lv_obj_set_style_bg_color(o, M.surface, 0);
 		lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
-		b = snap(o, LV_COLOR_FORMAT_XRGB8888);
+		b = a ? snap_area(o, LV_COLOR_FORMAT_XRGB8888, a) : snap(o, LV_COLOR_FORMAT_XRGB8888);
 		lv_obj_set_style_bg_opa(o, opa, 0);
 		lv_obj_set_style_bg_color(o, col, 0);
 		return b;
 	}
-	b = snap(o, LV_COLOR_FORMAT_ARGB8888);
+	b = a ? snap_area(o, LV_COLOR_FORMAT_ARGB8888, a) : snap(o, LV_COLOR_FORMAT_ARGB8888);
 	if (b && mode == PG_MODE_LAYER0)
 		mbx_gpu_premultiply_buf(b);
 	return b;
+}
+
+static lv_draw_buf_t *pg_snap(lv_obj_t *o, int mode)
+{
+	return pg_snap_area(o, mode, NULL);
 }
 
 /* columns @x1..@x2 of @b as a picture of their own (flags kept) */
@@ -334,7 +384,7 @@ static bool pg_pics_take(void)
 {
 	int mode = pg_mode(), i;
 
-	if (pg.strip_pic && pg.pic_ver == home_ver && pg.pic_mode == mode && pg.pic_w == W) {
+	if (pg.page_pic[0] && pg.pic_ver == home_ver && pg.pic_mode == mode && pg.pic_w == W) {
 		if (pg.pic_dots != pg.cur) {	/* only the dots moved on */
 			tr_free(&pg.dots_pic);
 			pg.dots_pic = pg_snap(home_dots, mode);
@@ -345,12 +395,24 @@ static bool pg_pics_take(void)
 	pg_pics_free();
 	lv_obj_update_layout(home_scr);
 	pg_time_show(false);		/* (the bar's picture without the time) */
-	pg.strip_pic = pg_snap(home_apps, mode);
+	{
+		lv_area_t s, a;
+		int k;
+
+		lv_obj_get_coords(home_apps, &s);	/* (page 0 at x 0 - cur * W) */
+		for (k = 0; k < pg.n && k < PG_PAGES_MAX; k++) {
+			a = s;
+			a.x1 = s.x1 + k * W;
+			a.x2 = a.x1 + W - 1;
+			if (!(pg.page_pic[k] = pg_snap_area(home_apps, mode, &a)))
+				break;
+		}
+	}
 	pg.bar_pic = pg_snap(home_bar, mode);
 	pg.dots_pic = pg.n > 1 ? pg_snap(home_dots, mode) : NULL;
 	pg_time_show(pg.cur > 0);
 	pg_time_pics(mode);
-	if (!pg.strip_pic || !pg.bar_pic) {
+	if (!pg.page_pic[LV_MIN(pg.n, PG_PAGES_MAX) - 1] || !pg.bar_pic) {
 		pg_pics_free();
 		return false;
 	}
@@ -451,7 +513,28 @@ static void pg_frame(int off)
 	pg.off = off;
 	if (!pg.scr)
 		return;
-	lv_obj_set_x(pg.strip_img, -off);
+	{
+		/* pages k and k + 1 in view (k -1 or the last: pulled past an end) */
+		int k = off >= 0 ? off / W : -1, n = LV_MIN(pg.n, PG_PAGES_MAX);
+
+		if (k != pg.strip_k) {
+			pg.strip_k = k;
+			if (k >= 0 && k < n) {
+				lv_image_set_src(pg.strip_img, pg.page_pic[k]);
+				lv_obj_remove_flag(pg.strip_img, LV_OBJ_FLAG_HIDDEN);
+			} else {
+				lv_obj_add_flag(pg.strip_img, LV_OBJ_FLAG_HIDDEN);
+			}
+			if (k + 1 >= 0 && k + 1 < n) {
+				lv_image_set_src(pg.strip_img2, pg.page_pic[k + 1]);
+				lv_obj_remove_flag(pg.strip_img2, LV_OBJ_FLAG_HIDDEN);
+			} else {
+				lv_obj_add_flag(pg.strip_img2, LV_OBJ_FLAG_HIDDEN);
+			}
+		}
+		lv_obj_set_x(pg.strip_img, k * W - off);
+		lv_obj_set_x(pg.strip_img2, (k + 1) * W - off);
+	}
 	/* the time: nothing on page 0, all of it a page on */
 	lv = LV_CLAMP(0, (off * PG_TIME_LEVELS + W / 2) / W, PG_TIME_LEVELS);
 	if (pg.time_img && lv != pg.time_lv && pg.time_pic[lv]) {
@@ -509,7 +592,10 @@ static bool pg_frames_begin(void)
 	 * slower, and soft edges too dark). The strip ends above the dots, the
 	 * bar is cut around the time.
 	 */
-	pg.strip_img = pg_img(pg.strip_pic, -pg.cur * W, PG_TOP);
+	/* the page in view and the next: one GPU copy each, side by side */
+	pg.strip_img = pg_img(pg.page_pic[pg.cur], 0, PG_TOP);
+	pg.strip_img2 = pg_img(pg.page_pic[pg.cur], W, PG_TOP);
+	pg.strip_k = -2;
 	{
 		lv_area_t b;
 
@@ -553,7 +639,7 @@ static void pg_frames_end(int p)
 	if (!scr)
 		return;
 	pg.scr = NULL;
-	pg.strip_img = pg.bar_img = pg.bar_r_img = pg.time_img = pg.dots_img = pg.wp_img = NULL;
+	pg.strip_img = pg.strip_img2 = pg.bar_img = pg.bar_r_img = pg.time_img = pg.dots_img = pg.wp_img = NULL;
 	if (pg.mode == PG_MODE_LAYER0)
 		mbx_gpu_set_transparent(false);
 	n72_trace("pg-opaque", 0);

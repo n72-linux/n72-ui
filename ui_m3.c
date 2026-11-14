@@ -19,6 +19,8 @@
 #include "lvgl/src/core/lv_obj_scroll_private.h"	/* lv_obj_scroll_by_raw() */
 #include "lvgl/src/core/lv_obj_draw_private.h"	/* lv_obj_get_ext_draw_size() */
 #include "lvgl/src/misc/lv_area_private.h"	/* lv_area_intersect() */
+#include "lvgl/src/draw/lv_draw_private.h"	/* snap_area(): a layer of its own */
+#include "lvgl/src/core/lv_refr_private.h"
 #include "lvgl/src/misc/lv_anim_private.h"	/* the animation list (turning) */
 #include "lvgl/src/core/lv_global.h"
 #include <sys/wait.h>
