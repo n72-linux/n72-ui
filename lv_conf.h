@@ -1120,6 +1120,10 @@
 /*Vector graphic demo*/
 #define LV_USE_DEMO_VECTOR_GRAPHIC  0
 
+/* n72: iOS 4.2.1 UIScrollView (n72-ramboot/ui/IOS-PAGING.md 2.1-2.5) */
+#define ELASTIC_SLOWNESS_FACTOR 2	/* past an end the content moves at half the finger */
+#define SCROLLBAR_MIN_SIZE 36		/* the shortest scroll indicator */
+
 /*--END OF LV_CONF_H--*/
 
 #endif /*LV_CONF_H*/
