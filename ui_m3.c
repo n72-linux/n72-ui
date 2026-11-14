@@ -42,6 +42,9 @@ static lv_obj_t *home_apps;
 #define QS_COLS (W > H ? 3 : 2)	/* quick-settings tiles a row */
 static bool app_is_video(void);
 static bool cmd_is_video(const char *cmd);
+static bool app_is_game(void);
+static bool cmd_is_game(const char *cmd);
+static int rot_side, game_rot;	/* (defined with the turning code below) */
 static bool ui_turn(int rot);
 static void vc_start(void);
 static void vc_stop(void);
@@ -5483,7 +5486,7 @@ static void app_launch(const char *cmd, lv_obj_t *tile)
 	if (!app_cmd)
 		return;
 	cmd = app_cmd;		/* (the row's copy goes with its page in a turn) */
-	if (ui_rot && !cmd_is_video(cmd)) {
+	if (ui_rot && !cmd_is_video(cmd) && !cmd_is_game(cmd)) {
 		/* applications draw for an upright panel: turn first, and
 		 * find the tile again in the new home */
 		int idx = lv_obj_get_parent(tile) == home_apps ? (int)lv_obj_get_index(tile) : -1;
@@ -6212,6 +6215,7 @@ static void open_files(lv_event_t *e)
 }
 
 #include "ui_youtube.c"	/* YouTube: search, a video's page, Play/Listen */
+#include "ui_games.c"	/* Games: the library, a game started in RetroArch */
 
 static void open_paint(lv_event_t *e);
 
@@ -6311,6 +6315,8 @@ static void build_home(void)
 	page_tile_anim(apps, open_files);
 	app_tile(apps, LV_SYMBOL_PLAY, "YouTube", M.tertiary_c, M.on_tertiary_c, open_youtube);
 	page_tile_anim(apps, open_youtube);
+	app_tile(apps, LV_SYMBOL_KEYBOARD, "Games", M.primary_c, M.on_primary_c, open_games);
+	page_tile_anim(apps, open_games);
 	home_apps_builtin = lv_obj_get_child_count(apps);
 	app_tiles(apps);
 
@@ -9198,6 +9204,8 @@ static int rot_wanted(void)
 	lv_obj_t *a = lv_screen_active();
 
 	if (app_pid > 0 && a == app_scr) {
+		if (app_is_game())
+			return game_rot;
 		if (!app_is_video())
 			return 0;
 		if (video_rot >= 0)	/* the controls' turn button holds it */
@@ -9233,8 +9241,8 @@ static bool rot_can_turn(void)
 	    page_over_app || finite_anims_running() ||
 	    (touch_indev && lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
 		return false;
-	if (app_pid != 0 && !(app_pid > 0 && a == app_scr && app_is_video()))
-		return false;		/* an application starting, or not the player */
+	if (app_pid != 0 && !(app_pid > 0 && a == app_scr && (app_is_video() || app_is_game())))
+		return false;		/* an application starting, or not the player or a game */
 	for (i = 0; i < nav_n; i++)
 		if (nav_re[i].open == open_paint)
 			return false;
@@ -9395,6 +9403,29 @@ static bool cmd_is_video(const char *cmd)
 static bool app_is_video(void)
 {
 	return app_pid > 0 && cmd_is_video(app_cmd);
+}
+
+/*
+ * A game (ui_games.c): RetroArch started through n72-retro-launch, in
+ * landscape on the side game_rot (90 or 270), which the display turns for
+ * it; the launcher's layer turns the same way while it plays.
+ */
+static int game_rot = 90;
+
+static bool cmd_is_game(const char *cmd)
+{
+	return cmd && strstr(cmd, "n72-retro-launch") != NULL;
+}
+
+static bool app_is_game(void)
+{
+	return app_pid > 0 && cmd_is_game(app_cmd);
+}
+
+/* A game in front: the screen stays on (main.c, idle_check). */
+static bool game_playing(void)
+{
+	return app_is_game() && lv_screen_active() == app_scr;
 }
 
 /* A video playing in front: the screen stays on (main.c, idle_check). */

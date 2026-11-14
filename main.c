@@ -1561,7 +1561,7 @@ static void idle_check(lv_timer_t *t)
 	}
 	if (screen_off)
 		return;
-	if (video_playing()) {		/* a video is watched, not idle */
+	if (video_playing() || game_playing()) {	/* a video watched, a game played */
 		lv_display_trigger_activity(NULL);
 		lv_timer_set_period(t, LV_MIN(next, 5000));
 		return;
