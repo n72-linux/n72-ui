@@ -4677,11 +4677,9 @@ static void za_spawn_cb(lv_timer_t *t)
 	 * za_next gives it full priority when the grow ends */
 }
 
-static void app_launch_cb(lv_event_t *e)
+/* Start @cmd as the application, growing out of @tile (a tile, or a row). */
+static void app_launch(const char *cmd, lv_obj_t *tile)
 {
-	const char *cmd = lv_event_get_user_data(e);
-	lv_obj_t *tile = lv_event_get_current_target(e);
-
 	if (app_pid != 0 || za.phase || !mbx_gpu_on_shell_layer())
 		return;
 	free(app_cmd);
@@ -4758,6 +4756,11 @@ static void app_launch_cb(lv_event_t *e)
 	za_build();
 	lv_screen_load(za.scr);
 	za_run(1, 0, 1024, ZA_GROW_MS, za_path_spring);
+}
+
+static void app_launch_cb(lv_event_t *e)
+{
+	app_launch(lv_event_get_user_data(e), lv_event_get_current_target(e));
 }
 
 /* One tile for every manifest in APPS_DIR. */
@@ -5087,11 +5090,10 @@ static void apps_watch(void)
  * n72-video, launched from the row as an application from its tile.
  */
 #define FILES_ROOT	"/root"
-#define FILES_MAX	400
-
 struct fent {
 	char *name;
 	bool dir;
+	int count;		/* a folder's items, -1 until a row shows it */
 	off_t size;
 };
 
@@ -5144,64 +5146,218 @@ static void files_size(off_t n, char *buf, size_t len)
 		snprintf(buf, len, "%.1f GB", n / (1024.0 * 1024 * 1024));
 }
 
-static void files_free_ud(lv_event_t *e)
-{
-	free(lv_event_get_user_data(e));
-}
-
-/* "12 items" (visible ones; counted up to 999) */
-static void files_count(const char *path, char *buf, size_t len)
+/* A folder's items (visible ones; counted up to 999) */
+static int files_count(const char *path)
 {
 	DIR *d = opendir(path);
 	struct dirent *de;
 	int n = 0;
 
-	if (!d) {
-		snprintf(buf, len, "Folder");
-		return;
-	}
+	if (!d)
+		return -2;
 	while (n < 999 && (de = readdir(d)))
 		if (de->d_name[0] != '.')
 			n++;
 	closedir(d);
-	snprintf(buf, len, n == 0 ? "Empty" : n == 1 ? "1 item" : n == 999 ? "999+ items" : "%d items", n);
+	return n;
+}
+
+/*
+ * A folder's page builds rows only for what is on screen: each card is as
+ * tall as all its rows, and a few row objects move and take the entries
+ * that scroll into view. With a row for every entry (6 objects each), a
+ * folder of 300 made every scroll step move ~1800 objects, and dropped
+ * glides to 20-40 fps.
+ */
+#define FROW_H		64	/* a row (m3_row_ex) */
+#define FROW_PAD	4	/* the card's padding */
+#define FROW_POOL	14	/* rows a card has: a screen, landscape or portrait, and a row more each side */
+
+struct fpage {
+	char *path;
+	struct fent *v;
+	int n, nd;		/* entries, folders (first) of them */
+	lv_obj_t *body;
+	struct flist {
+		lv_obj_t *card;
+		int base, n;	/* its entries: v[base], ... v[base + n - 1] */
+		lv_obj_t *row[FROW_POOL];
+		int at[FROW_POOL];	/* the entry (of the card) a row shows; -1 none */
+	} list[2];		/* folders, files */
+};
+
+static int floor_div(int a, int b)
+{
+	return a >= 0 ? a / b : -((-a + b - 1) / b);
+}
+
+static void files_bind(struct fpage *fp, struct flist *l, int j, int i)
+{
+	struct fent *f = &fp->v[l->base + i];
+	lv_obj_t *r = l->row[j], *badge = lv_obj_get_child(r, 0), *col = lv_obj_get_child(r, 1);
+	lv_obj_t *glyph = lv_obj_get_child(badge, 0);
+	const char *icon;
+	lv_color_t bg, fg;
+	char sub[48];
+
+	if (f->dir) {
+		if (f->count == -1) {
+			char full[PATH_MAX];
+
+			snprintf(full, sizeof(full), "%s/%s", fp->path, f->name);
+			f->count = files_count(full);
+		}
+		icon = LV_SYMBOL_DIRECTORY;
+		bg = M.primary_c;
+		fg = M.on_primary_c;
+		snprintf(sub, sizeof(sub), f->count < 0 ? "Folder" : f->count == 0 ? "Empty" :
+			 f->count == 1 ? "1 item" : f->count == 999 ? "999+ items" : "%d items",
+			 f->count);
+	} else {
+		const char *kind;
+		char size[24];
+		bool media;
+
+		icon = files_icon(f->name, &media, &kind);
+		bg = media ? M.tertiary_c : M.secondary_c;
+		fg = media ? M.on_tertiary_c : M.on_secondary_c;
+		files_size(f->size, size, sizeof(size));
+		snprintf(sub, sizeof(sub), "%s, %s", kind, size);	/* (the fonts are ASCII) */
+	}
+	lv_obj_set_pos(r, 0, i * FROW_H);
+	lv_obj_set_user_data(r, (void *)(intptr_t)(l->base + i));
+	lv_obj_set_style_bg_color(badge, bg, 0);
+	lv_obj_set_style_text_color(glyph, fg, 0);
+	lv_label_set_text(glyph, icon);
+	lv_label_set_text(lv_obj_get_child(col, 0), f->name);
+	lv_label_set_text(lv_obj_get_child(col, 1), sub);
+	lv_obj_remove_flag(r, LV_OBJ_FLAG_HIDDEN);
+	l->at[j] = i;
+}
+
+/* Rows for the entries on screen, a row beyond each edge. */
+static void files_sync(struct fpage *fp)
+{
+	lv_area_t bc, cc;
+	int k, i, j;
+
+	lv_obj_get_coords(fp->body, &bc);
+	for (k = 0; k < 2; k++) {
+		struct flist *l = &fp->list[k];
+		int first, last;
+
+		if (!l->card)
+			continue;
+		lv_obj_get_coords(l->card, &cc);
+		first = LV_MAX(floor_div(bc.y1 - cc.y1 - FROW_PAD, FROW_H) - 1, 0);
+		last = LV_MIN(floor_div(bc.y2 - cc.y1 - FROW_PAD, FROW_H) + 2, l->n);
+		for (j = 0; j < FROW_POOL; j++)
+			if (l->row[j] && l->at[j] >= 0 && (l->at[j] < first || l->at[j] >= last)) {
+				l->at[j] = -1;
+				lv_obj_add_flag(l->row[j], LV_OBJ_FLAG_HIDDEN);
+			}
+		for (i = first; i < last; i++) {
+			int free_j = -1;
+
+			for (j = 0; j < FROW_POOL && l->row[j]; j++) {
+				if (l->at[j] == i)
+					break;
+				if (l->at[j] < 0 && free_j < 0)
+					free_j = j;
+			}
+			if (j < FROW_POOL && l->row[j])
+				continue;	/* shown already */
+			if (free_j < 0)
+				break;		/* (no row left: a taller screen than counted) */
+			files_bind(fp, l, free_j, i);
+		}
+	}
 }
 
 static void files_open_dir(const char *path);
 
-static void files_dir_cb(lv_event_t *e)
+static void files_row_cb(lv_event_t *e)
 {
-	files_open_dir(lv_event_get_user_data(e));
+	struct fpage *fp = lv_event_get_user_data(e);
+	lv_obj_t *r = lv_event_get_current_target(e);
+	int i = (int)(intptr_t)lv_obj_get_user_data(r);
+	char full[PATH_MAX], q[PATH_MAX * 2 + 16], cmd[PATH_MAX * 2 + 32];
+	const char *kind;
+	bool media;
+
+	if (i < 0 || i >= fp->n)
+		return;
+	snprintf(full, sizeof(full), "%s/%s", fp->path, fp->v[i].name);
+	if (fp->v[i].dir) {
+		files_open_dir(full);
+		return;
+	}
+	files_icon(fp->v[i].name, &media, &kind);
+	if (!media)
+		return;
+	/* opened as an application from its tile */
+	shq(full, q, sizeof(q));
+	snprintf(cmd, sizeof(cmd), "n72-video %s", q);
+	app_launch(cmd, r);
+}
+
+static void files_page_ev(lv_event_t *e)
+{
+	struct fpage *fp = lv_event_get_user_data(e);
+
+	if (lv_event_get_code(e) != LV_EVENT_DELETE) {
+		files_sync(fp);
+		return;
+	}
+	for (int i = 0; i < fp->n; i++)
+		free(fp->v[i].name);
+	free(fp->v);
+	free(fp->path);
+	free(fp);
 }
 
 static void files_open_dir(const char *path)
 {
 	nav_mark(NULL, path);
 	const char *title = !strcmp(path, FILES_ROOT) ? "Files" : strrchr(path, '/') + 1;
-	struct fent *v = calloc(FILES_MAX, sizeof(*v));
+	struct fpage *fp = calloc(1, sizeof(*fp));
 	lv_obj_t *scr, *body, *c, *row;
 	struct dirent *de;
-	int n = 0, i;
+	int cap = 0, k, j;
 	DIR *d;
 
-	if (!v)
+	if (!fp || !(fp->path = strdup(path))) {
+		free(fp);
 		return;
+	}
 	body = m3_page(title, &scr);
+	fp->body = body;
+	lv_obj_add_event_cb(body, files_page_ev, LV_EVENT_DELETE, fp);
 	d = opendir(path);
-	while (d && n < FILES_MAX && (de = readdir(d))) {
+	while (d && (de = readdir(d))) {
 		struct stat st;
 
 		if (de->d_name[0] == '.' || fstatat(dirfd(d), de->d_name, &st, 0))
 			continue;
-		v[n].name = strdup(de->d_name);
-		if (!v[n].name)
+		if (fp->n == cap) {
+			struct fent *nv = realloc(fp->v, (cap ? cap * 2 : 64) * sizeof(*nv));
+
+			if (!nv)
+				break;
+			fp->v = nv;
+			cap = cap ? cap * 2 : 64;
+		}
+		fp->v[fp->n].name = strdup(de->d_name);
+		if (!fp->v[fp->n].name)
 			break;
-		v[n].dir = S_ISDIR(st.st_mode);
-		v[n].size = st.st_size;
-		n++;
+		fp->v[fp->n].dir = S_ISDIR(st.st_mode);
+		fp->v[fp->n].count = -1;
+		fp->v[fp->n].size = st.st_size;
+		fp->n++;
 	}
-	qsort(v, n, sizeof(*v), fent_cmp);
-	if (!n) {
+	if (fp->n)
+		qsort(fp->v, fp->n, sizeof(*fp->v), fent_cmp);
+	if (!fp->n) {
 		/* empty state: the icon large, a headline, what to do */
 		c = m3_card(body, M.surface_c);
 		lv_obj_set_height(c, LV_SIZE_CONTENT);
@@ -5219,58 +5375,32 @@ static void files_open_dir(const char *path)
 		lv_label_set_long_mode(row, LV_LABEL_LONG_WRAP);
 		lv_obj_set_style_text_align(row, LV_TEXT_ALIGN_CENTER, 0);
 	} else {
-		int nd = 0;
+		while (fp->nd < fp->n && fp->v[fp->nd].dir)
+			fp->nd++;
+		fp->list[0].n = fp->nd;
+		fp->list[1].base = fp->nd;
+		fp->list[1].n = fp->n - fp->nd;
+		for (k = 0; k < 2; k++) {	/* a section and its card: folders, then files */
+			struct flist *l = &fp->list[k];
 
-		while (nd < n && v[nd].dir)
-			nd++;
-		c = NULL;
-		for (i = 0; i < n; i++) {
-			char full[PATH_MAX], sub[48], *ud;
-
-			if (i == 0 || i == nd) {	/* a section and its card: folders, then files */
-				m3_section(body, i < nd ? "Folders" : "Files");
-				c = m3_card(body, M.surface_c);
-				lv_obj_set_style_pad_all(c, 4, 0);
-				lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+			if (!l->n)
+				continue;
+			m3_section(body, k ? "Files" : "Folders");
+			l->card = c = m3_card(body, M.surface_c);
+			lv_obj_set_style_pad_all(c, FROW_PAD, 0);
+			lv_obj_set_height(c, l->n * FROW_H + 2 * FROW_PAD);
+			for (j = 0; j < FROW_POOL && j < l->n; j++) {
+				l->row[j] = m3_row_ex(c, LV_SYMBOL_FILE, M.secondary_c, M.on_secondary_c,
+						      "", "", files_row_cb, fp, NULL, k == 0);
+				lv_obj_add_flag(l->row[j], LV_OBJ_FLAG_HIDDEN);
+				l->at[j] = -1;
 			}
-			snprintf(full, sizeof(full), "%s/%s", path, v[i].name);
-			if (v[i].dir) {
-				files_count(full, sub, sizeof(sub));
-				ud = strdup(full);
-				row = m3_row_ex(c, LV_SYMBOL_DIRECTORY, M.primary_c, M.on_primary_c,
-						v[i].name, sub, ud ? files_dir_cb : NULL, ud, NULL, true);
-			} else {
-				const char *icon, *kind;
-				char size[24];
-				bool media;
-
-				icon = files_icon(v[i].name, &media, &kind);
-				files_size(v[i].size, size, sizeof(size));
-				snprintf(sub, sizeof(sub), "%s, %s", kind, size);	/* (the fonts are ASCII) */
-				ud = NULL;
-				if (media) {
-					char q[PATH_MAX * 2];
-
-					shq(full, q, sizeof(q));
-					ud = malloc(strlen(q) + 16);
-					if (ud)
-						sprintf(ud, "n72-video %s", q);
-				}
-				/* opened as an application from its tile (app_launch_cb) */
-				row = m3_row_ex(c, icon,
-						media ? M.tertiary_c : M.secondary_c,
-						media ? M.on_tertiary_c : M.on_secondary_c,
-						v[i].name, sub, ud ? app_launch_cb : NULL, ud, NULL, false);
-			}
-			if (ud)
-				lv_obj_add_event_cb(row, files_free_ud, LV_EVENT_DELETE, ud);
 		}
-		if (n == FILES_MAX)
-			m3_note(body, "Only the first 400 entries are shown.");
+		lv_obj_add_event_cb(body, files_page_ev, LV_EVENT_SCROLL, fp);
+		lv_obj_add_event_cb(body, files_page_ev, LV_EVENT_SIZE_CHANGED, fp);
+		lv_obj_update_layout(scr);
+		files_sync(fp);
 	}
-	for (i = 0; i < n; i++)
-		free(v[i].name);
-	free(v);
 	if (d)
 		closedir(d);
 	push(scr);
@@ -7457,6 +7587,8 @@ static void ui_reopen(void)
 		shade_set(true, false);
 	else if (!strcmp(p, "paint"))
 		open_paint(NULL);
+	else if (!strncmp(p, "files:", 6))	/* (tests: a folder's page) */
+		files_open_dir(p + 6);
 	else if (strcmp(p, "logs") && strcmp(p, "about") && strcmp(p, "volume") &&
 		 strcmp(p, "keyboard"))
 		open_settings(NULL);
