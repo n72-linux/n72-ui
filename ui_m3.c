@@ -45,6 +45,7 @@ static bool cmd_is_video(const char *cmd);
 static bool app_is_game(void);
 static bool cmd_is_game(const char *cmd);
 static int rot_side, game_rot;	/* (defined with the turning code below) */
+static void open_games(lv_event_t *e);
 static bool ui_turn(int rot);
 static void vc_start(void);
 static void vc_stop(void);
@@ -8586,6 +8587,8 @@ static void ui_reopen(void)
 		open_paint(NULL);
 	else if (!strncmp(p, "files:", 6))	/* (tests: a folder's page) */
 		files_open_dir(p + 6);
+	else if (!strcmp(p, "games"))		/* (tests: the Games page) */
+		open_games(NULL);
 	else if (strcmp(p, "logs") && strcmp(p, "about") && strcmp(p, "volume") &&
 		 strcmp(p, "keyboard"))
 		open_settings(NULL);
