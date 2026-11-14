@@ -46,6 +46,7 @@ static bool app_is_game(void);
 static bool cmd_is_game(const char *cmd);
 static int rot_side, game_rot;	/* (defined with the turning code below) */
 static void open_games(lv_event_t *e);
+static void rot_kick(void);
 static bool ui_turn(int rot);
 static void vc_start(void);
 static void vc_stop(void);
@@ -4961,6 +4962,10 @@ static void za_next(void)
 	case 3:
 		za.phase = 0;
 		lv_screen_load(app_pid > 0 ? app_scr : home_scr);
+		/* a game turns the launcher's layer to its side now that it is in
+		 * front (rot_wanted; during the grow it was not) */
+		if (app_is_game())
+			rot_kick();
 		za_free();
 		if (app_pid <= 0)
 			app_home_ui();

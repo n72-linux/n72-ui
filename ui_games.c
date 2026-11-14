@@ -79,6 +79,23 @@ static void games_name(const char *path, char *out, size_t len)
 	out[n] = 0;
 }
 
+/* ".md" is also Markdown: a text file there is not a Mega Drive game */
+static bool games_is_text(const char *path)
+{
+	unsigned char b[256];
+	FILE *f = fopen(path, "rb");
+	size_t n, i;
+
+	if (!f)
+		return true;
+	n = fread(b, 1, sizeof(b), f);
+	fclose(f);
+	for (i = 0; i < n; i++)
+		if (b[i] < 0x09 || (b[i] > 0x0d && b[i] < 0x20))
+			return false;	/* a control byte: binary */
+	return true;
+}
+
 /* a .bin beside a .cue of the same name is that disc's track, not a game */
 static bool games_is_cue_track(const char *path)
 {
@@ -122,6 +139,8 @@ static void games_scan(const char *dir, int depth, struct game *v, int *n)
 		}
 		if (!S_ISREG(st.st_mode) || !(sys = games_system_of(path, &order)) ||
 		    games_is_cue_track(path))
+			continue;
+		if (!strcasecmp(strrchr(path, '.'), ".md") && games_is_text(path))
 			continue;
 		v[*n].path = strdup(path);
 		if (!v[*n].path)
