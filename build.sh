@@ -5,16 +5,16 @@
 # Kernel uapi headers: linux-build-alpine/usr/include (`make O=../linux-build-alpine ARCH=arm headers`).
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-UI="$ROOT/n72-ui"
+UI=$(cd "$(dirname "$0")" && pwd)
 # GLES=dir: another n72-gles checkout (its build/libGLESv1_CM.a and include/)
 GLES=${GLES:-$ROOT/n72-gles}
 LVGL="$ROOT/lvgl-src/lvgl"
-OUT="$ROOT/n72-ui-build"
+OUT="$ROOT/$(basename "$UI")-build"
 CROSS=${CROSS:-armv6-alpine-linux-musleabihf-}
 CC=${CROSS}gcc
 PG=
 # PROFILE=1: gprof build (n72-ui-build-prof/, not stripped; gmon.out on a clean exit, e.g. --bench)
-[ "$PROFILE" = 1 ] && { OUT="$ROOT/n72-ui-build-prof"; PG=-pg; }
+[ "$PROFILE" = 1 ] && { OUT="$ROOT/$(basename "$UI")-build-prof"; PG=-pg; }
 # link-time optimisation: LVGL's drawing inlined across files (text 11-19% faster on the device)
 LTO=-flto=auto
 CFLAGS="$PG $LTO -O2 -g -idirafter $ROOT/linux-build-alpine/usr/include -idirafter $ROOT/linux-s5l87xx/include/uapi -mcpu=arm1176jzf-s -mfpu=vfpv2 -mfloat-abi=hard -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src -I$GLES/include"
