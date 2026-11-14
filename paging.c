@@ -56,6 +56,7 @@ static struct {
 	int cols, rows0, rowsn;
 	/* touch */
 	bool cand, on, caught;
+	bool lost;			/* this touch is nobody's (the frames failed) */
 	int x0, y0;			/* where the finger came down */
 	int start_off, tx0;		/* offset and finger at take-over */
 	int last_x;
@@ -77,6 +78,8 @@ static struct {
 	lv_draw_buf_t *strip_pic, *bar_pic, *bar_l, *bar_r, *dots_pic, *time_pic[PG_TIME_LEVELS + 1];
 	lv_area_t time_area;		/* the time's place in the bar */
 	unsigned long pic_ver;		/* home_ver they show */
+	unsigned long fail_ver;		/* (no memory for them at this home_ver) */
+	uint32_t fail_ms;
 	int pic_mode, pic_w, pic_dots;
 	bool fb0_ok;			/* /dev/fb0 holds the home wallpaper */
 	int fb0_w;
@@ -327,7 +330,7 @@ static void pg_time_pics(int mode)
 }
 
 /* The pictures, taken again only if home changed (true: they are there). */
-static bool pg_pics(void)
+static bool pg_pics_take(void)
 {
 	int mode = pg_mode(), i;
 
@@ -358,6 +361,26 @@ static bool pg_pics(void)
 	pg.pic_w = W;
 	pg.pic_dots = pg.cur;
 	return true;
+}
+
+/*
+ * (The time hidden and shown again, the plain background set and taken
+ * off: home's look is back as it was, so nothing is drawn again for it.)
+ */
+static bool pg_pics(void)
+{
+	bool ok;
+
+	if (home_scr)
+		lv_obj_update_layout(home_scr);	/* (real changes marked, outside the quiet) */
+	quiet_begin();
+	ok = pg_pics_take();
+	quiet_end();
+	if (!ok) {
+		pg.fail_ver = home_ver;
+		pg.fail_ms = lv_tick_get();
+	}
+	return ok;
 }
 
 /*
@@ -469,7 +492,14 @@ static bool pg_frames_begin(void)
 	} else {
 		m3_screen(pg.scr);
 		if (mode == PG_MODE_BLEND)
-			pg.wp_img = pg_img(wp_pic(WP_HOME), 0, 0);
+		{
+			lv_draw_buf_t *b = wp_pic(WP_HOME);
+
+			if (b && (pg.wp_img = pg_img(b, 0, 0)) && !wp_hold(pg.wp_img, b)) {
+				lv_obj_delete(pg.wp_img);
+				pg.wp_img = NULL;
+			}
+		}
 	}
 	lv_obj_remove_flag(pg.scr, LV_OBJ_FLAG_SCROLLABLE);
 	/*
@@ -570,6 +600,17 @@ static void pg_settle_exec(void *var, int32_t v)
 	pg_frame((int)pg.sp.x);
 }
 
+/* (a stall of seconds outlasted the animation: at the page now) */
+static void pg_settle_late(lv_anim_t *a)
+{
+	LV_UNUSED(a);
+	if (!pg.settling)
+		return;
+	pg_frame(pg.target * W);
+	pg.dir = 0;
+	pg_frames_end(pg.target);
+}
+
 static void pg_settle(double v)
 {
 	lv_anim_t a;
@@ -597,7 +638,7 @@ static void pg_settle(double v)
 	lv_anim_set_exec_cb(&a, pg_settle_exec);
 	lv_anim_set_values(&a, 0, 1);
 	lv_anim_set_duration(&a, 3000);		/* (ends itself well before) */
-	lv_anim_set_completed_cb(&a, NULL);
+	lv_anim_set_completed_cb(&a, pg_settle_late);
 	lv_anim_start(&a);
 }
 
@@ -650,6 +691,12 @@ static void pg_take(int x, int off)
  */
 static bool pg_drag(int phase, int x, int y)
 {
+	if (pg.lost) {		/* (to the lift, then free) */
+		if (phase == 2 || phase == 0)
+			pg.lost = false;
+		if (phase != 0)
+			return true;
+	}
 	if (phase == 0) {
 		pg.cand = false;
 		pg.caught = false;
@@ -682,14 +729,21 @@ static bool pg_drag(int phase, int x, int y)
 			return false;
 		pg.cand = false;
 		ui_touch_lost();	/* (not a tile's press) */
-		if (!pg_frames_begin())
-			return false;
+		if (!pg_frames_begin()) {
+			/* no memory for the frames: no swipe, and not a tile's
+			 * press either (lifting over one would launch it) */
+			pg.lost = true;
+			return true;
+		}
 		pg_take(x, pg.cur * W);
 		pg.tx0 = pg.x0 + (dx > 0 ? PG_SLOP : -PG_SLOP);	/* no jump by the slop */
 		pg.dir = 0;	/* (a fresh drag: no settle to add to) */
 	}
 	if (phase == 2) {
 		pg.on = false;
+		/* caught, then dragged back against the settle: no page on from its target */
+		if (pg.caught && (pg.off - pg.start_off) * pg.dir < 0)
+			pg.dir = 0;
 		if (mono_us() - pg.last_us > 80000)
 			pg.vel = pg.prev_vel = 0;	/* held still before the lift */
 		pg_settle(pg.vel);
@@ -715,8 +769,12 @@ static void pg_warm(lv_timer_t *t)
 	    tr.scr || za.phase || sd.on || lv_anim_count_running() ||
 	    (touch_indev && lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
 		return;
-	if (pg.pic_ver != home_ver || pg.pic_mode != pg_mode() || pg.pic_w != W)
+	if (pg.pic_ver != home_ver || pg.pic_mode != pg_mode() || pg.pic_w != W) {
+		/* (short of memory: not every second, again when home changes) */
+		if (pg.fail_ver == home_ver && lv_tick_elaps(pg.fail_ms) < 30000)
+			return;
 		pg_pics();
+	}
 	else if (pg.pic_mode == PG_MODE_LAYER0)
 		pg_fb0_wallpaper();
 }
@@ -725,7 +783,7 @@ static void pg_warm(lv_timer_t *t)
 static void pg_home_gone(void)
 {
 	if (pg_warm_timer) {
-		lv_timer_delete(pg_warm_timer);
+		awake_timer_delete(pg_warm_timer);
 		pg_warm_timer = NULL;
 	}
 	if (pg.scr) {

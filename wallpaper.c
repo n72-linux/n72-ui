@@ -35,9 +35,20 @@ static void wp_path(char *buf, size_t len, int kind, int turned)
 /* ------------------------------------------------------ the conversion */
 
 struct wp_img {
-	uint8_t *rgb;		/* w x h, 3 bytes a pixel */
+	uint8_t *rgb;		/* w x h, R G B */
 	int w, h;
+	lv_draw_buf_t *db;	/* (a PNG: rgb is inside its decoder's buffer) */
 };
+
+static void wp_img_free(struct wp_img *im)
+{
+	if (im->db)
+		lv_draw_buf_destroy(im->db);
+	else
+		free(im->rgb);
+	im->rgb = NULL;
+	im->db = NULL;
+}
 
 struct wp_jpg {
 	FILE *f;
@@ -60,11 +71,20 @@ static int wp_jpg_out(JDEC *jd, void *bitmap, JRECT *r)
 	const uint8_t *s = bitmap;
 	int w = r->right - r->left + 1, y;
 
-	for (y = r->top; y <= r->bottom; y++) {
-		if (y < im->h && r->left < im->w)
-			memcpy(im->rgb + ((size_t)y * im->w + r->left) * 3, s,
-			       (size_t)LV_MIN(w, im->w - r->left) * 3);
-		s += (size_t)w * 3;
+	/* (LVGL's tjpgd gives B G R) */
+	for (y = r->top; y <= r->bottom; y++, s += (size_t)w * 3) {
+		uint8_t *o;
+		int x, n;
+
+		if (y >= im->h || r->left >= im->w)
+			continue;
+		o = im->rgb + ((size_t)y * im->w + r->left) * 3;
+		n = LV_MIN(w, im->w - r->left);
+		for (x = 0; x < n; x++, o += 3) {
+			o[0] = s[x * 3 + 2];
+			o[1] = s[x * 3 + 1];
+			o[2] = s[x * 3];
+		}
 	}
 	return 1;
 }
@@ -93,6 +113,7 @@ static int wp_load_jpg(const char *path, struct wp_img *im)
 	im->rgb = calloc((size_t)im->w * im->h, 3);
 	if (!im->rgb) {
 		fclose(j.f);
+		fprintf(stderr, "wallpaper: %s: no memory for %d x %d\n", path, im->w, im->h);
 		return -3;
 	}
 	r = jd_decomp(&jd, wp_jpg_out, (uint8_t)s);
@@ -104,14 +125,25 @@ static int wp_load_jpg(const char *path, struct wp_img *im)
 	return 0;
 }
 
-/* PNG: whole, up to 8 megapixels (lodepng decodes all of it); alpha over black */
+/*
+ * PNG: whole, up to 4 megapixels (lodepng decodes all of it; a phone's
+ * screenshot is 3-3.6); alpha over black. 8-bit RGB and RGBA are decoded
+ * as they are, other kinds converted to RGBA, and the pixels are packed to
+ * R G B inside the decoder's own buffer: at 4 megapixels the peak is
+ * the file, 16 MB of buffer and lodepng's 12 MB of scanlines while it
+ * decodes (an 8-megapixel limit, a second buffer for the conversion and a
+ * copy for R G B came to 60-90 MB, next to n72-ui and an application).
+ */
+#define WP_PNG_MAX_PX	4200000
+
 static int wp_load_png(const char *path, struct wp_img *im)
 {
-	unsigned char *rgba = NULL, *data = NULL;
-	unsigned w, h;
-	size_t len = 0;
+	unsigned char *out = NULL, *data = NULL;
+	unsigned w, h, err;
 	FILE *f = fopen(path, "rb");
+	LodePNGState st;
 	long n;
+	int bpp;
 
 	if (!f)
 		return -1;
@@ -119,57 +151,55 @@ static int wp_load_png(const char *path, struct wp_img *im)
 	    !(data = malloc((size_t)n)) || fread(data, 1, (size_t)n, f) != (size_t)n) {
 		fclose(f);
 		free(data);
+		fprintf(stderr, "wallpaper: %s: cannot read it\n", path);
 		return -1;
 	}
 	fclose(f);
-	len = (size_t)n;
-	{
-		LodePNGState st;
-
-		lodepng_state_init(&st);
-		if (lodepng_inspect(&w, &h, &st, data, len) || (uint64_t)w * h > 8000000) {
-			lodepng_state_cleanup(&st);
-			free(data);
-			fprintf(stderr, "wallpaper: %s: not a PNG, or over 8 megapixels\n", path);
-			return -2;
-		}
+	lodepng_state_init(&st);
+	err = lodepng_inspect(&w, &h, &st, data, (size_t)n);
+	if (err || (uint64_t)w * h > WP_PNG_MAX_PX) {
 		lodepng_state_cleanup(&st);
+		free(data);
+		fprintf(stderr, "wallpaper: %s: %s\n", path,
+			err ? "not a PNG" : "over 4 megapixels (a JPEG of it works)");
+		return -2;
 	}
-	{
-		unsigned err = lodepng_decode32(&rgba, &w, &h, data, len);
-
-		if (err) {
-			free(data);
-			fprintf(stderr, "wallpaper: %s: %s\n", path, lodepng_error_text(err));
-			return -2;
-		}
-	}
+	if (st.info_png.color.bitdepth == 8 &&
+	    (st.info_png.color.colortype == LCT_RGB || st.info_png.color.colortype == LCT_RGBA))
+		st.info_raw.colortype = st.info_png.color.colortype;	/* as it is */
+	else
+		st.info_raw.colortype = LCT_RGBA;
+	st.info_raw.bitdepth = 8;
+	bpp = st.info_raw.colortype == LCT_RGB ? 3 : 4;
+	err = lodepng_decode(&out, &w, &h, &st, data, (size_t)n);
+	lodepng_state_cleanup(&st);
 	free(data);
-	/* (LVGL's lodepng: an ARGB8888 draw buffer, B G R A bytes, straight alpha) */
+	if (err || !out) {
+		if (out)
+			lv_draw_buf_destroy((lv_draw_buf_t *)out);
+		fprintf(stderr, "wallpaper: %s: %s\n", path, err ? lodepng_error_text(err) : "no memory");
+		return -2;
+	}
+	/*
+	 * (LVGL's lodepng gives an LVGL draw buffer, its pixels packed in the
+	 * PNG's own order: R G B or R G B A, straight alpha)
+	 */
+	im->db = (lv_draw_buf_t *)out;
+	im->rgb = im->db->data;
+	im->w = (int)w;
+	im->h = (int)h;
 	{
-		lv_draw_buf_t *db = (lv_draw_buf_t *)rgba;
-		unsigned y, x;
+		const uint8_t *q = im->rgb;
+		uint8_t *o = im->rgb;
+		size_t i, np = (size_t)w * h;
 
-		im->w = (int)w;
-		im->h = (int)h;
-		im->rgb = malloc((size_t)w * h * 3);
-		if (!im->rgb) {
-			lv_draw_buf_destroy(db);
-			return -3;
+		for (i = 0; i < np; i++, q += bpp, o += 3) {	/* (o never passes q) */
+			unsigned a = bpp == 4 ? q[3] : 255, r = q[0], g = q[1], b = q[2];
+
+			o[0] = (uint8_t)(r * a / 255);
+			o[1] = (uint8_t)(g * a / 255);
+			o[2] = (uint8_t)(b * a / 255);
 		}
-		for (y = 0; y < h; y++) {
-			const uint8_t *q = db->data + (size_t)y * db->header.stride;
-			uint8_t *o = im->rgb + (size_t)y * w * 3;
-
-			for (x = 0; x < w; x++, q += 4, o += 3) {
-				unsigned a = q[3];
-
-				o[0] = (uint8_t)(q[2] * a / 255);
-				o[1] = (uint8_t)(q[1] * a / 255);
-				o[2] = (uint8_t)(q[0] * a / 255);
-			}
-		}
-		lv_draw_buf_destroy(db);
 	}
 	return 0;
 }
@@ -179,7 +209,7 @@ static int wp_load_png(const char *path, struct wp_img *im)
  * an area average when shrinking (each output pixel the mean of the source
  * pixels it covers), bilinear when growing.
  */
-static void wp_fit(const struct wp_img *im, uint32_t *out, int dw, int dh)
+static int wp_fit(const struct wp_img *im, uint32_t *out, int dw, int dh)
 {
 	int cx, cy, cw, ch, x, y;
 
@@ -200,7 +230,7 @@ static void wp_fit(const struct wp_img *im, uint32_t *out, int dw, int dh)
 		if (!rows || !xs) {
 			free(rows);
 			free(xs);
-			return;
+			return -1;
 		}
 		for (x = 0; x <= dw; x++)
 			xs[x] = cx + (int)((int64_t)x * cw / dw);
@@ -243,7 +273,7 @@ static void wp_fit(const struct wp_img *im, uint32_t *out, int dw, int dh)
 		}
 		free(rows);
 		free(xs);
-		return;
+		return 0;
 	}
 	for (y = 0; y < dh; y++) {
 		float fy = cy + (y + 0.5f) * ch / dh - 0.5f;
@@ -268,6 +298,7 @@ static void wp_fit(const struct wp_img *im, uint32_t *out, int dw, int dh)
 			out[(size_t)y * dw + x] = px;
 		}
 	}
+	return 0;
 }
 
 /*
@@ -385,13 +416,14 @@ static void wp_meta_read(void)
 	if (!f)
 		return;
 	while (fgets(line, sizeof(line), f)) {
-		if (sscanf(line, "home_luma=%d", &v) == 1)
+		/* (out of range: the defaults) */
+		if (sscanf(line, "home_luma=%d", &v) == 1 && v >= 0 && v <= 255)
 			wp.luma[WP_HOME] = v;
-		else if (sscanf(line, "lock_luma=%d", &v) == 1)
+		else if (sscanf(line, "lock_luma=%d", &v) == 1 && v >= 0 && v <= 255)
 			wp.luma[WP_LOCK] = v;
-		else if (sscanf(line, "hue=%d", &v) == 1)
+		else if (sscanf(line, "hue=%d", &v) == 1 && v >= -1 && v < 360)
 			wp.hue = v;
-		else if (sscanf(line, "sat=%d", &v) == 1)
+		else if (sscanf(line, "sat=%d", &v) == 1 && v >= 0 && v <= 100)
 			wp.sat = v;
 	}
 	fclose(f);
@@ -432,6 +464,10 @@ static int wp_convert_main(int argc, char **argv)
 			wp_path(path, sizeof(path), k, t);
 			unlink(path);
 		}
+		if (k == WP_HOME) {	/* (its accent goes with it) */
+			wp.hue = -1;
+			wp_meta_write();
+		}
 		return 0;
 	}
 	if (n > 4 && !strcasecmp(src + n - 4, ".png"))
@@ -439,32 +475,41 @@ static int wp_convert_main(int argc, char **argv)
 	else
 		r = wp_load_jpg(src, &im);
 	if (r) {
-		free(im.rgb);
+		wp_img_free(&im);
 		return 2;
 	}
 	px = malloc((size_t)WP_PW * WP_PH * 4);
-	if (!px)
+	if (!px) {
+		wp_img_free(&im);
+		fprintf(stderr, "wallpaper: no memory\n");
 		return 3;
+	}
 	for (k = 0; k < WP_KINDS; k++) {
 		if (!kinds[k])
 			continue;
 		for (t = 0; t < 2; t++) {
 			int w = t ? WP_PH : WP_PW, h = t ? WP_PW : WP_PH;
 
-			wp_fit(&im, px, w, h);
-			if (!t && (k == WP_HOME || !kinds[WP_HOME]))
+			if (wp_fit(&im, px, w, h)) {
+				free(px);
+				wp_img_free(&im);
+				fprintf(stderr, "wallpaper: no memory to resize it\n");
+				return 3;
+			}
+			if (!t && k == WP_HOME)	/* (the accent is the home picture's) */
 				wp_accent(px, w * h, &wp.hue, &wp.sat);	/* (before the shading) */
 			wp_finish(k, px, w, h, t ? NULL : &wp.luma[k]);
 			if (wp_write(k, t, px, w, h)) {
 				free(px);
-				free(im.rgb);
+				wp_img_free(&im);
+				fprintf(stderr, "wallpaper: cannot write it: %s\n", strerror(errno));
 				return 4;
 			}
 		}
 	}
 	wp_meta_write();
 	free(px);
-	free(im.rgb);
+	wp_img_free(&im);
 	return 0;
 }
 
@@ -497,20 +542,91 @@ static lv_draw_buf_t *wp_read(int kind, int turned)
 	return b;
 }
 
-/* (Re)read what is set; the frames of the other orientation on demand. */
+/*
+ * A frame is freed when the table lets go of it (a new picture, the other
+ * shape after a turn) and no image shows it any more: the lock screen is
+ * kept while locked through a rebuild of home, and a page swipe's frames
+ * and the old home last into the rebuild. (Freeing them under their
+ * images was a use-after-free; keeping every frame until the next rebuild
+ * held up to 4 x 600 KB of the GPU pool.)
+ */
+#define WP_HOLDS	8
+static struct {
+	lv_draw_buf_t *b;
+	int refs;
+	bool gone;		/* out of the table: freed with its last image */
+} wp_holds[WP_HOLDS];
+
+static void wp_free(lv_draw_buf_t *b)
+{
+	lv_image_cache_drop(b);
+	lv_draw_buf_destroy(b);
+}
+
+static int wp_hold_find(const lv_draw_buf_t *b)
+{
+	for (int i = 0; i < WP_HOLDS; i++)
+		if (wp_holds[i].b == b)
+			return i;
+	return -1;
+}
+
+static void wp_image_gone(lv_event_t *e)
+{
+	lv_draw_buf_t *b = lv_event_get_user_data(e);
+	int i = wp_hold_find(b);
+
+	if (i < 0 || --wp_holds[i].refs > 0)
+		return;
+	if (wp_holds[i].gone)
+		wp_free(b);
+	wp_holds[i].b = NULL;
+	wp_holds[i].gone = false;
+}
+
+/* @img shows @b: @b stays until @img is deleted. false: not kept (show nothing). */
+static bool wp_hold(lv_obj_t *img, lv_draw_buf_t *b)
+{
+	int i = wp_hold_find(b);
+
+	if (i < 0) {
+		if ((i = wp_hold_find(NULL)) < 0) {
+			fprintf(stderr, "n72-ui: more than %d wallpaper images\n", WP_HOLDS);
+			return false;
+		}
+		wp_holds[i].b = b;
+		wp_holds[i].refs = 0;
+		wp_holds[i].gone = false;
+	}
+	wp_holds[i].refs++;
+	lv_obj_add_event_cb(img, wp_image_gone, LV_EVENT_DELETE, b);
+	return true;
+}
+
+static void wp_drop(int kind, int turned)
+{
+	lv_draw_buf_t *b = wp.pic[kind][turned];
+	int i;
+
+	if (!b)
+		return;
+	wp.pic[kind][turned] = NULL;
+	if ((i = wp_hold_find(b)) >= 0)
+		wp_holds[i].gone = true;
+	else
+		wp_free(b);
+}
+
+/* (Re)read what is set: at the start, and after a conversion. Frames on demand. */
 static void wp_load(void)
 {
 	int k, t;
 
 	for (k = 0; k < WP_KINDS; k++)
 		for (t = 0; t < 2; t++)
-			if (wp.pic[k][t]) {
-				lv_image_cache_drop(wp.pic[k][t]);
-				lv_draw_buf_destroy(wp.pic[k][t]);
-				wp.pic[k][t] = NULL;
-			}
+			wp_drop(k, t);
 	wp_meta_read();
-	if (icon_shadow) {	/* (its strength follows the picture) */
+	if (icon_shadow) {	/* (its strength follows the picture; home is built again) */
 		lv_image_cache_drop(icon_shadow);
 		lv_draw_buf_destroy(icon_shadow);
 		icon_shadow = NULL;
@@ -521,15 +637,21 @@ static void wp_load(void)
 		wp_path(path, sizeof(path), k, 0);
 		wp.set[k] = !access(path, R_OK);
 	}
+	wp.loaded = true;
 }
 
-/* The frame for @kind at the screen's current shape, or NULL (none set). */
+/*
+ * The frame for @kind at the screen's current shape, or NULL (none set).
+ * The other shape's goes (freed once nothing shows it): a turn back reads
+ * it again, ~600 KB.
+ */
 static lv_draw_buf_t *wp_pic(int kind)
 {
 	int t = W > H;
 
 	if (!wp.set[kind])
 		return NULL;
+	wp_drop(kind, !t);
 	if (!wp.pic[kind][t])
 		wp.pic[kind][t] = wp_read(kind, t);
 	return wp.pic[kind][t];
@@ -544,6 +666,10 @@ static bool wp_put(lv_obj_t *scr, int kind)
 	if (!b)
 		return false;
 	i = lv_image_create(scr);
+	if (!wp_hold(i, b)) {
+		lv_obj_delete(i);
+		return false;
+	}
 	lv_image_set_src(i, b);
 	lv_obj_remove_flag(i, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_add_flag(i, LV_OBJ_FLAG_IGNORE_LAYOUT);
@@ -561,27 +687,85 @@ static char *wp_choice;		/* the picture picked, waiting for where */
 
 static void open_wallpaper(lv_event_t *e);
 
+/*
+ * A conversion is over: the screens are built again with the new frames,
+ * as after a turn (ui_rebuild), when nothing is in the way: not while dark,
+ * locked (the lock screen goes when unlocked), a slide or a home swipe.
+ * With the home picture's colours in use the palette changes too, which
+ * only a restart makes: that waits for no application as well (a restart
+ * would lose it, and the lock).
+ */
+static lv_timer_t *wp_apply_t;
+static bool wp_apply_restart;
+
+static bool wp_apply_try(void)
+{
+	if (screen_off || locked || tr.scr || sc.owner || pg.on || pg.settling)
+		return false;
+	if (wp_apply_restart) {
+		if (app_pid > 0)
+			return false;
+		ui_restart("wallpaper");
+	}
+	wp_load();
+	ui_rebuild(app_pid <= 0);
+	return true;
+}
+
+static void wp_apply_cb(lv_timer_t *t)
+{
+	if (wp_apply_try()) {
+		lv_timer_delete(t);
+		wp_apply_t = NULL;
+	}
+}
+
+static void wp_status(const char *text)
+{
+	if (wp_status_lbl)
+		lv_label_set_text(wp_status_lbl, text);
+}
+
 static void wp_done(const char *out, void *ud)
 {
-	LV_UNUSED(out);
-	LV_UNUSED(ud);
+	const char *st = strstr(out, "wp-status ");
+	bool home = (intptr_t)ud;
+
 	wp.busy = false;
-	/* the screens are built again with it (as after a theme change) */
-	ui_restart(NULL);
+	if (!st || atoi(st + 10) != 0) {
+		/* the converter's first line says why */
+		char why[160];
+		size_t n = strcspn(out, "\n");
+
+		if (!strncmp(out, "wallpaper: ", 11))
+			out += 11, n -= 11;
+		snprintf(why, sizeof(why), "The picture could not be used: %.*s", (int)LV_MIN(n, 120), out);
+		fprintf(stderr, "n72-ui: %s\n", why);
+		wp_status(why);
+		return;
+	}
+	wp_status("");
+	wp_apply_restart |= home && conf.wp_accent;
+	if (!wp_apply_t && !wp_apply_try())
+		wp_apply_t = lv_timer_create(wp_apply_cb, 500, NULL);
 }
 
 static void wp_run(const char *src, const char *what)
 {
 	char q[600], cmd[700];
+	bool home = strcmp(what, "lock") && strcmp(what, "none-lock");
 
 	if (wp.busy)
 		return;
 	shq(src, q, sizeof(q));
-	snprintf(cmd, sizeof(cmd), "nice -n 10 /proc/%d/exe --wallpaper %s %s 2>&1", (int)getpid(), q, what);
+	snprintf(cmd, sizeof(cmd), "nice -n 10 /proc/%d/exe --wallpaper %s %s 2>&1; echo \"wp-status $?\"",
+		 (int)getpid(), q, what);
+	if (job_run(cmd, NULL, wp_done, (void *)(intptr_t)home)) {
+		wp_status("The picture could not be prepared (no memory to start it)");
+		return;
+	}
 	wp.busy = true;
-	if (wp_status_lbl)
-		lv_label_set_text(wp_status_lbl, "Preparing the picture...");
-	job_run(cmd, NULL, wp_done, NULL);
+	wp_status("Preparing the picture...");
 }
 
 static void wp_where_cb(lv_event_t *e)
@@ -610,15 +794,16 @@ static bool wp_is_picture(const char *n)
 					!strcasecmp(n + l - 4, ".png"));
 }
 
-static void wp_pick_cb(lv_event_t *e)
+static void wp_pick_open(lv_event_t *e)
 {
-	const char *name = lv_event_get_user_data(e);
-	char path[512];
+	const char *name;
 	lv_obj_t *scr, *body, *c;
 
-	snprintf(path, sizeof(path), WP_PICTURES "/%s", name);
-	free(wp_choice);
-	wp_choice = strdup(path);
+	LV_UNUSED(e);
+	if (!wp_choice)
+		return;
+	nav_mark(wp_pick_open, NULL);	/* (built again after a turn or a new picture) */
+	name = strrchr(wp_choice, '/') ? strrchr(wp_choice, '/') + 1 : wp_choice;
 	body = m3_page(name, &scr);
 	c = m3_card(body, M.surface_c);
 	lv_obj_set_style_pad_all(c, 4, 0);
@@ -628,8 +813,20 @@ static void wp_pick_cb(lv_event_t *e)
 	m3_row(c, LV_SYMBOL_IMAGE, "Both", "Home and lock screens", wp_where_cb, "both", NULL);
 	wp_status_lbl = m3_label(body, wp.busy ? "Preparing the picture..." : "", &lv_font_montserrat_14,
 				 M.on_surface_v);
+	lv_obj_set_width(wp_status_lbl, lv_pct(100));
+	lv_label_set_long_mode(wp_status_lbl, LV_LABEL_LONG_WRAP);	/* (an error's reason) */
 	obj_track(&wp_status_lbl);
 	push(scr);
+}
+
+static void wp_pick_cb(lv_event_t *e)
+{
+	char path[512];
+
+	snprintf(path, sizeof(path), WP_PICTURES "/%s", (const char *)lv_event_get_user_data(e));
+	free(wp_choice);
+	wp_choice = strdup(path);
+	wp_pick_open(NULL);
 }
 
 static void wp_names_free(lv_event_t *e)

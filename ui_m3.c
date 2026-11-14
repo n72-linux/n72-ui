@@ -92,11 +92,13 @@ static struct {
 	int luma[WP_KINDS];			/* mean luma under the app grid / clock */
 	int hue, sat;				/* the picture's own accent; hue -1: none */
 	bool busy;				/* a conversion is running */
+	bool loaded;				/* what is set has been read (wp_load) */
 } wp = { .hue = -1 };
 static void wp_load(void);
 static bool wp_put(lv_obj_t *scr, int kind);
 static bool home_wp;		/* home is built over a wallpaper */
 static lv_draw_buf_t *wp_pic(int kind);
+static bool wp_hold(lv_obj_t *img, lv_draw_buf_t *b);
 static bool pg_drag(int phase, int x, int y);
 static void pg_fb0_dirty(void);
 static void pg_abort(void);
@@ -418,13 +420,17 @@ static void row_press_cb(lv_event_t *e)
 	uint32_t held;
 
 	if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
-		if (row_hold_timer)
+		if (row_hold_timer) {	/* (the last tap's highlight goes now) */
+			lv_timer_delete(row_hold_timer);
 			row_hold_end(NULL);
+		}
 		row_press_ms = lv_tick_get();
 		return;
 	}
 	held = lv_tick_elaps(row_press_ms);	/* (released) */
-	if (held >= ROW_HOLD_MS || !lv_obj_is_valid(r))
+	/* (a flick that started on the row is a scroll, not a tap: no highlight) */
+	if (held >= ROW_HOLD_MS || !lv_obj_is_valid(r) ||
+	    (lv_indev_active() && lv_indev_get_scroll_obj(lv_indev_active())))
 		return;
 	lv_obj_add_state(r, LV_STATE_PRESSED);	/* (LVGL took it off already) */
 	row_held = r;
@@ -740,6 +746,20 @@ static void tr_done_cb(lv_anim_t *a)
 	tr_finish();
 }
 
+/*
+ * Looks changed for a picture and changed back (hidden, a colour): no area
+ * marked, nothing drawn again on screen for it. (Nested: a counter.)
+ */
+static void quiet_begin(void)	/* (the layout brought up to date first, outside) */
+{
+	lv_display_enable_invalidation(NULL, false);
+}
+
+static void quiet_end(void)
+{
+	lv_display_enable_invalidation(NULL, true);
+}
+
 static lv_draw_buf_t *snap(lv_obj_t *obj, lv_color_format_t cf)
 {
 	lv_draw_buf_t *b;
@@ -859,10 +879,13 @@ static bool psl_take(struct psl *s, lv_obj_t *live)
 	if (s->pic && s->sig && !strcmp(sig, s->pic_sig))
 		return true;		/* (still what it shows) */
 	tr_free(&s->pic);
+	lv_obj_update_layout(live);	/* (what moved for real is marked: outside the quiet) */
+	quiet_begin();		/* (over an application, a redraw of its place) */
 	lv_obj_remove_flag(live, LV_OBJ_FLAG_HIDDEN);	/* (a hidden object draws nothing) */
 	s->pic = snap(live, LV_COLOR_FORMAT_ARGB8888);
 	if (hidden)
 		lv_obj_add_flag(live, LV_OBJ_FLAG_HIDDEN);
+	quiet_end();
 	if (!s->pic)
 		return false;
 	mbx_gpu_premultiply_buf(s->pic);	/* exact copy on the transparent display */
@@ -961,6 +984,22 @@ static void psl_wake(lv_obj_t *live)
 	s->resting = false;
 	psl_img_free(s);
 	lv_obj_remove_flag(live, LV_OBJ_FLAG_HIDDEN);
+}
+
+/*
+ * A touch on @live's place while it slides in: the slide ends there and
+ * then, and the object itself takes the touch (hidden, it would get
+ * nothing: the touch was lost). A resting picture: the object again.
+ */
+static void psl_touch(lv_obj_t *live)
+{
+	struct psl *s = psl_of(live);
+
+	if (!s || !s->img || (s->hide && !s->resting))
+		return;
+	if (!s->resting)
+		psl_finish(s);
+	psl_wake(live);
 }
 
 /* Resting, and its look changed since the picture: the object again. */
@@ -1350,6 +1389,8 @@ static struct {
 	int32_t done;	/* px moved so far (along sign) */
 	bool lv_anim_killed;
 	bool on;
+	lv_obj_t *caught;	/* stopped past an end by a press: back to it on the lift */
+	bool caught_hor;
 } gl;
 
 static struct {
@@ -1561,6 +1602,8 @@ static void glide_back(lv_obj_t *obj, bool hor, int out, int32_t e0, float v)
 
 /* a press anywhere stops a glide; fast scrolling only goes on from a
  * glide caught within FAST_GAP_MS of its lift */
+static int32_t glide_past(lv_obj_t *obj, bool hor, int *out);
+
 static void ts_press_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
@@ -1568,7 +1611,27 @@ static void ts_press_cb(lv_event_t *e)
 		fs_reset();
 	fs.start_mult = fs.mult;
 	fs.slow = false;
+	gl.caught = NULL;
+	if (gl.on && gl.obj && lv_obj_is_valid(gl.obj) && glide_past(gl.obj, gl.hor, NULL) > 0) {
+		/* held past an end: a drag goes on from there, a lift goes back (iOS) */
+		gl.caught = gl.obj;
+		gl.caught_hor = gl.hor;
+	}
 	glide_stop();
+}
+
+/* the lift after a press that caught a list past its end, without a drag */
+static void ts_release_cb(lv_event_t *e)
+{
+	lv_obj_t *obj = gl.caught;
+	int32_t e0;
+	int out;
+
+	LV_UNUSED(e);
+	gl.caught = NULL;
+	if (!obj || gl.on || !lv_obj_is_valid(obj) || (e0 = glide_past(obj, gl.caught_hor, &out)) <= 0)
+		return;
+	glide_back(obj, gl.caught_hor, out, e0, 0);
 }
 
 /*
@@ -1656,6 +1719,17 @@ static float ts_velocity(bool hor)
 	return (hor ? ts.x[i] - ts.x[j] : ts.y[i] - ts.y[j]) / dt;
 }
 
+/* px @obj is past an end (0: within them); @out: +1 past the top/left, -1 the other */
+static int32_t glide_past(lv_obj_t *obj, bool hor, int *out)
+{
+	int32_t a = hor ? lv_obj_get_scroll_left(obj) : lv_obj_get_scroll_top(obj);
+	int32_t b = hor ? lv_obj_get_scroll_right(obj) : lv_obj_get_scroll_bottom(obj);
+
+	if (out)
+		*out = a < 0 ? 1 : -1;
+	return a < 0 ? -a : b < 0 ? -b : 0;
+}
+
 static void fling_cb(lv_event_t *e)
 {
 	lv_obj_t *obj = lv_event_get_current_target(e);
@@ -1669,21 +1743,39 @@ static void fling_cb(lv_event_t *e)
 	if (!in)
 		return;
 	hor = in->pointer.scroll_dir == LV_DIR_HOR;
-	/* LVGL's throw off: the glide below replaces it */
+	gl.caught = NULL;	/* (a drag after the catch: this lift decides) */
+	/*
+	 * LVGL's throw off, and its scroll ended here: the glide below
+	 * replaces both. (Left to it, its throw handler, an animation that
+	 * starts after this, springs a list let go past an end back itself:
+	 * with the glide's own way back, two springs at once, the list
+	 * coming to rest inside its end.)
+	 */
 	in->pointer.scroll_throw_vect.x = in->pointer.scroll_throw_vect.y = 0;
 	in->pointer.scroll_throw_vect_ori = in->pointer.scroll_throw_vect;
+	in->pointer.scroll_obj = NULL;
+	in->pointer.scroll_dir = LV_DIR_NONE;
+	lv_obj_send_event(obj, LV_EVENT_SCROLL_END, in);	/* (what LVGL would send) */
+	if (!lv_obj_is_valid(obj))
+		return;
 	v = ts_velocity(hor);
 	sign = v > 0 ? 1 : -1;
 	/* past an end (pulled out): back to it, with the lift's speed if outwards */
-	back = hor ? LV_MIN(lv_obj_get_scroll_left(obj), lv_obj_get_scroll_right(obj)) :
-		     LV_MIN(lv_obj_get_scroll_top(obj), lv_obj_get_scroll_bottom(obj));
-	if (back < 0) {
-		/* out +1: pulled past the top/left (content moved down/right) */
-		int out = (hor ? lv_obj_get_scroll_left(obj) : lv_obj_get_scroll_top(obj)) < 0 ? 1 : -1;
+	{
+		int out;
 
-		fs_reset();
-		glide_back(obj, hor, out, -back, v);
-		return;
+		back = glide_past(obj, hor, &out);
+		/*
+		 * Thrown inwards hard enough to cross the end: an ordinary
+		 * glide from where it is (iOS), not a spring back to the end
+		 * after carrying past it.
+		 */
+		if (back > 0 && !(sign != out && fabsf(v) >= GLIDE_MIN_V &&
+				  fabsf(v) / 1000.0 * GLIDE_F / (1.0 - GLIDE_F) > back)) {
+			fs_reset();
+			glide_back(obj, hor, out, back, v);
+			return;
+		}
 	}
 	if (fs.slow || (fs.sign && sign != fs.sign))
 		fs_reset();
@@ -1722,8 +1814,10 @@ static void fling_accel(lv_obj_t *obj)
 static void glide_init(void)
 {
 	for (lv_indev_t *in = lv_indev_get_next(NULL); in; in = lv_indev_get_next(in))
-		if (lv_indev_get_type(in) == LV_INDEV_TYPE_POINTER)
+		if (lv_indev_get_type(in) == LV_INDEV_TYPE_POINTER) {
 			lv_indev_add_event_cb(in, ts_press_cb, LV_EVENT_PRESSED, NULL);
+			lv_indev_add_event_cb(in, ts_release_cb, LV_EVENT_RELEASED, NULL);
+		}
 }
 
 /* scroll-cached page bodies, to find the one on the active screen */
@@ -2415,8 +2509,8 @@ static void job_poll(lv_timer_t *t)
 	free(j);
 }
 
-static void job_run(const char *cmd, lv_obj_t *owner,
-		    void (*done)(const char *out, void *ud), void *ud);
+static int job_run(const char *cmd, lv_obj_t *owner,
+		   void (*done)(const char *out, void *ud), void *ud);
 
 /* A job asked for during a page slide, started once the slide is over. */
 struct job_later {
@@ -2439,8 +2533,9 @@ static void job_later_cb(lv_timer_t *t)
 	free(l);
 }
 
-static void job_run(const char *cmd, lv_obj_t *owner,
-		    void (*done)(const char *out, void *ud), void *ud)
+/* 0: started (or to start after the slide); -1: it could not be (@done is not called) */
+static int job_run(const char *cmd, lv_obj_t *owner,
+		   void (*done)(const char *out, void *ud), void *ud)
 {
 	struct job *j;
 	posix_spawn_file_actions_t fa;
@@ -2460,14 +2555,14 @@ static void job_run(const char *cmd, lv_obj_t *owner,
 			l->done = done;
 			l->ud = ud;
 			lv_timer_create(job_later_cb, 50, l);
-			return;
+			return 0;
 		}
 		free(l);
 	}
 	j = calloc(1, sizeof(*j));
 	if (!j || pipe(p)) {
 		free(j);
-		return;
+		return -1;
 	}
 	/*
 	 * posix_spawn, not fork: glibc's is a vfork-style clone, so the page
@@ -2486,7 +2581,7 @@ static void job_run(const char *cmd, lv_obj_t *owner,
 	if (j->pid < 0) {
 		close(p[0]);
 		free(j);
-		return;
+		return -1;
 	}
 	fcntl(p[0], F_SETFL, O_NONBLOCK);
 	j->fd = p[0];
@@ -2494,6 +2589,7 @@ static void job_run(const char *cmd, lv_obj_t *owner,
 	j->ud = ud;
 	j->owner = owner;
 	lv_timer_create(job_poll, 150, j);
+	return 0;
 }
 
 /* Shell-quote @s into @out ('...' with ' escaped). */
@@ -3751,7 +3847,8 @@ static void app_bar_update(void)
 	/* showing as its picture: the bar itself if that is old now; hidden:
 	 * the picture for the next slide, while nothing moves */
 	psl_check(app_bar);
-	if (!app_bar_shown && !lv_anim_count_running() && !(touch_indev &&
+	/* (only over the application: elsewhere the bar is not needed) */
+	if (!app_bar_shown && lv_screen_active() == app_scr && !lv_anim_count_running() && !(touch_indev &&
 	    lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
 		psl_warm(app_bar, app_bar_sig);
 }
@@ -4458,7 +4555,9 @@ static bool ui_drag(int phase, int x, int y)
 	if (locked || ul.scr)
 		return ul_drag(phase, y);
 	if (phase == 0 && app_bar && y < APP_BAR_H)
-		psl_wake(app_bar);	/* (the bar itself takes its touches) */
+		psl_touch(app_bar);	/* (the bar itself takes its touches) */
+	if (phase == 0 && kbd.obj && kbd_wants(x, y))
+		psl_touch(kbd.obj);
 	if (pg_drag(phase, x, y))	/* sideways on home: the pages */
 		return true;
 	if (phase == 0) {
@@ -6136,7 +6235,8 @@ static void build_home(void)
 	lv_obj_t *bar, *apps;
 
 	conf_load();
-	wp_load();	/* (before the theme: its colours may come from the wallpaper) */
+	if (!wp.loaded)	/* (before the theme: its colours may come from the wallpaper) */
+		wp_load();
 	m3_apply_theme();
 	home_scr = lv_obj_create(NULL);
 	m3_screen(home_scr);
