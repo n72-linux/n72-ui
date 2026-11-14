@@ -47,6 +47,7 @@
 #include <linux/netlink.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <linux/fb.h>
 #include <sys/klog.h>
 #include <sys/socket.h>
 #include <sys/reboot.h>
@@ -2004,6 +2005,30 @@ int main(int argc, char **argv)
 	tty_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
 	if (tty_fd >= 0)
 		ioctl(tty_fd, KDSETMODE, KD_GRAPHICS);
+	/*
+	 * Layer 0 (/dev/fb0) still holds what the console drew while no
+	 * launcher ran (boot, or a restart: the kernel's messages). It shows
+	 * wherever layer 1 is transparent before an application or the
+	 * wallpaper paints it (an app's card growing over home): black now.
+	 */
+	{
+		int fd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+		struct fb_var_screeninfo vi;
+
+		if (fd >= 0) {
+			if (ioctl(fd, FBIOGET_VSCREENINFO, &vi) == 0 && vi.bits_per_pixel == 32) {
+				size_t len = (size_t)vi.xres_virtual * vi.yres_virtual * 4;
+				uint32_t *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+				if (p != MAP_FAILED) {
+					for (size_t i = 0; i < len / 4; i++)
+						p[i] = 0xff000000u;
+					munmap(p, len);
+				}
+			}
+			close(fd);
+		}
+	}
 	atexit(restore_tty);
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
