@@ -157,8 +157,8 @@ static void dock_save(void)
 	size_t len = 0;
 
 	conf.dock[0] = 0;
-	for (i = 0; i < n; i++)
-		len += snprintf(conf.dock + len, sizeof(conf.dock) - LV_MIN(len, sizeof(conf.dock)), "%s%s",
+	for (i = 0; i < n && len < sizeof(conf.dock); i++)
+		len += snprintf(conf.dock + len, sizeof(conf.dock) - len, "%s%s",
 				i ? "|" : "", tile_name(lv_obj_get_child(home_dock, i)));
 	conf.dock_set = true;
 	conf_save_later();
