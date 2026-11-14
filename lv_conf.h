@@ -771,7 +771,7 @@
 #endif
 
 /*LODEPNG decoder library*/
-#define LV_USE_LODEPNG 0
+#define LV_USE_LODEPNG 1	/* (wallpaper.c, --wallpaper only) */
 
 /*PNG decoder(libpng) library*/
 #define LV_USE_LIBPNG 0
@@ -781,7 +781,7 @@
 
 /* JPG + split JPG decoder library.
  * Split JPG is a custom format optimized for embedded systems. */
-#define LV_USE_TJPGD 0
+#define LV_USE_TJPGD 1	/* (wallpaper.c, --wallpaper only) */
 
 /* libjpeg-turbo decoder library.
  * Supports complete JPEG specifications and high-performance JPEG decoding. */
@@ -1120,9 +1120,10 @@
 /*Vector graphic demo*/
 #define LV_USE_DEMO_VECTOR_GRAPHIC  0
 
-/* n72: iOS 4.2.1 UIScrollView (n72-ramboot/ui/IOS-PAGING.md 2.1-2.5) */
+/* n72: scroll elasticity, scrollbar minimum size, and JPEG prescaling */
 #define ELASTIC_SLOWNESS_FACTOR 2	/* past an end the content moves at half the finger */
 #define SCROLLBAR_MIN_SIZE 36		/* the shortest scroll indicator */
+#define JD_USE_SCALE 1			/* tjpgd decodes at 1/2..1/8 (wallpaper.c) */
 
 /*--END OF LV_CONF_H--*/
 

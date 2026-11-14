@@ -68,7 +68,8 @@ static struct {
 	int rotlock;		/* with it off: the turn it was left in, 0, 90 or 270 */
 	int bright;		/* brightness %, 0 = as it is */
 	int wifi, bt;		/* left on (1) or off (0); -1 not set */
-} conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1 };
+	bool wp_accent;		/* the colours from the home wallpaper (wallpaper.c) */
+} conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1, false };
 
 /*
  * Auto-rotate on: the screen turns with the iPod. Off: it stays as it was
@@ -82,6 +83,21 @@ static const struct { const char *name; uint16_t hue; uint8_t sat; } accents[] =
 	{ "Green", 135, 40 }, { "Amber", 38, 70 }, { "Rose", 340, 55 },
 };
 #define N_ACCENTS ((int)(sizeof(accents) / sizeof(accents[0])))
+
+/* Wallpapers (wallpaper.c) */
+enum { WP_HOME, WP_LOCK, WP_KINDS };
+static struct {
+	lv_draw_buf_t *pic[WP_KINDS][2];	/* [kind][0 upright, 1 turned] */
+	bool set[WP_KINDS];
+	int luma[WP_KINDS];			/* mean luma under the app grid / clock */
+	int hue, sat;				/* the picture's own accent; hue -1: none */
+	bool busy;				/* a conversion is running */
+} wp = { .hue = -1 };
+static void wp_load(void);
+static bool wp_put(lv_obj_t *scr, int kind);
+static bool home_wp;		/* home is built over a wallpaper */
+/* text straight on a wallpaper: white (the picture is darkened under it) */
+#define WP_TEXT lv_color_white()
 
 static void conf_load(void)
 {
@@ -123,6 +139,8 @@ static void conf_load(void)
 			conf.wifi = !!v;
 		else if (sscanf(line, "bt=%d", &v) == 1)
 			conf.bt = !!v;
+		else if (sscanf(line, "wpaccent=%d", &v) == 1)
+			conf.wp_accent = !!v;
 	}
 	fclose(f);
 }
@@ -136,8 +154,9 @@ static void conf_save(void)
 	if (!f)
 		return;
 	fprintf(f, "dark=%d\naccent=%d\nidle=%d\nvol=%d\nspk=%d\nplug=%d\nrot=%d\nrotlock=%d\n"
-		"bright=%d\nwifi=%d\nbt=%d\n", conf.dark, conf.accent, conf.idle_s, conf.vol,
-		conf.spk, conf.wake_plug, conf.autorot, conf.rotlock, conf.bright, conf.wifi, conf.bt);
+		"bright=%d\nwifi=%d\nbt=%d\nwpaccent=%d\n", conf.dark, conf.accent, conf.idle_s, conf.vol,
+		conf.spk, conf.wake_plug, conf.autorot, conf.rotlock, conf.bright, conf.wifi, conf.bt,
+		conf.wp_accent);
 	if (fflush(f) == 0)
 		fsync(fileno(f));
 	fclose(f);
@@ -193,8 +212,9 @@ static lv_color_t tone(uint16_t h, uint8_t s, uint8_t l)
 
 static void m3_build_palette(void)
 {
-	uint16_t h = accents[conf.accent].hue, h2 = (h + 60) % 360;
-	uint8_t s = accents[conf.accent].sat, sn = 8, snv = 14;
+	bool wa = conf.wp_accent && wp.set[WP_HOME] && wp.hue >= 0;
+	uint16_t h = wa ? wp.hue : accents[conf.accent].hue, h2 = (h + 60) % 360;
+	uint8_t s = wa ? wp.sat : accents[conf.accent].sat, sn = 8, snv = 14;
 
 	if (conf.dark) {
 		M.primary = tone(h, s, 80);	M.on_primary = tone(h, s, 20);
@@ -2756,6 +2776,7 @@ static void home_update(lv_timer_t *t)
 }
 
 static void open_settings(lv_event_t *e);
+static void open_wallpaper(lv_event_t *e);
 static void open_logs(lv_event_t *e);
 static void open_wifi(lv_event_t *e);
 static void open_bt(lv_event_t *e);
@@ -2917,7 +2938,7 @@ static void app_tile(lv_obj_t *parent, const char *icon, const char *name,
 	lv_obj_set_style_transform_scale(t, 240, LV_STATE_PRESSED);
 	{
 		/* a long name ends in an ellipsis, as on iOS */
-		lv_obj_t *l = m3_label(t, name, &lv_font_montserrat_14, M.on_surface);
+		lv_obj_t *l = m3_label(t, name, &lv_font_montserrat_14, home_wp ? WP_TEXT : M.on_surface);
 
 		lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
 		lv_obj_set_width(l, 74);
@@ -3936,6 +3957,7 @@ static void lock_build(void)
 	lv_obj_set_style_bg_color(lock_scr, lv_color_mix(M.primary_c, lv_color_black(), 150), 0);
 	lv_obj_set_style_bg_grad_color(lock_scr, lv_color_black(), 0);
 	lv_obj_set_style_bg_grad_dir(lock_scr, LV_GRAD_DIR_VER, 0);
+	wp_put(lock_scr, WP_LOCK);	/* (a picture, if one is set, over the gradient) */
 
 	lock_date = m3_label(lock_scr, "", &lv_font_montserrat_20, lv_color_hex(0xe8e0f0));
 	lv_obj_align(lock_date, LV_ALIGN_TOP_MID, 0, 64);
@@ -5837,9 +5859,11 @@ static void build_home(void)
 	lv_obj_t *bar, *apps;
 
 	conf_load();
+	wp_load();	/* (before the theme: its colours may come from the wallpaper) */
 	m3_apply_theme();
 	home_scr = lv_obj_create(NULL);
 	m3_screen(home_scr);
+	home_wp = wp_put(home_scr, WP_HOME);
 	lv_obj_add_event_cb(home_scr, home_gesture_cb, LV_EVENT_GESTURE, NULL);
 
 	/* status bar: time, Wi-Fi and Bluetooth, battery; a tap opens the shade */
@@ -5851,6 +5875,12 @@ static void build_home(void)
 	lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_add_event_cb(bar, shade_tap_cb, LV_EVENT_CLICKED, (void *)1);
 	status_row(bar, &status_time, &status_wifi, &status_bt, &batt_lbl);
+	if (home_wp) {
+		lv_obj_set_style_text_color(status_time, WP_TEXT, 0);
+		lv_obj_set_style_text_color(status_wifi, WP_TEXT, 0);
+		lv_obj_set_style_text_color(status_bt, WP_TEXT, 0);
+		lv_obj_set_style_text_color(batt_lbl, WP_TEXT, 0);
+	}
 	/* the card below shows the time: the bar on home does not (the
 	 * label stays, hidden: the bar over applications copies it) */
 	lv_obj_add_flag(status_time, LV_OBJ_FLAG_HIDDEN);
@@ -5864,7 +5894,8 @@ static void build_home(void)
 		lv_obj_set_pos(c, 16, 44);
 		lv_obj_set_style_radius(c, 24, 0);
 		lv_obj_set_style_bg_color(c, M.surface_c_high, 0);
-		lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
+		/* over a wallpaper the card lets a little of it through */
+		lv_obj_set_style_bg_opa(c, home_wp ? LV_OPA_80 : LV_OPA_COVER, 0);
 		lv_obj_set_style_pad_all(c, 0, 0);
 		lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
 		lv_obj_add_event_cb(c, shade_tap_cb, LV_EVENT_CLICKED, (void *)1);
@@ -6866,9 +6897,10 @@ static void accent_cb(lv_event_t *e)
 {
 	int i = (int)(intptr_t)lv_event_get_user_data(e);
 
-	if (i == conf.accent)
+	if (i == conf.accent && !conf.wp_accent)
 		return;
 	conf.accent = i;
+	conf.wp_accent = false;
 	ui_restart("display");
 }
 
@@ -6952,7 +6984,7 @@ static void open_display(lv_event_t *e)
 		lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
 		lv_obj_set_style_bg_color(dot, tone(accents[i].hue, accents[i].sat, conf.dark ? 70 : 45), 0);
 		lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-		if ((int)i == conf.accent) {
+		if ((int)i == conf.accent && !conf.wp_accent) {
 			lv_obj_set_style_border_width(dot, 3, 0);
 			lv_obj_set_style_border_color(dot, M.on_surface, 0);
 		}
@@ -7735,6 +7767,8 @@ static void apps_refresh_cb(lv_event_t *e)
 	job_run(IOS_TILES " >/dev/null 2>&1; echo $?", NULL, apps_refresh_done, NULL);
 }
 
+#include "wallpaper.c"	/* wallpapers: conversion, frames, the Settings page */
+
 static void open_settings(lv_event_t *e)
 {
 	nav_mark(open_settings, NULL);
@@ -7758,8 +7792,11 @@ static void open_settings(lv_event_t *e)
 	lv_obj_set_style_pad_all(c, 4, 0);
 	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
 	snprintf(sub, sizeof(sub), "%s, %s, %d%%", conf.dark ? "Dark" : "Light",
-		 accents[conf.accent].name, backlight_get());
+		 conf.wp_accent ? "wallpaper colours" : accents[conf.accent].name, backlight_get());
 	m3_row(c, LV_SYMBOL_IMAGE, "Display", sub, open_display, NULL, NULL);
+	m3_row(c, LV_SYMBOL_HOME, "Wallpaper", wp.set[WP_HOME] || wp.set[WP_LOCK] ?
+	       (wp.set[WP_HOME] && wp.set[WP_LOCK] ? "Home and lock screens" : wp.set[WP_HOME] ?
+		"Home screen" : "Lock screen") : "None", open_wallpaper, NULL, NULL);
 	snd_summary(sub, sizeof(sub));
 	m3_row(c, LV_SYMBOL_VOLUME_MAX, "Sound", sub, open_sound, NULL, &set_snd_sub);
 	obj_track(&set_snd_sub);
@@ -8158,6 +8195,8 @@ static void ui_reopen(void)
 		open_sound(NULL);
 	else if (!strcmp(p, "power"))
 		open_power(NULL);
+	else if (!strcmp(p, "wallpaper"))
+		open_wallpaper(NULL);
 	else if (!strcmp(p, "about"))
 		open_about(NULL);
 	else if (!strcmp(p, "logs"))
