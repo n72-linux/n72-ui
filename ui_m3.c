@@ -6031,7 +6031,7 @@ static void build_home(void)
 	apps = home_apps = lv_obj_create(home_scr);
 	plain(apps);
 	lv_obj_set_pos(apps, 0, PG_TOP);
-	lv_obj_set_size(apps, W, H - PG_TOP);
+	lv_obj_set_size(apps, W, H - PG_TOP - PG_DOTS_H);
 	lv_obj_set_style_bg_opa(apps, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_pad_all(apps, 0, 0);
 	lv_obj_remove_flag(apps, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);

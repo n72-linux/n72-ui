@@ -72,8 +72,9 @@ static struct {
 	/* frames */
 	int mode;
 	int off;			/* the strip's offset now, px */
-	lv_obj_t *scr, *strip_img, *bar_img, *time_img, *dots_img, *wp_img;
-	lv_draw_buf_t *strip_pic, *bar_pic, *dots_pic, *time_pic[PG_TIME_LEVELS + 1];
+	int time_lv;			/* the time's picture showing */
+	lv_obj_t *scr, *strip_img, *bar_img, *bar_r_img, *time_img, *dots_img, *wp_img;
+	lv_draw_buf_t *strip_pic, *bar_pic, *bar_l, *bar_r, *dots_pic, *time_pic[PG_TIME_LEVELS + 1];
 	lv_area_t time_area;		/* the time's place in the bar */
 	unsigned long pic_ver;		/* home_ver they show */
 	int pic_mode, pic_w, pic_dots;
@@ -181,7 +182,7 @@ static void pg_layout(void)
 	}
 	k = cnt <= per0 ? 1 : 1 + (cnt - per0 + pern - 1) / pern;
 	pg.n = LV_MIN(k, PG_MAX);
-	lv_obj_set_size(home_apps, pg.n * W, H - PG_TOP);
+	lv_obj_set_size(home_apps, pg.n * W, H - PG_TOP - PG_DOTS_H);	/* (not over the dots: see pg_frames_begin) */
 	pg_show_page(pg.cur);
 }
 
@@ -193,6 +194,8 @@ static void pg_pics_free(void)
 
 	tr_free(&pg.strip_pic);
 	tr_free(&pg.bar_pic);
+	tr_free(&pg.bar_l);
+	tr_free(&pg.bar_r);
 	tr_free(&pg.dots_pic);
 	for (i = 0; i <= PG_TIME_LEVELS; i++)
 		tr_free(&pg.time_pic[i]);
@@ -232,6 +235,25 @@ static lv_draw_buf_t *pg_snap(lv_obj_t *o, int mode)
 	if (b && mode == PG_MODE_LAYER0)
 		mbx_gpu_premultiply_buf(b);
 	return b;
+}
+
+/* columns @x1..@x2 of @b as a picture of their own (flags kept) */
+static lv_draw_buf_t *pg_crop(const lv_draw_buf_t *b, int x1, int x2)
+{
+	lv_draw_buf_t *o;
+	int y;
+
+	if (x2 < x1)
+		return NULL;
+	o = lv_draw_buf_create(x2 - x1 + 1, b->header.h, b->header.cf, 0);
+	if (!o)
+		return NULL;
+	for (y = 0; y < (int)b->header.h; y++)
+		memcpy(o->data + (size_t)y * o->header.stride, b->data + (size_t)y * b->header.stride + x1 * 4,
+		       (size_t)(x2 - x1 + 1) * 4);
+	o->header.flags |= b->header.flags & LV_IMAGE_FLAGS_PREMULTIPLIED;
+	lv_draw_buf_flush_cache(o, NULL);
+	return o;
 }
 
 /*
@@ -283,6 +305,10 @@ static void pg_time_pics(int mode)
 		pg.time_pic[lv] = b;
 	}
 	tr_free(&with);
+	/* the bar around the time, so that no picture lies over another */
+	pg.time_pic[0] = pg_crop(pg.bar_pic, a.x1, a.x2);	/* (none of the time) */
+	pg.bar_l = pg_crop(pg.bar_pic, 0, a.x1 - 1);
+	pg.bar_r = pg_crop(pg.bar_pic, a.x2 + 1, (int)pg.bar_pic->header.w - 1);
 }
 
 /* The pictures, taken again only if home changed (true: they are there). */
@@ -390,13 +416,9 @@ static void pg_frame(int off)
 	lv_obj_set_x(pg.strip_img, -off);
 	/* the time: nothing on page 0, all of it a page on */
 	lv = LV_CLAMP(0, (off * PG_TIME_LEVELS + W / 2) / W, PG_TIME_LEVELS);
-	if (pg.time_img) {
-		if (lv && pg.time_pic[lv]) {
-			lv_image_set_src(pg.time_img, pg.time_pic[lv]);
-			lv_obj_remove_flag(pg.time_img, LV_OBJ_FLAG_HIDDEN);
-		} else {
-			lv_obj_add_flag(pg.time_img, LV_OBJ_FLAG_HIDDEN);
-		}
+	if (pg.time_img && lv != pg.time_lv && pg.time_pic[lv]) {
+		pg.time_lv = lv;		/* (a new picture only when the level moves) */
+		lv_image_set_src(pg.time_img, pg.time_pic[lv]);
 	}
 }
 
@@ -432,15 +454,28 @@ static bool pg_frames_begin(void)
 			pg.wp_img = pg_img(wp_pic(WP_HOME), 0, 0);
 	}
 	lv_obj_remove_flag(pg.scr, LV_OBJ_FLAG_SCROLLABLE);
+	/*
+	 * No picture over another: with layer 0 each one is an exact GPU copy
+	 * that the flush must leave alone, and it can only when nothing is
+	 * drawn over it later (else it premultiplies it again on the CPU:
+	 * slower, and soft edges too dark). The strip ends above the dots, the
+	 * bar is cut around the time.
+	 */
 	pg.strip_img = pg_img(pg.strip_pic, -pg.cur * W, PG_TOP);
-	pg.bar_img = pg_img(pg.bar_pic, 0, 0);
 	{
 		lv_area_t b;
 
 		lv_obj_get_coords(home_bar, &b);
-		lv_obj_set_pos(pg.bar_img, b.x1, b.y1);
-		pg.time_img = pg_img(pg.time_pic[PG_TIME_LEVELS] ? pg.time_pic[PG_TIME_LEVELS] : pg.bar_pic,
-				     b.x1 + pg.time_area.x1, b.y1 + pg.time_area.y1);
+		if (pg.time_pic[PG_TIME_LEVELS] && pg.time_pic[0]) {
+			if (pg.bar_l)
+				pg.bar_img = pg_img(pg.bar_l, b.x1, b.y1);
+			if (pg.bar_r)
+				pg.bar_r_img = pg_img(pg.bar_r, b.x1 + pg.time_area.x2 + 1, b.y1);
+			pg.time_img = pg_img(pg.time_pic[PG_TIME_LEVELS],
+					     b.x1 + pg.time_area.x1, b.y1 + pg.time_area.y1);
+		} else {
+			pg.bar_img = pg_img(pg.bar_pic, b.x1, b.y1);
+		}
 	}
 	if (pg.dots_pic) {
 		lv_area_t d;
@@ -450,6 +485,7 @@ static bool pg_frames_begin(void)
 	}
 	if (mode == PG_MODE_LAYER0)
 		mbx_gpu_set_transparent(true);
+	pg.time_lv = -1;
 	pg_frame(pg.cur * W);
 	lv_screen_load(pg.scr);
 	return true;
@@ -466,7 +502,7 @@ static void pg_frames_end(int p)
 	if (!scr)
 		return;
 	pg.scr = NULL;
-	pg.strip_img = pg.bar_img = pg.time_img = pg.dots_img = pg.wp_img = NULL;
+	pg.strip_img = pg.bar_img = pg.bar_r_img = pg.time_img = pg.dots_img = pg.wp_img = NULL;
 	if (pg.mode == PG_MODE_LAYER0)
 		mbx_gpu_set_transparent(false);
 	lv_screen_load(home_scr);
