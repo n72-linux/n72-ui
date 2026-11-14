@@ -1672,9 +1672,17 @@ static void ts_cb(lv_event_t *e)
 		int32_t d = hor ? ts.x[ts.head] - ts.x[prev] : ts.y[ts.head] - ts.y[prev];
 		uint64_t dt = ts.t[ts.head] - ts.t[prev];
 
-		if (dt > 0 && (fabsf(d * 1e6f / dt) < FAST_SLOW_V ||
-			       (fs.sign && d && (d > 0 ? 1 : -1) != fs.sign)))
+		/*
+		 * (no movement: LVGL sends SCROLL twice for some steps, 0.1-0.5
+		 * ms apart at the same point; counted as a slow stretch, every
+		 * drag ended fast scrolling)
+		 */
+		if (d && dt > 0 && (fabsf(d * 1e6f / dt) < FAST_SLOW_V ||
+			       (fs.sign && d && (d > 0 ? 1 : -1) != fs.sign))) {
+			if (getenv("N72_FPS") && !fs.slow)
+				fprintf(stderr, "fast scroll off: step %d px in %.1f ms (sign %d)\n", (int)d, dt / 1000.0, fs.sign);
 			fs.slow = true;
+		}
 	}
 }
 
