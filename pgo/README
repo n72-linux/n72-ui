@@ -1,0 +1,30 @@
+Profile-guided build of n72-ui
+==============================
+
+n72ui.profdata is an execution profile of n72-ui (clang IR-level
+instrumentation, -fprofile-generate) taken on the iPod touch 2G with a
+wallpaper set, panel lit, through the fake-touch harness: home page swipes
+(slow and flung), Files (/usr/lib, /root) and Logs scrolls, the Sound,
+Display and Wi-Fi pages, typing on the keyboard, and --bench. build.sh
+uses it whenever it is here (NOPGO=1: not), with hot/cold splitting at the
+LTO link.
+
+Measured 2026-11-14 on the device (same scripted touches twice, panel lit):
+render time per frame while scrolling ~5% lower (Logs 7.8 -> 7.4 ms, Files
+8.7-9.1 -> 7.8-7.9 ms without the 25-30 ms spikes); text drawn into a canvas
+6.85 -> 6.19 ms; frame rates unchanged (the scrolls wait for the display,
+55-64 fps either way); --bench and text checksums identical. -O3 with the
+profile: canvas text 5.79 ms, the rest no better and a 45 KB larger
+binary, so -O2 stays.
+
+A function changed since the profile is built as without one (clang checks
+a hash per function); make a new one after larger changes:
+
+  1. docker run ... -e PGO_GEN=1 n72-alpine sh /work/n72-ui/build.sh
+     (n72-ui-build-pgogen/; the runtime is n72-gles/pgo-rt/libclang_rt.profile-armhf.a)
+  2. On the device: that binary as /root/n72-ui-pgogen, the training script
+     (pgo/train.sh: harness runs with
+     LLVM_PROFILE_FILE=/root/pgo/ui-%p.profraw; the counters are written
+     when n72-ui is stopped with SIGTERM, or at the end of --bench).
+  3. llvm-profdata merge -o pgo/n72ui.profdata raw/*.profraw
+  4. Build as usual.

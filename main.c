@@ -1972,6 +1972,13 @@ static void on_signal(int sig)
 	if (app_pid > 0)
 		kill(-app_pid, SIGTERM);
 	restore_tty();
+#ifdef N72_PGO_GEN
+	{	/* (instrumented build: the counters, as it is stopped) */
+		extern int __llvm_profile_write_file(void);
+
+		__llvm_profile_write_file();
+	}
+#endif
 	signal(sig, SIG_DFL);
 	raise(sig);
 }
