@@ -594,7 +594,25 @@ static lv_timer_t *awake_timer(lv_timer_cb_t cb, uint32_t ms, void *ud)
 
 	if (t && nawake < NAWAKE)
 		awake_t[nawake++] = t;
+	else if (t)
+		fprintf(stderr, "n72-ui: more than %d awake timers: one runs while dark\n", NAWAKE);
 	return t;
+}
+
+/*
+ * Delete an awake timer, and forget it here: deleted with lv_timer_delete
+ * it stayed listed, and the next screen change paused or resumed freed
+ * memory (the home screen's timers, after every turn or theme change),
+ * while the list filled up and later timers ran in the dark.
+ */
+static void awake_timer_delete(lv_timer_t *t)
+{
+	for (int i = 0; i < nawake; i++)
+		if (awake_t[i] == t) {
+			awake_t[i] = awake_t[--nawake];
+			break;
+		}
+	lv_timer_delete(t);
 }
 
 static void awake_set(bool on)

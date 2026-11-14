@@ -8129,11 +8129,11 @@ static void ui_rebuild(bool load)
 	lv_obj_delete(home_scr);
 	home_scr = NULL;
 	if (home_timer) {
-		lv_timer_delete(home_timer);
+		awake_timer_delete(home_timer);
 		home_timer = NULL;
 	}
 	if (shade_warm_timer) {
-		lv_timer_delete(shade_warm_timer);
+		awake_timer_delete(shade_warm_timer);
 		shade_warm_timer = NULL;
 	}
 	/* what pointed into them (net_ui_sync and the status updates run
@@ -8207,11 +8207,11 @@ static void home_fresh(void)
 	home_stale = false;
 	ui_rebuild_overlays_free();
 	if (home_timer) {
-		lv_timer_delete(home_timer);
+		awake_timer_delete(home_timer);
 		home_timer = NULL;
 	}
 	if (shade_warm_timer) {
-		lv_timer_delete(shade_warm_timer);
+		awake_timer_delete(shade_warm_timer);
 		shade_warm_timer = NULL;
 	}
 	{
