@@ -544,9 +544,11 @@ static void pg_frames_end(int p)
 {
 	lv_obj_t *scr = pg.scr;
 
+	n72_trace("pg-end>", 0);
 	pg.on = pg.settling = false;
 	lv_anim_delete(&pg, NULL);
 	pg_show_page(p);
+	n72_trace("pg-show", 0);
 	wp_apply_kick();
 	if (!scr)
 		return;
@@ -554,8 +556,11 @@ static void pg_frames_end(int p)
 	pg.strip_img = pg.bar_img = pg.bar_r_img = pg.time_img = pg.dots_img = pg.wp_img = NULL;
 	if (pg.mode == PG_MODE_LAYER0)
 		mbx_gpu_set_transparent(false);
+	n72_trace("pg-opaque", 0);
 	lv_screen_load(home_scr);
+	n72_trace("pg-load", 0);
 	lv_obj_delete(scr);
+	n72_trace("pg-end<", 0);
 }
 
 /* ------------------------------------------------------------- settle */
@@ -582,6 +587,45 @@ static int pg_decide(double v)
 	return LV_CLAMP(0, t, pg.n - 1);
 }
 
+/*
+ * At the page: this frame still shows it as the pictures, on time, and live
+ * home takes over a frame later. Home's first frame is a full redraw
+ * (~30 ms with a wallpaper) and the switch out of the transparent mode;
+ * done in the same step as the last move, that move came ~65 ms late.
+ * A frame late where nothing moves shows nothing.
+ */
+static lv_timer_t *pg_end_t;
+
+static void pg_end_cb(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	pg_end_t = NULL;	/* (one run: LVGL deletes it) */
+	if (pg.scr && !pg.on && !pg.settling)
+		pg_frames_end(pg.target);
+}
+
+static void pg_arrive(void)
+{
+	pg.settling = false;
+	pg.dir = 0;
+	lv_anim_delete(&pg, NULL);
+	if (!pg_end_t) {
+		pg_end_t = lv_timer_create(pg_end_cb, 20, NULL);
+		lv_timer_set_repeat_count(pg_end_t, 1);
+	}
+}
+
+/* (a touch while home waits to take over: now) */
+static void pg_end_now(void)
+{
+	if (!pg_end_t)
+		return;
+	lv_timer_delete(pg_end_t);
+	pg_end_t = NULL;
+	if (pg.scr && !pg.on && !pg.settling)
+		pg_frames_end(pg.target);
+}
+
 static void pg_settle_exec(void *var, int32_t v)
 {
 	uint64_t now = mono_us();
@@ -594,8 +638,7 @@ static void pg_settle_exec(void *var, int32_t v)
 	pg.step_us = now;
 	if (ios_pager_step(&pg.sp, n)) {
 		pg_frame((int)pg.sp.x);
-		pg.dir = 0;
-		pg_frames_end(pg.target);
+		pg_arrive();
 		return;
 	}
 	pg_frame((int)pg.sp.x);
@@ -705,6 +748,7 @@ static bool pg_drag(int phase, int x, int y)
 			return true;
 	}
 	if (phase == 0) {
+		pg_end_now();
 		pg.cand = false;
 		pg.caught = false;
 		if (pg.settling && pg.scr) {
@@ -776,6 +820,7 @@ static void pg_warm(lv_timer_t *t)
 	    tr.scr || za.phase || sd.on || lv_anim_count_running() ||
 	    (touch_indev && lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
 		return;
+	n72_trace("pg-warm", 0);
 	if (pg.pic_ver != home_ver || pg.pic_mode != pg_mode() || pg.pic_w != W) {
 		/* (short of memory: not every second, again when home changes) */
 		if (pg.fail_ver == home_ver && lv_tick_elaps(pg.fail_ms) < 30000)
