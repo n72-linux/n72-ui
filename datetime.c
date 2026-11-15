@@ -84,6 +84,33 @@ static void dt_place(const char *zone, char *out, size_t len)
 			out[i] = ' ';
 }
 
+/*
+ * A zone's standard offset as people write it, "UTC+05:30": from its POSIX
+ * rule ("IST-5:30", "<+03>-3"), whose sign is the other way round.
+ */
+static void dt_offset(const char *posix, char *out, size_t len)
+{
+	const char *p = posix;
+	int h = 0, m = 0, sign = -1;	/* (no sign: west, as "EST5EDT") */
+
+	if (*p == '<') {
+		p = strchr(p, '>');
+		p = p ? p + 1 : posix + strlen(posix);
+	} else {
+		while (*p && isalpha((unsigned char)*p))
+			p++;
+	}
+	if (*p == '-' || *p == '+')
+		sign = *p++ == '-' ? 1 : -1;	/* (POSIX: west is positive) */
+	h = atoi(p);
+	if ((p = strchr(p, ':')) && isdigit((unsigned char)p[1]))
+		m = atoi(p + 1);
+	if (!h && !m)
+		snprintf(out, len, "UTC");
+	else
+		snprintf(out, len, "UTC%c%02d:%02d", sign > 0 ? '+' : '-', h, m);
+}
+
 static void open_dt_places(lv_event_t *e)
 {
 	lv_obj_t *scr, *body, *c;
@@ -103,8 +130,11 @@ static void open_dt_places(lv_event_t *e)
 
 		if (strncmp(z->name, dt_region, n) || (z->name[n] != '/' && z->name[n]))
 			continue;
+		char off[16];
+
 		dt_place(z->name, place, sizeof(place));
-		m3_row(c, LV_SYMBOL_GPS, place, z->posix, dt_zone_cb, (void *)z, NULL);
+		dt_offset(z->posix, off, sizeof(off));
+		m3_row(c, LV_SYMBOL_GPS, place, off, dt_zone_cb, (void *)z, NULL);
 	}
 	push(scr);
 }
