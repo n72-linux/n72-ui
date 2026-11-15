@@ -1047,18 +1047,38 @@ static void drain(int fd)
 			;
 }
 
-/* Does the kernel offer this sleep state ("mem" only with n72_sleep.deep=1)? */
-static bool sleep_offered(const char *state)
+/*
+ * Suspend to RAM ("deep" in /sys/power/mem_sleep). Which state "mem" means
+ * is chosen there: n72-base leaves it at s2idle, and n72-ui picks deep only
+ * for its own deep sleeps (deep_sleep).
+ */
+#define MEM_SLEEP	"/sys/power/mem_sleep"
+
+static bool deep_offered(void)
 {
 	char buf[64] = "";
-	FILE *f = fopen("/sys/power/state", "r");
+	FILE *f = fopen(MEM_SLEEP, "r");
 
 	if (!f)
 		return false;
 	if (!fgets(buf, sizeof(buf), f))
 		buf[0] = 0;
 	fclose(f);
-	return strstr(buf, state) != NULL;
+	return strstr(buf, "deep") != NULL;
+}
+
+static bool mem_sleep_set(const char *mode)
+{
+	int fd = open(MEM_SLEEP, O_WRONLY | O_CLOEXEC);
+	bool ok;
+
+	if (fd < 0)
+		return false;
+	ok = write(fd, mode, strlen(mode)) == (ssize_t)strlen(mode);
+	if (!ok)
+		fprintf(stderr, "n72-ui: mem_sleep %s: %s\n", mode, strerror(errno));
+	close(fd);
+	return ok;
 }
 
 static bool write_sleep_state(const char *state)
@@ -1302,23 +1322,28 @@ static bool audio_playing(void);
 /*
  * May the sleep go deep now? Not on USB power, where the charger's events
  * wake the PMU straight out of hibernate; not while sound plays (that keeps
- * the system up anyway) or an application is open; not with N72_SLEEP=freeze.
- * The kernel offers "mem" once n72_sleep.deep is set.
+ * the system up anyway) or an application is open; not with N72_SLEEP=freeze;
+ * and only where the kernel offers it.
  */
 static bool deep_allowed(void)
 {
 	const char *e = getenv("N72_SLEEP");
-	int fd;
 
 	if ((e && !strcmp(e, "freeze")) || usb_powered() || audio_playing() || app_pid > 0)
 		return false;
-	fd = open("/sys/module/n72_sleep/parameters/deep", O_WRONLY | O_CLOEXEC);
-	if (fd >= 0) {
-		if (write(fd, "Y", 1) != 1)
-			fprintf(stderr, "n72-ui: n72_sleep.deep: %s\n", strerror(errno));
-		close(fd);
-	}
-	return sleep_offered("mem");
+	return deep_offered();
+}
+
+/* One suspend to RAM: "mem" as deep for this sleep, s2idle again after. */
+static bool deep_sleep(void)
+{
+	bool ok;
+
+	if (!mem_sleep_set("deep"))
+		return false;
+	ok = write_sleep_state("mem");
+	mem_sleep_set("s2idle");
+	return ok;
 }
 
 /*
@@ -1364,7 +1389,7 @@ static bool system_sleep(void)
 		if (!wakeup_count_arm()) {
 			ok = true;	/* an event came first: look at it, as after a wake */
 		} else {
-			ok = deep && write_sleep_state("mem");
+			ok = deep && deep_sleep();
 			if (!ok)	/* not deep, or the PMU refused: suspend to idle */
 				ok = write_sleep_state("freeze");
 		}
