@@ -79,12 +79,14 @@ static struct {
 	bool wp_accent;		/* the colours from the home wallpaper (wallpaper.c) */
 	char dock[200];		/* the dock's icons, names joined by '|' (dock.c) */
 	bool dock_set;		/* (no "dock=" line: the default) */
+	char order[1200];	/* the grid's order, names joined by '|' (dock.c) */
+	bool order_set;
 	char tz[48];		/* the time zone's name (datetime.c; its rule is /etc/TZ) */
 	bool tz_set;
 	char wx_name[96];	/* the weather's place (weather.c) */
 	double wx_lat, wx_lon;
 	bool wx_set, wx_f;	/* a place set; Fahrenheit */
-} conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1, false, "", false, "", false, "", 0, 0, false, false };
+} conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1, false, "", false, "", false, "", false, "", 0, 0, false, false };
 
 /*
  * Auto-rotate on: the screen turns with the iPod. Off: it stays as it was
@@ -117,6 +119,7 @@ static lv_draw_buf_t *wp_pic(int kind);
 static lv_draw_buf_t *wp_upright(int kind);
 static bool wp_hold(lv_obj_t *img, lv_draw_buf_t *b);
 static void wp_apply_kick(void);	/* (something in the way of new wallpaper frames ended) */
+static void dock_carry_stop(void);	/* (dock.c: a carried icon put down) */
 static bool pg_drag(int phase, int x, int y);
 static void pg_fb0_dirty(void);
 static void pg_abort(void);
@@ -125,7 +128,7 @@ static void pg_abort(void);
 
 static void conf_load(void)
 {
-	char line[240];
+	char line[1300];
 	FILE *f = fopen(CONF_PATH, "r");
 	const char *e = getenv("N72_IDLE_SLEEP");
 
@@ -175,7 +178,11 @@ static void conf_load(void)
 			}
 		} else if (sscanf(line, "wxf=%d", &v) == 1)
 			conf.wx_f = !!v;
-		else if (!strncmp(line, "tz=", 3)) {
+		else if (!strncmp(line, "order=", 6)) {
+			snprintf(conf.order, sizeof(conf.order), "%s", line + 6);
+			conf.order[strcspn(conf.order, "\r\n")] = 0;
+			conf.order_set = true;
+		} else if (!strncmp(line, "tz=", 3)) {
 			snprintf(conf.tz, sizeof(conf.tz), "%s", line + 3);
 			conf.tz[strcspn(conf.tz, "\r\n")] = 0;
 			conf.tz_set = true;
@@ -202,6 +209,8 @@ static void conf_save(void)
 		conf.wp_accent);
 	if (conf.dock_set)	/* (only once changed: the file is as it was till then) */
 		fprintf(f, "dock=%s\n", conf.dock);
+	if (conf.order_set)
+		fprintf(f, "order=%s\n", conf.order);
 	if (conf.tz_set)
 		fprintf(f, "tz=%s\n", conf.tz);
 	if (conf.wx_set)
@@ -4428,6 +4437,7 @@ static void ui_lock(void)
 	za_finish();
 	sd_settle_now();
 	tr_finish();
+	dock_carry_stop();
 	pg_abort();
 	if (shade_open)
 		sd_end(false);
@@ -4614,12 +4624,16 @@ static bool ul_drag(int phase, int y)
  * A launcher touch, from the router: phase 0 down, 1 move, 2 lift.
  * True once the drag is the shade's (the router then keeps it from LVGL).
  */
+static bool dock_carry_touch(int phase, int x, int y);
+
 static bool ui_drag(int phase, int x, int y)
 {
 	uint32_t now = lv_tick_get();
 
 	if (locked || ul.scr)
 		return ul_drag(phase, y);
+	if (dock_carry_touch(phase, x, y))	/* an icon carried (dock.c): its touch */
+		return true;
 	if (phase == 0 && app_bar && y < APP_BAR_H)
 		psl_touch(app_bar);	/* (the bar itself takes its touches) */
 	if (phase == 0 && kbd.obj && kbd_wants(x, y))

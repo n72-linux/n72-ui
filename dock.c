@@ -7,9 +7,8 @@
  *
  * The icons are the tiles themselves, moved into the dock object: a tap
  * opens them as from the grid, and the zoom grows from the dock. A long
- * press moves a tile into the dock or back into its place in the grid: it
- * flies there as a picture of its badge (one small GPU copy a frame), the
- * grid takes its new order at once. A full dock shakes instead.
+ * press picks a tile up to carry it anywhere in the grid, onto another
+ * page, or into or out of the dock (see "the carrying" below).
  *
  * What is docked is kept as names in ui.conf ("dock=Settings|Files|...");
  * with no such line, the dock holds Settings, Files, YouTube and Browser.
@@ -101,6 +100,25 @@ static void dock_undock_all(void)
 
 static void dock_long_cb(lv_event_t *e);
 
+/* the grid in the order ui.conf keeps (names not there stay after, as they were) */
+static void dock_order_apply(void)
+{
+	char names[sizeof(conf.order)], *save = NULL, *n;
+	uint32_t k = 1, i, cnt;
+
+	if (!conf.order_set)
+		return;
+	snprintf(names, sizeof(names), "%s", conf.order);
+	for (n = strtok_r(names, "|", &save); n; n = strtok_r(NULL, "|", &save)) {
+		cnt = lv_obj_get_child_count(home_apps);
+		for (i = k; i < cnt; i++)
+			if (!strcmp(tile_name(lv_obj_get_child(home_apps, i)), n)) {
+				lv_obj_move_to_index(lv_obj_get_child(home_apps, i), (int32_t)k++);
+				break;
+			}
+	}
+}
+
 /* the grid's tiles as they are now: their order, and the long press */
 static void dock_note_order(void)
 {
@@ -185,6 +203,7 @@ static void dock_build(void)
 	lv_obj_set_style_bg_opa(d, home_wp ? LV_OPA_80 : LV_OPA_COVER, 0);
 	lv_obj_set_style_pad_all(d, 0, 0);
 	lv_obj_remove_flag(d, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	dock_order_apply();
 	dock_note_order();
 	dock_apply();
 }
@@ -200,6 +219,7 @@ static void dock_after_reload(void)
 {
 	if (!home_dock)
 		return;
+	dock_order_apply();
 	dock_note_order();
 	dock_apply();
 }
@@ -251,54 +271,6 @@ static void dock_badge_xy(lv_obj_t *t, int32_t *x, int32_t *y)
 	*y = a.y1;
 }
 
-/* @t into the dock (or out of it), flying there */
-static void dock_move(lv_obj_t *t, bool in)
-{
-	lv_obj_t *badge = lv_obj_get_child(t, 0);
-	lv_anim_t a;
-	int i, k;
-
-	dock_fly_stop();
-	dock_badge_xy(t, &dock_fly.x0, &dock_fly.y0);
-	/* the badge (a picture: one small GPU copy a frame; the tile's press
-	 * scale is the tile's, not in it) */
-	lv_obj_remove_state(t, LV_STATE_PRESSED);
-	dock_fly.pic = badge ? snap(badge, LV_COLOR_FORMAT_ARGB8888) : NULL;
-	if (in) {
-		lv_obj_set_parent(t, home_dock);
-		dock_tile_style(t, true);
-	} else {
-		/* back where it was in the grid's order */
-		for (i = 0, k = 0; i < dock_norder && dock_order[i] != t; i++)
-			if (lv_obj_is_valid(dock_order[i]) && !tile_docked(dock_order[i]))
-				k++;
-		lv_obj_set_parent(t, home_apps);
-		dock_tile_style(t, false);
-		lv_obj_move_to_index(t, k + 1);
-	}
-	dock_layout();
-	pg_layout();
-	bp_changed(home_scr);
-	dock_save();
-	if (!dock_fly.pic)
-		return;
-	dock_badge_xy(t, &dock_fly.x1, &dock_fly.y1);
-	dock_fly.tile = t;
-	lv_obj_add_flag(t, LV_OBJ_FLAG_HIDDEN);
-	dock_fly.img = lv_image_create(lv_layer_top());
-	lv_image_set_src(dock_fly.img, dock_fly.pic);
-	lv_obj_remove_flag(dock_fly.img, LV_OBJ_FLAG_CLICKABLE);
-	dock_fly_x(NULL, 0);
-	lv_anim_init(&a);
-	lv_anim_set_var(&a, &dock_fly);
-	lv_anim_set_exec_cb(&a, dock_fly_x);
-	lv_anim_set_values(&a, 0, 1024);
-	lv_anim_set_duration(&a, DOCK_FLY_MS);
-	lv_anim_set_path_cb(&a, ios_path_ease_in_out);
-	lv_anim_set_completed_cb(&a, dock_fly_done);
-	lv_anim_start(&a);
-}
-
 /* a full dock: a short shake, nothing moves in */
 static void dock_shake_x(void *var, int32_t v)
 {
@@ -326,17 +298,304 @@ static void dock_shake(void)
 	lv_anim_start(&a);
 }
 
-static void dock_long_cb(lv_event_t *e)
-{
-	lv_obj_t *t = lv_event_get_current_target(e);
+/* ------------------------------------------------------- the carrying */
 
-	if (!home_dock || za.phase || pg.on || pg.scr || lv_screen_active() != home_scr)
+/*
+ * A long press picks a tile up: a picture of its badge follows the finger
+ * (one small GPU copy a frame) while the tile itself, hidden, holds the
+ * place it will land in. Over the grid that place moves to the slot under
+ * the finger, over the dock into the dock (while it has room: a full one
+ * shakes once), and the tiles between slide over (0.2 s, only those that
+ * show). Held at a side of the pages for 0.6 s, the next page glides in.
+ * On the lift the picture settles into the place; the order of the grid
+ * and the dock goes into ui.conf ("order=", "dock="). The touch is the
+ * router's from the long press on (ui_drag): no swipe, no shade, no tap.
+ */
+#define CARRY_SLIDE_MS	200
+#define CARRY_EDGE	20	/* px from a side of the pages */
+#define CARRY_EDGE_MS	600
+
+static struct {
+	bool on;
+	lv_obj_t *tile, *img;
+	lv_draw_buf_t *pic;
+	int32_t dx, dy;		/* the picture's corner from the finger */
+	int32_t x, y;		/* the finger */
+	int edge;		/* -1, +1: held at a side; 0 not */
+	uint32_t edge_ms;
+	bool shook;		/* (the full dock shook for this pass over it) */
+	lv_timer_t *timer;
+} carry;
+
+static void carry_slide_x(void *o, int32_t v)
+{
+	lv_obj_set_x(o, v);
+}
+
+static void carry_slide_y(void *o, int32_t v)
+{
+	lv_obj_set_y(o, v);
+}
+
+/* @o from where it was (@x0, @y0 in its parent) to where it is now */
+static void carry_slide(lv_obj_t *o, int32_t x0, int32_t y0)
+{
+	int32_t x1 = lv_obj_get_x(o), y1 = lv_obj_get_y(o);
+	lv_anim_t a;
+
+	if (x0 == x1 && y0 == y1)
 		return;
-	lv_indev_wait_release(lv_indev_active());	/* (no tap on the lift) */
-	lv_obj_remove_state(t, LV_STATE_PRESSED);
-	if (!tile_docked(t) && lv_obj_get_child_count(home_dock) >= DOCK_MAX) {
-		dock_shake();
+	lv_anim_init(&a);
+	lv_anim_set_var(&a, o);
+	lv_anim_set_duration(&a, CARRY_SLIDE_MS);
+	lv_anim_set_path_cb(&a, ios_path_ease_out);
+	lv_anim_set_exec_cb(&a, carry_slide_x);
+	lv_anim_set_values(&a, x0, x1);
+	lv_anim_start(&a);
+	lv_anim_set_exec_cb(&a, carry_slide_y);
+	lv_anim_set_values(&a, y0, y1);
+	lv_anim_start(&a);
+	lv_obj_set_pos(o, x0, y0);
+}
+
+/* the carried tile to @idx of the grid or of the dock, the others sliding over */
+static void carry_place(bool in_dock, int idx)
+{
+	lv_obj_t *t = carry.tile, *seen[48];
+	int32_t ox[48], oy[48];
+	lv_obj_t *par = in_dock ? home_dock : home_apps;
+	int n = 0, i, first, last;
+
+	/* where the tiles that show are now: those of this page, and the dock's */
+	first = 1;
+	last = (int)lv_obj_get_child_count(home_apps) - 1;
+	for (i = first; i <= last && n < 40; i++) {
+		lv_obj_t *o = lv_obj_get_child(home_apps, i);
+		int32_t x = lv_obj_get_x(o);
+
+		if (o != t && x >= pg.cur * PW - PG_TILE_W && x < (pg.cur + 1) * PW) {
+			seen[n] = o;
+			ox[n] = x;
+			oy[n++] = lv_obj_get_y(o);
+		}
+	}
+	for (i = 0; i < (int)lv_obj_get_child_count(home_dock) && n < 48; i++) {
+		lv_obj_t *o = lv_obj_get_child(home_dock, i);
+
+		if (o != t) {
+			seen[n] = o;
+			ox[n] = lv_obj_get_x(o);
+			oy[n++] = lv_obj_get_y(o);
+		}
+	}
+	if (lv_obj_get_parent(t) != par) {
+		lv_obj_set_parent(t, par);
+		dock_tile_style(t, in_dock);
+	}
+	lv_obj_move_to_index(t, in_dock ? idx : idx + 1);	/* (the card first in the grid) */
+	dock_layout();
+	pg_layout();
+	for (i = 0; i < n; i++)
+		carry_slide(seen[i], ox[i], oy[i]);
+	bp_changed(home_scr);
+}
+
+/* where the finger at (@x, @y) would put the tile: grid or dock, and the index */
+static bool carry_target(int32_t x, int32_t y, bool *in_dock, int *idx)
+{
+	bool docked = tile_docked(carry.tile);
+
+	if (home_dock && in_obj(home_dock, x, y)) {
+		int n = (int)lv_obj_get_child_count(home_dock) + (docked ? 0 : 1), along, len;
+		lv_area_t d;
+
+		if (!docked && n > DOCK_MAX) {
+			if (!carry.shook) {
+				dock_shake();
+				carry.shook = true;
+			}
+			return false;
+		}
+		lv_obj_get_coords(home_dock, &d);
+		along = dock_side() == DOCK_BOTTOM ? x - d.x1 : y - d.y1;
+		len = dock_side() == DOCK_BOTTOM ? lv_area_get_width(&d) : lv_area_get_height(&d);
+		*in_dock = true;
+		*idx = LV_CLAMP(0, along * n / LV_MAX(len, 1), n - 1);
+		return true;
+	}
+	carry.shook = false;
+	if (x < PX || x >= PX + PW || y < PG_TOP || y >= PB - PG_DOTS_H)
+		return false;
+	{
+		int top = pg.cur ? PG_GRIDN : PG_GRID0, rows = pg.cur ? pg.rowsn : pg.rows0;
+		int x0 = (PW - pg.cols * PG_TILE_W) / 2, gx = x - PX - x0, gy = y - PG_TOP - top;
+		int col = LV_CLAMP(0, gx / PG_TILE_W, pg.cols - 1);
+		int row = LV_CLAMP(0, gy / (PG_TILE_H + PG_ROW_GAP), rows - 1);
+		int slot = row * pg.cols + col;
+		int per0 = pg.cols * pg.rows0, pern = pg.cols * pg.rowsn;
+		int count = (int)lv_obj_get_child_count(home_apps) - 1 + (docked ? 1 : 0);
+
+		if (gy < -PG_ROW_GAP)
+			return false;	/* (over the card) */
+		*in_dock = false;
+		*idx = LV_CLAMP(0, pg.cur ? per0 + (pg.cur - 1) * pern + slot : slot, count - 1);
+	}
+	return true;
+}
+
+static void carry_follow(void)
+{
+	bool in_dock;
+	int idx;
+
+	if (carry.img)
+		lv_obj_set_pos(carry.img, carry.x + carry.dx, carry.y + carry.dy);
+	if (pg.scr)
+		return;		/* (a page gliding in: the place is found after) */
+	if (!carry_target(carry.x, carry.y, &in_dock, &idx))
+		return;
+	if (in_dock == tile_docked(carry.tile) &&
+	    idx == (int)lv_obj_get_index(carry.tile) - (in_dock ? 0 : 1))
+		return;
+	carry_place(in_dock, idx);
+}
+
+/* held at a side: the next page */
+static void carry_tick(lv_timer_t *t)
+{
+	int e;
+
+	LV_UNUSED(t);
+	if (!carry.on || pg.scr)
+		return;
+	e = carry.x < PX + CARRY_EDGE ? -1 : carry.x >= PX + PW - CARRY_EDGE ? 1 : 0;
+	if (carry.y < PG_TOP || carry.y >= PB)
+		e = 0;
+	if (e != carry.edge) {
+		carry.edge = e;
+		carry.edge_ms = lv_tick_get();
 		return;
 	}
-	dock_move(t, !tile_docked(t));
+	if (e && lv_tick_elaps(carry.edge_ms) >= CARRY_EDGE_MS && pg_glide_to(pg.cur + e))
+		carry.edge_ms = lv_tick_get();
+}
+
+/* the grid's and the dock's order, kept (ui.conf) */
+static void carry_save(void)
+{
+	size_t len = 0;
+	uint32_t i, n;
+
+	conf.order[0] = 0;
+	n = lv_obj_get_child_count(home_apps);
+	for (i = 1; i < n && len < sizeof(conf.order); i++)
+		len += snprintf(conf.order + len, sizeof(conf.order) - len, "%s%s", len ? "|" : "",
+				tile_name(lv_obj_get_child(home_apps, i)));
+	conf.order_set = true;
+	dock_save();	/* (and conf_save_later) */
+	/* the order every rebuild comes back to (dock_undock_all) */
+	dock_norder = 0;
+	for (i = 1; i < n && dock_norder < (int)(sizeof(dock_order) / sizeof(dock_order[0])); i++)
+		dock_order[dock_norder++] = lv_obj_get_child(home_apps, i);
+	n = lv_obj_get_child_count(home_dock);
+	for (i = 0; i < n && dock_norder < (int)(sizeof(dock_order) / sizeof(dock_order[0])); i++)
+		dock_order[dock_norder++] = lv_obj_get_child(home_dock, i);
+}
+
+static void carry_end(bool drop)
+{
+	lv_obj_t *t = carry.tile;
+
+	carry.on = false;
+	if (carry.timer) {
+		lv_timer_delete(carry.timer);
+		carry.timer = NULL;
+	}
+	if (!t || !lv_obj_is_valid(t)) {
+		if (carry.img)
+			lv_obj_delete(carry.img);
+		tr_free(&carry.pic);
+		carry.img = NULL;
+		carry.tile = NULL;
+		return;
+	}
+	if (drop)
+		carry_save();
+	/* the picture settles into the place (dock_fly's flight, from here) */
+	dock_fly_stop();
+	dock_fly.img = carry.img;
+	dock_fly.pic = carry.pic;
+	dock_fly.tile = t;
+	dock_fly.x0 = lv_obj_get_x(carry.img);
+	dock_fly.y0 = lv_obj_get_y(carry.img);
+	dock_badge_xy(t, &dock_fly.x1, &dock_fly.y1);
+	carry.img = NULL;
+	carry.pic = NULL;
+	carry.tile = NULL;
+	{
+		lv_anim_t a;
+
+		lv_anim_init(&a);
+		lv_anim_set_var(&a, &dock_fly);
+		lv_anim_set_exec_cb(&a, dock_fly_x);
+		lv_anim_set_values(&a, 0, 1024);
+		lv_anim_set_duration(&a, CARRY_SLIDE_MS);
+		lv_anim_set_path_cb(&a, ios_path_ease_out);
+		lv_anim_set_completed_cb(&a, dock_fly_done);
+		lv_anim_start(&a);
+	}
+}
+
+/* The router's touch while a tile is carried (ui_drag): true, it is ours. */
+static bool dock_carry_touch(int phase, int x, int y)
+{
+	if (!carry.on)
+		return false;
+	carry.x = x;
+	carry.y = y;
+	if (phase == 2)
+		carry_end(true);
+	else
+		carry_follow();
+	return true;
+}
+
+/* (home rebuilt, the screen off, an application: put it down where it is) */
+static void dock_carry_stop(void)
+{
+	if (carry.on)
+		carry_end(true);
+}
+
+static void dock_long_cb(lv_event_t *e)
+{
+	lv_obj_t *t = lv_event_get_current_target(e), *badge = lv_obj_get_child(t, 0);
+	lv_indev_t *in = lv_indev_active();
+	lv_point_t p;
+	int32_t bx, by;
+
+	if (!home_dock || carry.on || za.phase || pg.on || pg.scr || lv_screen_active() != home_scr || !in)
+		return;
+	dock_fly_stop();
+	lv_indev_wait_release(in);	/* (no tap on the lift) */
+	lv_obj_remove_state(t, LV_STATE_PRESSED);
+	lv_indev_get_point(in, &p);
+	dock_badge_xy(t, &bx, &by);
+	carry.pic = badge ? snap(badge, LV_COLOR_FORMAT_ARGB8888) : NULL;
+	if (!carry.pic)
+		return;
+	carry.tile = t;
+	carry.x = p.x;
+	carry.y = p.y;
+	carry.dx = bx - p.x;
+	carry.dy = by - p.y;
+	carry.edge = 0;
+	carry.shook = false;
+	carry.img = lv_image_create(lv_layer_top());
+	lv_image_set_src(carry.img, carry.pic);
+	lv_obj_remove_flag(carry.img, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_pos(carry.img, bx, by);
+	lv_obj_add_flag(t, LV_OBJ_FLAG_HIDDEN);	/* (it holds its place) */
+	carry.on = true;
+	carry.timer = lv_timer_create(carry_tick, 100, NULL);
 }

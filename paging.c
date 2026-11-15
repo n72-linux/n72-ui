@@ -51,6 +51,7 @@
 enum { PG_MODE_LAYER0, PG_MODE_OPAQUE, PG_MODE_BLEND };
 
 static void dock_fly_stop(void);
+static void dock_carry_stop(void);
 static lv_obj_t *home_bar, *home_dots, *home_view;	/* home_view: the pages' window */
 
 /*
@@ -789,9 +790,10 @@ static void pg_settle_late(lv_anim_t *a)
 	pg_frames_end(pg.target);
 }
 
+static void pg_settle_from(double v0);
+
 static void pg_settle(double v)
 {
-	lv_anim_t a;
 	bool inside = pg.off >= 0 && pg.off <= pg_max_off();
 	double v0;
 
@@ -800,6 +802,14 @@ static void pg_settle(double v)
 		pg.vel = pg.prev_vel = 0;	/* (_endPanWithEvent) */
 	v0 = pg.prev_vel != 0 ? 0.75 * pg.prev_vel + 0.25 * pg.vel : pg.vel;	/* (_startTimer) */
 	LV_UNUSED(v);
+	pg_settle_from(v0);
+}
+
+/* the settle to pg.target from pg.off at @v0 (px/ms) */
+static void pg_settle_from(double v0)
+{
+	lv_anim_t a;
+
 	ios_pager_init(&pg.sp, (float)PW);
 	pg.sp.x = (float)pg.off;
 	pg.sp.v = v0;
@@ -824,6 +834,23 @@ static void pg_settle(double v)
 	lv_anim_set_duration(&a, 3000);		/* (ends itself well before) */
 	lv_anim_set_completed_cb(&a, pg_settle_late);
 	lv_anim_start(&a);
+}
+
+/*
+ * To page @p as a swipe would settle there, from rest (an icon held at the
+ * edge, dock.c). False: not now (a swipe on, home not showing).
+ */
+static bool pg_glide_to(int p)
+{
+	if (p < 0 || p >= pg.n || p == pg.cur || pg.scr || pg.on || lv_screen_active() != home_scr)
+		return false;
+	if (!pg_frames_begin())
+		return false;
+	pg.dir = 0;
+	pg.target = p;
+	pg.off = pg.cur * PW;
+	pg_settle_from(0);
+	return true;
 }
 
 /* ---------------------------------------------------------------- touch */
@@ -970,6 +997,7 @@ static void pg_warm(lv_timer_t *t)
 /* Home is being built again (a turn, a theme): its pictures go with it. */
 static void pg_home_gone(void)
 {
+	dock_carry_stop();	/* (a carried icon is put down first) */
 	dock_fly_stop();	/* (its picture flies over the old home) */
 	if (pg_warm_timer) {
 		awake_timer_delete(pg_warm_timer);
