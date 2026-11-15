@@ -81,7 +81,10 @@ static struct {
 	bool dock_set;		/* (no "dock=" line: the default) */
 	char tz[48];		/* the time zone's name (datetime.c; its rule is /etc/TZ) */
 	bool tz_set;
-} conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1, false, "", false, "", false };
+	char wx_name[96];	/* the weather's place (weather.c) */
+	double wx_lat, wx_lon;
+	bool wx_set, wx_f;	/* a place set; Fahrenheit */
+} conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1, false, "", false, "", false, "", 0, 0, false, false };
 
 /*
  * Auto-rotate on: the screen turns with the iPod. Off: it stays as it was
@@ -162,6 +165,16 @@ static void conf_load(void)
 			conf.bt = !!v;
 		else if (sscanf(line, "wpaccent=%d", &v) == 1)
 			conf.wp_accent = !!v;
+		else if (!strncmp(line, "wx=", 3)) {
+			int n = 0;
+
+			if (sscanf(line + 3, "%lf,%lf,%n", &conf.wx_lat, &conf.wx_lon, &n) == 2 && n > 0) {
+				snprintf(conf.wx_name, sizeof(conf.wx_name), "%s", line + 3 + n);
+				conf.wx_name[strcspn(conf.wx_name, "\r\n")] = 0;
+				conf.wx_set = true;
+			}
+		} else if (sscanf(line, "wxf=%d", &v) == 1)
+			conf.wx_f = !!v;
 		else if (!strncmp(line, "tz=", 3)) {
 			snprintf(conf.tz, sizeof(conf.tz), "%s", line + 3);
 			conf.tz[strcspn(conf.tz, "\r\n")] = 0;
@@ -191,6 +204,10 @@ static void conf_save(void)
 		fprintf(f, "dock=%s\n", conf.dock);
 	if (conf.tz_set)
 		fprintf(f, "tz=%s\n", conf.tz);
+	if (conf.wx_set)
+		fprintf(f, "wx=%.4f,%.4f,%s\n", conf.wx_lat, conf.wx_lon, conf.wx_name);
+	if (conf.wx_f)
+		fprintf(f, "wxf=1\n");
 	if (fflush(f) == 0)
 		fsync(fileno(f));
 	fclose(f);
@@ -3910,6 +3927,7 @@ static bool in_obj(lv_obj_t *o, int x, int y)
 }
 
 #include "kbd.c"		/* the system keyboard */
+#include "weather.c"	/* the weather: Open-Meteo, on the home card and the lock screen */
 
 /* Does a touch that begins at (x, y) belong to the launcher? */
 static bool ui_wants_touch(int x, int y)
@@ -4374,6 +4392,7 @@ static void lock_build(void)
 	lock_time = m3_label(lock_scr, "", clock_font ? clock_font : &lv_font_montserrat_48,
 			     lv_color_white());
 	lv_obj_align(lock_time, LV_ALIGN_TOP_MID, 0, 90);
+	wx_lock_build(lock_scr, 196);	/* (hidden while there is none) */
 	lock_batt = m3_label(lock_scr, "", &lv_font_montserrat_14, lv_color_hex(0xc8c0d0));
 	lv_obj_align(lock_batt, LV_ALIGN_BOTTOM_MID, 0, -74);
 	o = m3_label(lock_scr, "Swipe up to unlock", &lv_font_montserrat_14, lv_color_hex(0xb0a8b8));
@@ -6361,7 +6380,8 @@ static void build_home(void)
 		lv_obj_align(home_clock, LV_ALIGN_TOP_LEFT, 18, 8);
 		home_date = m3_label(c, "", &lv_font_montserrat_16, M.primary);
 		lv_obj_align(home_date, LV_ALIGN_BOTTOM_LEFT, 20, -12);
-		/* (the right side is left for weather) */
+		wx_card_build(c);	/* the right side: the weather */
+		wx_init();
 	}
 
 	app_tile(apps, LV_SYMBOL_SETTINGS, "Settings", M.primary_c, M.on_primary_c, open_settings);
@@ -8264,6 +8284,7 @@ static void open_settings(lv_event_t *e)
 	obj_track(&set_snd_sub);
 	m3_row(c, LV_SYMBOL_POWER, "Power", "Sleep, restart, power off", open_power, NULL, NULL);
 	m3_row(c, LV_SYMBOL_BELL, "Date & Time", dt_zone_name(), open_datetime, NULL, NULL);
+	m3_row(c, LV_SYMBOL_GPS, "Weather", conf.wx_set ? conf.wx_name : "Off", open_weather, NULL, NULL);
 
 	c = m3_card(body, M.surface_c);
 	lv_obj_set_style_pad_all(c, 4, 0);
