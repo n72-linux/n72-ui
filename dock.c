@@ -466,8 +466,13 @@ static void carry_tick(lv_timer_t *t)
 	int e;
 
 	LV_UNUSED(t);
-	if (!carry.on || pg.scr)
+	if (!carry.on)
 		return;
+	if (pg.scr) {
+		carry.edge_ms = lv_tick_get();	/* (the next turn counts from the glide's end) */
+		return;
+	}
+	carry_follow();		/* (a finger held still after a glide: its place on this page) */
 	e = carry.x < PX + CARRY_EDGE ? -1 : carry.x >= PX + PW - CARRY_EDGE ? 1 : 0;
 	if (carry.y < PG_TOP || carry.y >= PB)
 		e = 0;
@@ -553,8 +558,10 @@ static bool dock_carry_touch(int phase, int x, int y)
 		return false;
 	carry.x = x;
 	carry.y = y;
-	if (phase == 2)
+	if (phase == 2) {
+		carry_follow();	/* (the place under the lift, if a glide skipped the last move) */
 		carry_end(true);
+	}
 	else
 		carry_follow();
 	return true;
