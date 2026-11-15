@@ -751,18 +751,66 @@ static int rt_n;
 static uint64_t rt_frame_us;		/* when LVGL last had a frame */
 static bool rt_ui_touch;		/* a launcher touch is down */
 static bool rt_claim;			/* ... and ui_drag() has it */
+/*
+ * Multi-touch protocol B (the device has ABS_MT_SLOT): its state, as the
+ * frames so far left it. Protocol B sends only what changed, so a touch
+ * becoming the application's starts with the whole state of every contact
+ * (rt_app_begin), and the application's touch ends with every slot lifted.
+ */
+#define RT_SLOTS	16
+static bool rt_mt_b;
+static int rt_nslots, rt_cur;
+static struct { int id, x, y; } rt_sl[RT_SLOTS];
+
+static void rt_put(struct input_event *v, int *n, int type, int code, int value)
+{
+	v[*n].type = type;
+	v[*n].code = code;
+	v[*n].value = value;
+	(*n)++;
+}
+
+/* A touch becomes the application's: one frame with everything down now. */
+static void rt_app_begin(void)
+{
+	struct input_event v[RT_SLOTS * 4 + 8] = { 0 };
+	int n = 0, i;
+
+	for (i = 0; i < rt_nslots; i++) {
+		if (rt_sl[i].id < 0)
+			continue;
+		rt_put(v, &n, EV_ABS, ABS_MT_SLOT, i);
+		rt_put(v, &n, EV_ABS, ABS_MT_TRACKING_ID, rt_sl[i].id);
+		rt_put(v, &n, EV_ABS, ABS_MT_POSITION_X, rt_sl[i].x);
+		rt_put(v, &n, EV_ABS, ABS_MT_POSITION_Y, rt_sl[i].y);
+	}
+	rt_put(v, &n, EV_ABS, ABS_MT_SLOT, rt_cur);	/* (where the next frames continue) */
+	rt_put(v, &n, EV_ABS, ABS_X, rt_raw_x);
+	rt_put(v, &n, EV_ABS, ABS_Y, rt_raw_y);
+	rt_put(v, &n, EV_KEY, BTN_TOUCH, 1);
+	rt_put(v, &n, EV_SYN, SYN_REPORT, 0);
+	if (write(rt_uinput, v, n * sizeof(v[0])) < 0)
+		;
+}
 
 static void rt_reset(void)
 {
 	if (rt_owner == RT_APP && rt_uinput >= 0) {
 		/* the application's touch ends here */
-		struct input_event up[3] = {
-			{ .type = EV_KEY, .code = BTN_TOUCH, .value = 0 },
-			{ .type = EV_SYN, .code = SYN_MT_REPORT },
-			{ .type = EV_SYN, .code = SYN_REPORT },
-		};
+		struct input_event up[RT_SLOTS * 2 + 4] = { 0 };
+		int n = 0, i;
 
-		if (write(rt_uinput, up, sizeof(up)) < 0)
+		if (rt_mt_b) {
+			for (i = 0; i < rt_nslots; i++) {
+				rt_put(up, &n, EV_ABS, ABS_MT_SLOT, i);
+				rt_put(up, &n, EV_ABS, ABS_MT_TRACKING_ID, -1);
+			}
+		}
+		rt_put(up, &n, EV_KEY, BTN_TOUCH, 0);
+		if (!rt_mt_b)
+			rt_put(up, &n, EV_SYN, SYN_MT_REPORT, 0);
+		rt_put(up, &n, EV_SYN, SYN_REPORT, 0);
+		if (write(rt_uinput, up, n * sizeof(up[0])) < 0)
 			;
 	}
 	rt_n = 0;
@@ -824,8 +872,14 @@ static bool rt_frame_done(void)
 	lv_point_t p = rt_map(rt_raw_x, rt_raw_y), l = rt_logical(p);
 	bool news = false;
 
-	if (rt_owner == RT_NONE && rt_down)
+	if (rt_owner == RT_NONE && rt_down) {
 		rt_owner = app_pid > 0 && !ui_wants_touch(l.x, l.y) ? RT_APP : RT_UI;
+		if (rt_owner == RT_APP && rt_mt_b) {
+			rt_app_begin();		/* (this frame's news included) */
+			rt_n = 0;
+			return false;
+		}
+	}
 	if (rt_owner == RT_APP) {
 		if (write(rt_uinput, rt_frame, rt_n * sizeof(rt_frame[0])) < 0)
 			;
@@ -871,12 +925,25 @@ static void rt_feed(int fd, lv_indev_t *indev)
 				rt_n = 0;
 				continue;
 			}
-			if (e->type == EV_ABS && (e->code == ABS_X || e->code == ABS_MT_POSITION_X))
+			/*
+			 * The launcher follows the single-touch axes (the first
+			 * contact; with slots, another finger's MT position would
+			 * move it); the slots are kept for the application.
+			 */
+			if (e->type == EV_ABS && e->code == ABS_X)
 				rt_raw_x = e->value;
-			else if (e->type == EV_ABS && (e->code == ABS_Y || e->code == ABS_MT_POSITION_Y))
+			else if (e->type == EV_ABS && e->code == ABS_Y)
 				rt_raw_y = e->value;
 			else if (e->type == EV_KEY && e->code == BTN_TOUCH)
 				rt_down = e->value != 0;
+			else if (e->type == EV_ABS && e->code == ABS_MT_SLOT)
+				rt_cur = LV_CLAMP(0, e->value, RT_SLOTS - 1);
+			else if (e->type == EV_ABS && e->code == ABS_MT_TRACKING_ID)
+				rt_sl[rt_cur].id = e->value;
+			else if (e->type == EV_ABS && e->code == ABS_MT_POSITION_X)
+				rt_sl[rt_cur].x = e->value;
+			else if (e->type == EV_ABS && e->code == ABS_MT_POSITION_Y)
+				rt_sl[rt_cur].y = e->value;
 			if (rt_n < (int)(sizeof(rt_frame) / sizeof(rt_frame[0])))
 				rt_frame[rt_n++] = *e;
 			if (e->type == EV_SYN && e->code == SYN_REPORT) {
@@ -927,6 +994,11 @@ static bool rt_init(int fd, const char *cal, const char *swap)
 		return false;
 	if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(absbits)), absbits) < 0)
 		goto fail;
+	rt_mt_b = absbits[ABS_MT_SLOT / (8 * sizeof(long))] & (1UL << (ABS_MT_SLOT % (8 * sizeof(long))));
+	if (rt_mt_b && ioctl(fd, EVIOCGABS(ABS_MT_SLOT), &ai) == 0)
+		rt_nslots = LV_MIN(ai.maximum + 1, RT_SLOTS);
+	for (c = 0; c < RT_SLOTS; c++)
+		rt_sl[c].id = -1;
 	ioctl(u, UI_SET_EVBIT, EV_SYN);
 	ioctl(u, UI_SET_EVBIT, EV_KEY);
 	ioctl(u, UI_SET_EVBIT, EV_ABS);
