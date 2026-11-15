@@ -2825,8 +2825,15 @@ static void battery_text(char *buf, size_t len)
 	icon = cap > 87 ? LV_SYMBOL_BATTERY_FULL : cap > 62 ? LV_SYMBOL_BATTERY_3 :
 	       cap > 37 ? LV_SYMBOL_BATTERY_2 : cap > 12 ? LV_SYMBOL_BATTERY_1 :
 	       LV_SYMBOL_BATTERY_EMPTY;
-	snprintf(buf, len, "%s%d%%  %s", strncmp(st, "Charging", 8) ? "" :
-		 LV_SYMBOL_CHARGE " ", cap, icon);
+	/*
+	 * The bolt while on external power, charging or not: plugged in and
+	 * topped up the battery reads "Full" (or "Not charging"), and the bar
+	 * looked as on battery.
+	 */
+	snprintf(buf, len, "%s%d%%  %s",
+		 !strncmp(st, "Charging", 8) ||
+		 read_sysfs_int("/sys/class/power_supply/usb/online", 0) == 1 ? LV_SYMBOL_CHARGE " " : "",
+		 cap, icon);
 }
 
 static lv_timer_t *home_timer;
