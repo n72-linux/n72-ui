@@ -79,7 +79,9 @@ static struct {
 	bool wp_accent;		/* the colours from the home wallpaper (wallpaper.c) */
 	char dock[200];		/* the dock's icons, names joined by '|' (dock.c) */
 	bool dock_set;		/* (no "dock=" line: the default) */
-} conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1, false, "", false };
+	char tz[48];		/* the time zone's name (datetime.c; its rule is /etc/TZ) */
+	bool tz_set;
+} conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1, false, "", false, "", false };
 
 /*
  * Auto-rotate on: the screen turns with the iPod. Off: it stays as it was
@@ -160,7 +162,11 @@ static void conf_load(void)
 			conf.bt = !!v;
 		else if (sscanf(line, "wpaccent=%d", &v) == 1)
 			conf.wp_accent = !!v;
-		else if (!strncmp(line, "dock=", 5)) {
+		else if (!strncmp(line, "tz=", 3)) {
+			snprintf(conf.tz, sizeof(conf.tz), "%s", line + 3);
+			conf.tz[strcspn(conf.tz, "\r\n")] = 0;
+			conf.tz_set = true;
+		} else if (!strncmp(line, "dock=", 5)) {
 			snprintf(conf.dock, sizeof(conf.dock), "%s", line + 5);
 			conf.dock[strcspn(conf.dock, "\r\n")] = 0;
 			conf.dock_set = true;
@@ -183,6 +189,8 @@ static void conf_save(void)
 		conf.wp_accent);
 	if (conf.dock_set)	/* (only once changed: the file is as it was till then) */
 		fprintf(f, "dock=%s\n", conf.dock);
+	if (conf.tz_set)
+		fprintf(f, "tz=%s\n", conf.tz);
 	if (fflush(f) == 0)
 		fsync(fileno(f));
 	fclose(f);
@@ -2825,15 +2833,8 @@ static void battery_text(char *buf, size_t len)
 	icon = cap > 87 ? LV_SYMBOL_BATTERY_FULL : cap > 62 ? LV_SYMBOL_BATTERY_3 :
 	       cap > 37 ? LV_SYMBOL_BATTERY_2 : cap > 12 ? LV_SYMBOL_BATTERY_1 :
 	       LV_SYMBOL_BATTERY_EMPTY;
-	/*
-	 * The bolt while on external power, charging or not: plugged in and
-	 * topped up the battery reads "Full" (or "Not charging"), and the bar
-	 * looked as on battery.
-	 */
-	snprintf(buf, len, "%s%d%%  %s",
-		 !strncmp(st, "Charging", 8) ||
-		 read_sysfs_int("/sys/class/power_supply/usb/online", 0) == 1 ? LV_SYMBOL_CHARGE " " : "",
-		 cap, icon);
+	snprintf(buf, len, "%s%d%%  %s", strncmp(st, "Charging", 8) ? "" :
+		 LV_SYMBOL_CHARGE " ", cap, icon);
 }
 
 static lv_timer_t *home_timer;
@@ -7339,7 +7340,6 @@ static void bright_cb(lv_event_t *e)
 	conf.bright = v;
 	conf_save_later();
 	lv_slider_set_value(home_bright, v, LV_ANIM_OFF);
-	shade_changed(home_bright);	/* (the panel's picture is taken again: no jump when pulled) */
 	snprintf(buf, sizeof(buf), "%d%%", v);
 	label_set_if_changed(bright_val, buf);
 }
@@ -8229,6 +8229,7 @@ static void apps_refresh_cb(lv_event_t *e)
 }
 
 #include "wallpaper.c"	/* wallpapers: conversion, frames, the Settings page */
+#include "datetime.c"	/* Settings > Date & Time: the zone, network or set time */
 
 static void open_settings(lv_event_t *e)
 {
@@ -8262,6 +8263,7 @@ static void open_settings(lv_event_t *e)
 	m3_row(c, LV_SYMBOL_VOLUME_MAX, "Sound", sub, open_sound, NULL, &set_snd_sub);
 	obj_track(&set_snd_sub);
 	m3_row(c, LV_SYMBOL_POWER, "Power", "Sleep, restart, power off", open_power, NULL, NULL);
+	m3_row(c, LV_SYMBOL_BELL, "Date & Time", dt_zone_name(), open_datetime, NULL, NULL);
 
 	c = m3_card(body, M.surface_c);
 	lv_obj_set_style_pad_all(c, 4, 0);
