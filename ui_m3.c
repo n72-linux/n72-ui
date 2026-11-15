@@ -14,6 +14,7 @@
 
 #include <math.h>
 #include <spawn.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include "lvgl/src/indev/lv_indev_private.h"	/* the throw velocity */
 #include "lvgl/src/core/lv_obj_scroll_private.h"	/* lv_obj_scroll_by_raw() */
@@ -2859,8 +2860,15 @@ static void battery_text(char *buf, size_t len)
 	icon = cap > 87 ? LV_SYMBOL_BATTERY_FULL : cap > 62 ? LV_SYMBOL_BATTERY_3 :
 	       cap > 37 ? LV_SYMBOL_BATTERY_2 : cap > 12 ? LV_SYMBOL_BATTERY_1 :
 	       LV_SYMBOL_BATTERY_EMPTY;
-	snprintf(buf, len, "%s%d%%  %s", strncmp(st, "Charging", 8) ? "" :
-		 LV_SYMBOL_CHARGE " ", cap, icon);
+	/*
+	 * The bolt while on external power, charging or not: plugged in and
+	 * topped up the battery reads "Full" (or "Not charging"), and the bar
+	 * looked as on battery.
+	 */
+	snprintf(buf, len, "%s%d%%  %s",
+		 !strncmp(st, "Charging", 8) ||
+		 read_sysfs_int("/sys/class/power_supply/usb/online", 0) == 1 ? LV_SYMBOL_CHARGE " " : "",
+		 cap, icon);
 }
 
 static lv_timer_t *home_timer;
@@ -6826,6 +6834,51 @@ static char bt_list_sig[16 * 24];	/* what the list shows: rebuilt only on a chan
  */
 #define BT_AUTO_PATH "/var/lib/n72/bt-auto"
 
+/*
+ * Automatic and manual connects take turns: two pages at once make the
+ * controller refuse the second ("br-connection-busy", then BlueZ's
+ * "br-connection-unknown"). The automatic run (bt_auto_tick) holds
+ * BT_AUTO_RUN while it pages and gives up between devices as soon as
+ * BT_MANUAL_RUN appears; a manual connect sets BT_MANUAL_RUN and waits for
+ * the device being paged to finish (8 s at most) before it starts.
+ */
+#define BT_AUTO_RUN "/run/n72-bt-auto"
+#define BT_MANUAL_RUN "/run/n72-bt-manual"
+#define BT_MANUAL(cmd) "touch " BT_MANUAL_RUN "; i=0; while [ -e " BT_AUTO_RUN " ] && " \
+	"[ $i -lt 40 ]; do sleep 0.25; i=$((i+1)); done; " cmd "; r=$?; rm -f " BT_MANUAL_RUN "; exit $r"
+
+/*
+ * Devices the user disconnected: not reconnected automatically until they
+ * connect again (by a tap, or by themselves) or Bluetooth is switched off.
+ */
+#define BT_USER_OFF_MAX 8
+static char bt_user_off[BT_USER_OFF_MAX][18];
+
+static bool bt_user_off_has(const char *mac)
+{
+	for (int i = 0; i < BT_USER_OFF_MAX; i++)
+		if (bt_user_off[i][0] && !strcasecmp(bt_user_off[i], mac))
+			return true;
+	return false;
+}
+
+static void bt_user_off_set(const char *mac, bool off)
+{
+	int free_i = -1;
+
+	for (int i = 0; i < BT_USER_OFF_MAX; i++) {
+		if (bt_user_off[i][0] && !strcasecmp(bt_user_off[i], mac)) {
+			if (!off)
+				bt_user_off[i][0] = 0;
+			return;
+		}
+		if (!bt_user_off[i][0] && free_i < 0)
+			free_i = i;
+	}
+	if (off)
+		snprintf(bt_user_off[free_i >= 0 ? free_i : 0], 18, "%s", mac);
+}
+
 static bool bt_auto_get(const char *mac)
 {
 	char line[64];
@@ -6870,7 +6923,7 @@ static void open_bt_dev_cb(lv_event_t *e);
 static void bt_dev_cb(lv_event_t *e)
 {
 	struct bt_dev *d = lv_event_get_user_data(e);
-	char cmd[200];
+	char cmd[400];
 
 	/*
 	 * Pairing needs an agent: bluetoothctl's own, without input or output
@@ -6878,13 +6931,14 @@ static void bt_dev_cb(lv_event_t *e)
 	 * fails here). Audio devices connect only when bluez-alsa (bluealsa)
 	 * runs: it is what offers BlueZ the A2DP profile.
 	 */
+	bt_user_off_set(d->mac, d->connected);
 	if (d->connected)
 		snprintf(cmd, sizeof(cmd), "bluetoothctl disconnect %s", d->mac);
 	else if (d->paired)
-		snprintf(cmd, sizeof(cmd), "bluetoothctl --timeout 20 connect %s", d->mac);
+		snprintf(cmd, sizeof(cmd), BT_MANUAL("bluetoothctl --timeout 20 connect %s"), d->mac);
 	else
-		snprintf(cmd, sizeof(cmd), "bluetoothctl --agent NoInputNoOutput --timeout 25 pair %s && "
-			 "bluetoothctl trust %s && bluetoothctl --timeout 20 connect %s",
+		snprintf(cmd, sizeof(cmd), BT_MANUAL("bluetoothctl --agent NoInputNoOutput --timeout 25 "
+			 "pair %s && bluetoothctl trust %s && bluetoothctl --timeout 20 connect %s"),
 			 d->mac, d->mac, d->mac);
 	{
 		/* the row says what is going on (its second line) */
@@ -7194,11 +7248,12 @@ static void btd_cmd_done(const char *out, void *ud)
 
 static void btd_conn_cb(lv_event_t *e)
 {
-	char cmd[96];
+	char cmd[256];
 
 	LV_UNUSED(e);
+	bt_user_off_set(btd_mac, btd_connected);
 	snprintf(cmd, sizeof(cmd), btd_connected ? "bluetoothctl disconnect %s" :
-		 "bluetoothctl --timeout 20 connect %s", btd_mac);
+		 BT_MANUAL("bluetoothctl --timeout 20 connect %s"), btd_mac);
 	if (btd_status)
 		lv_label_set_text(btd_status, btd_connected ? "Disconnecting..." : "Connecting...");
 	job_run(cmd, btd_page, btd_cmd_done, NULL);
@@ -7329,36 +7384,54 @@ static void bt_auto_try_done(const char *out, void *ud)
 
 static void bt_auto_paired_done(const char *out, void *ud)
 {
-	char cmd[512] = "", mac[18];
+	char cmd[1024], mac[18];
 	const char *p;
-	size_t o = 0;
+	size_t o;
+	bool connected = false;
+	int n = 0;
 
 	LV_UNUSED(ud);
+	o = (size_t)snprintf(cmd, sizeof(cmd), "touch " BT_AUTO_RUN "; ");
 	for (p = out; p && *p; ) {
-		if (sscanf(p, "Device %17s", mac) == 1 && bt_auto_get(mac) && o < sizeof(cmd) - 90)
-			o += snprintf(cmd + o, sizeof(cmd) - o, "%sbluetoothctl --timeout 8 connect %s "
-				      "| grep -q 'Connection successful'", o ? " || " : "", mac);
+		if (sscanf(p, "C Device %17s", mac) == 1) {
+			/* connected, by a tap or by itself: automatic again later */
+			bt_user_off_set(mac, false);
+			connected = true;
+		} else if (sscanf(p, "Device %17s", mac) == 1 && bt_auto_get(mac) &&
+			   !bt_user_off_has(mac) && o < sizeof(cmd) - 160) {
+			/* (each device: not if a manual connect is waiting) */
+			o += snprintf(cmd + o, sizeof(cmd) - o, "%s{ [ -e " BT_MANUAL_RUN " ] || "
+				      "bluetoothctl --timeout 8 connect %s | grep -q 'Connection successful'; }",
+				      n++ ? " || " : "", mac);
+		}
 		p = strchr(p, '\n');
 		if (p)
 			p++;
 	}
-	if (!o) {
+	if (connected || !n) {
 		bt_auto_busy = false;
 		return;
 	}
-	job_run(cmd, NULL, bt_auto_try_done, NULL);
+	snprintf(cmd + o, sizeof(cmd) - o, "; rm -f " BT_AUTO_RUN);
+	if (job_run(cmd, NULL, bt_auto_try_done, NULL))
+		bt_auto_busy = false;
 }
 
 static void bt_auto_tick(lv_timer_t *t)
 {
 	LV_UNUSED(t);
+	if (!bt_powered)
+		memset(bt_user_off, 0, sizeof(bt_user_off));	/* (off and on: a fresh start) */
 	if (bt_auto_busy || screen_off || locked || !bt_powered || bt_want >= 0 ||
-	    !access("/run/n72-audio", F_OK) || !have_tool("bluetoothctl"))
+	    !access("/run/n72-audio", F_OK) || !access(BT_MANUAL_RUN, F_OK) ||
+	    !have_tool("bluetoothctl"))
 		return;
 	bt_auto_busy = true;
-	/* paired, and not connected to anything else of ours */
-	job_run("bluetoothctl devices Connected | grep -q Device || bluetoothctl devices Paired",
-		NULL, bt_auto_paired_done, NULL);
+	/* paired, and not connected to anything else of ours ("C " lines: connected) */
+	if (job_run("c=$(bluetoothctl devices Connected | grep Device); "
+		    "if [ -n \"$c\" ]; then echo \"$c\" | sed 's/^/C /'; else bluetoothctl devices Paired; fi",
+		    NULL, bt_auto_paired_done, NULL))
+		bt_auto_busy = false;
 }
 
 /* ------------------------------------------------------------ Display */
@@ -7374,6 +7447,7 @@ static void bright_cb(lv_event_t *e)
 	conf.bright = v;
 	conf_save_later();
 	lv_slider_set_value(home_bright, v, LV_ANIM_OFF);
+	shade_changed(home_bright);	/* (the panel's picture is taken again: no jump when pulled) */
 	snprintf(buf, sizeof(buf), "%d%%", v);
 	label_set_if_changed(bright_val, buf);
 }
@@ -10060,6 +10134,8 @@ static void ui_apply_saved(void)
 		job_run("n72-wifi off", NULL, NULL, NULL);
 	if (conf.bt == 0 && have_tool("bluetoothctl"))
 		job_run(BT_OFF_CMD, NULL, bt_set_done, NULL);
+	unlink(BT_AUTO_RUN);	/* (left by an n72-ui that ended mid-run) */
+	unlink(BT_MANUAL_RUN);
 	awake_timer(bt_auto_tick, 30000, NULL);	/* Connect automatically */
 	apps_watch();		/* the home tiles follow APPS_DIR and DESKTOP_DIR */
 	bz_start(NULL);		/* BlueZ's signals: the Bluetooth views follow */
