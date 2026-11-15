@@ -7332,6 +7332,7 @@ static void bright_cb(lv_event_t *e)
 	conf.bright = v;
 	conf_save_later();
 	lv_slider_set_value(home_bright, v, LV_ANIM_OFF);
+	shade_changed(home_bright);	/* (the panel's picture is taken again: no jump when pulled) */
 	snprintf(buf, sizeof(buf), "%d%%", v);
 	label_set_if_changed(bright_val, buf);
 }
