@@ -1613,17 +1613,22 @@ static void plug_changed(void)
 static void uevent_ev(int fd)
 {
 	char buf[2048];
-	bool usb = false;
+	bool usb = false, psy = false;
 	ssize_t n;
 
 	while ((n = recv(fd, buf, sizeof(buf) - 1, MSG_DONTWAIT)) > 0) {
 		buf[n] = 0;
-		for (char *p = buf; p < buf + n; p += strlen(p) + 1)
+		for (char *p = buf; p < buf + n; p += strlen(p) + 1) {
 			if (!strcmp(p, "POWER_SUPPLY_NAME=usb"))
 				usb = true;
+			if (!strcmp(p, "SUBSYSTEM=power_supply"))
+				psy = true;
+		}
 	}
 	if (usb)
 		plug_changed();
+	if (psy)
+		status_kick(true, false);	/* the battery text: bolt, level */
 }
 
 static void uevent_init(void)

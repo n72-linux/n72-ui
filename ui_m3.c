@@ -15,6 +15,7 @@
 #include <math.h>
 #include <spawn.h>
 #include <strings.h>
+#include <linux/rtnetlink.h>
 #include <sys/stat.h>
 #include "lvgl/src/indev/lv_indev_private.h"	/* the throw velocity */
 #include "lvgl/src/core/lv_obj_scroll_private.h"	/* lv_obj_scroll_by_raw() */
@@ -3008,7 +3009,116 @@ static void net_ui_sync(void)
 	icon_show(status_bt, b && bt_want < 0);
 	icon_show(app_bar_wifi, w && wifi_up && wifi_want < 0);
 	icon_show(app_bar_bt, b && bt_want < 0);
+	if (home_net)
+		label_set_if_changed(home_net, wifi_up ? wifi_ssid : "Wi-Fi off");
 	app_bar_update();
+}
+
+/*
+ * The status bar follows events, not a poll: the kernel's power_supply
+ * uevents (USB in or out, the battery gauge's new level: main.c's
+ * uevent_ev) and rtnetlink's link and address messages for wlan0 (Wi-Fi
+ * associated, lost, switched off), each read only when it comes; Bluetooth
+ * through BlueZ's signals (bz_ev). An event marks what is stale and one
+ * short timer reads it, so a burst (an association sends several) costs
+ * one sysfs read or one wpa_cli. While the screen is dark only the marks
+ * are kept: the wake path's home_update reads what they name.
+ */
+static bool status_batt_dirty, status_net_dirty;
+static lv_timer_t *status_ev_timer;
+static int rtnl_fd = -1;
+
+static void status_batt_update(void)
+{
+	char buf[64];
+
+	battery_text(buf, sizeof(buf));
+	label_set_if_changed(batt_lbl, buf);
+	if (home_batt)
+		label_set_if_changed(home_batt, buf);
+	app_bar_update();
+}
+
+static void status_ev_run(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	status_ev_timer = NULL;
+	if (getenv("N72_STATUS_LOG"))
+		fprintf(stderr, "n72-ui: status event: battery %d, Wi-Fi %d%s\n", status_batt_dirty,
+			status_net_dirty, screen_off ? " (dark: on wake)" : "");
+	if (screen_off)
+		return;
+	if (status_batt_dirty) {
+		status_batt_dirty = false;
+		status_batt_update();
+	}
+	if (status_net_dirty) {
+		status_net_dirty = false;
+		status_refresh(false);	/* (wifi_status_done: net_ui_sync) */
+	}
+}
+
+static void status_kick(bool batt, bool net)
+{
+	status_batt_dirty |= batt;
+	status_net_dirty |= net;
+	if (screen_off || status_ev_timer)
+		return;
+	status_ev_timer = lv_timer_create(status_ev_run, net ? 300 : 100, NULL);
+	lv_timer_set_repeat_count(status_ev_timer, 1);
+}
+
+/* Is this rtnetlink message about wlan0 (by name for links, by index for addresses)? */
+static bool rtnl_is_wlan(struct nlmsghdr *h, unsigned int wl_idx)
+{
+	if (h->nlmsg_type == RTM_NEWLINK || h->nlmsg_type == RTM_DELLINK) {
+		struct ifinfomsg *ifi = NLMSG_DATA(h);
+		int len = (int)IFLA_PAYLOAD(h);
+
+		for (struct rtattr *a = IFLA_RTA(ifi); RTA_OK(a, len); a = RTA_NEXT(a, len))
+			if (a->rta_type == IFLA_IFNAME)
+				return !strcmp(RTA_DATA(a), "wlan0");
+		return wl_idx && (unsigned int)ifi->ifi_index == wl_idx;
+	}
+	if (h->nlmsg_type == RTM_NEWADDR || h->nlmsg_type == RTM_DELADDR) {
+		struct ifaddrmsg *ifa = NLMSG_DATA(h);
+
+		return wl_idx && ifa->ifa_index == wl_idx;
+	}
+	return false;
+}
+
+static void rtnl_ev(int fd)
+{
+	char buf[4096] __attribute__((aligned(4)));
+	unsigned int wl_idx = if_nametoindex("wlan0");
+	bool wl = false;
+	ssize_t n;
+
+	while ((n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT)) > 0) {
+		int len = (int)n;
+
+		for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, len);
+		     h = NLMSG_NEXT(h, len))
+			wl |= rtnl_is_wlan(h, wl_idx);
+	}
+	if (wl)
+		status_kick(false, true);
+}
+
+static void rtnl_init(void)
+{
+	struct sockaddr_nl a = { .nl_family = AF_NETLINK,
+				 .nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR };
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_ROUTE);
+
+	if (fd >= 0 && bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+		close(fd);
+		fd = -1;
+	}
+	rtnl_fd = fd;
+	if (fd >= 0)
+		ui_watch(fd, rtnl_ev);
 }
 
 static void home_update(lv_timer_t *t)
@@ -3025,18 +3135,17 @@ static void home_update(lv_timer_t *t)
 
 	if (screen_off)
 		return;		/* (the wake path calls this again) */
-	if (now - last_status >= 30 || now < last_status) {
-		status_refresh(false);	/* lands by the next run */
+	/* (Wi-Fi: rtnetlink's events mark it; a poll only without them) */
+	if (rtnl_fd >= 0 ? status_net_dirty : now - last_status >= 30 || now < last_status) {
+		status_net_dirty = false;
+		status_refresh(false);	/* lands in a moment: wifi_status_done */
 		last_status = now;
 	}
+	status_batt_dirty = false;	/* (read below) */
 	localtime_r(&now, &tm);
-	/*
-	 * No seconds on screen: run again just after the next minute starts,
-	 * or in 5 s while a Wi-Fi answer is pending.
-	 */
+	/* No seconds on screen: run again just after the next minute starts. */
 	if (t)
-		lv_timer_set_period(t, now - last_status < 2 ? 5000 :
-				    (60 - tm.tm_sec) * 1000 + 50);
+		lv_timer_set_period(t, (60 - tm.tm_sec) * 1000 + 50);
 	snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
 	label_set_if_changed(clock_lbl, buf);
 	label_set_if_changed(status_time, buf);
@@ -3064,8 +3173,6 @@ static void home_update(lv_timer_t *t)
 	label_set_if_changed(batt_lbl, buf);
 	if (home_batt)
 		label_set_if_changed(home_batt, buf);
-	if (home_net)
-		label_set_if_changed(home_net, wifi_up ? wifi_ssid : "Wi-Fi off");
 	net_ui_sync();
 }
 
@@ -10134,6 +10241,7 @@ static void ui_apply_saved(void)
 		job_run("n72-wifi off", NULL, NULL, NULL);
 	if (conf.bt == 0 && have_tool("bluetoothctl"))
 		job_run(BT_OFF_CMD, NULL, bt_set_done, NULL);
+	rtnl_init();		/* the status bar's Wi-Fi follows rtnetlink */
 	unlink(BT_AUTO_RUN);	/* (left by an n72-ui that ended mid-run) */
 	unlink(BT_MANUAL_RUN);
 	awake_timer(bt_auto_tick, 30000, NULL);	/* Connect automatically */
