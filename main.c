@@ -1728,7 +1728,7 @@ static void keys_poll(lv_timer_t *t)
 			} else if (home_down_us && mono_us() - home_down_us >= 1000000) {
 				go_home();
 				open_logs(NULL);
-			} else {
+			} else if (!gp_home()) {	/* (a game: its pause panel) */
 				go_home();
 			}
 			home_down_us = 0;

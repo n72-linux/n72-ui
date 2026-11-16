@@ -52,6 +52,9 @@ static bool app_is_game(void);
 static bool cmd_is_game(const char *cmd);
 static int rot_side, game_rot;	/* (defined with the turning code below) */
 static void open_games(lv_event_t *e);
+static bool gp_up(void);		/* the games' pause panel (ui_games.c) */
+static bool gp_home(void);
+static void gp_gone(void);
 static void rot_kick(void);
 static bool ui_turn(int rot);
 static void vc_start(void);
@@ -414,6 +417,20 @@ static lv_obj_t *slider_value(lv_obj_t *parent)
 	return l;
 }
 
+/*
+ * Symbols of our own beside LVGL's (n72_icons.c, tools/svg2glyph.py): a
+ * badge's label takes their font when its text is one of them.
+ */
+#include "n72_icons.c"
+#define N72_SYMBOL_GAMEPAD	"\xEE\x80\x80"	/* U+E000 */
+
+static const lv_font_t *icon_font(const char *icon, bool big)
+{
+	if (icon && !strcmp(icon, N72_SYMBOL_GAMEPAD))
+		return big ? &n72_icon_24 : &n72_icon_20;
+	return big ? &lv_font_montserrat_24 : &lv_font_montserrat_20;
+}
+
 /* A round icon "badge" in a tonal container, as Material 3 list items use. */
 static lv_obj_t *m3_badge(lv_obj_t *parent, const char *icon, lv_color_t bg,
 			  lv_color_t fg, int size)
@@ -427,7 +444,7 @@ static lv_obj_t *m3_badge(lv_obj_t *parent, const char *icon, lv_color_t bg,
 	lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
 	lv_obj_set_style_pad_all(b, 0, 0);
 	lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-	l = m3_label(b, icon, size >= 48 ? &lv_font_montserrat_24 : &lv_font_montserrat_20, fg);
+	l = m3_label(b, icon, icon_font(icon, size >= 48), fg);
 	lv_obj_center(l);
 	return b;
 }
@@ -4193,6 +4210,8 @@ static bool ui_wants_touch(int x, int y)
 {
 	if (locked || app_pid <= 0 || lv_screen_active() != app_scr)
 		return true;
+	if (gp_up())
+		return true;		/* a game's pause panel: all of the screen */
 	if (kbd_wants(x, y))
 		return true;
 	if (app_is_video())
@@ -5656,6 +5675,7 @@ static void app_closed(void)
 
 	app_pid = 0;
 	app_pidfd_close();
+	gp_gone();		/* (a game's pause panel) */
 	kbd_app_gone();
 	rot_kick();		/* (a player gone: no reads needed) */
 	vc_stop();
@@ -5908,7 +5928,7 @@ static void app_tile_cmd(lv_obj_t *parent, const char *name, const char *cmd,
 		{ "file", LV_SYMBOL_FILE }, { "list", LV_SYMBOL_LIST },
 		{ "terminal", LV_SYMBOL_KEYBOARD }, { "gps", LV_SYMBOL_GPS },
 		{ "charge", LV_SYMBOL_CHARGE }, { "home", LV_SYMBOL_HOME },
-		{ "folder", LV_SYMBOL_DIRECTORY }, { "game", LV_SYMBOL_PLAY },
+		{ "folder", LV_SYMBOL_DIRECTORY }, { "game", N72_SYMBOL_GAMEPAD },
 		{ "web", LV_SYMBOL_WIFI },
 	};
 	uint32_t before = lv_obj_get_child_count(parent);
@@ -6369,15 +6389,21 @@ static void files_bind(struct fpage *fp, struct flist *l, int j, int i)
 	l->at[j] = i;
 }
 
-/* Rows for the entries on screen, a row beyond each edge. */
-static void files_sync(struct fpage *fp)
+/*
+ * Rows for the entries on screen, a row beyond each edge, in each of @nl
+ * cards (struct flist): a card is as tall as all its entries, and holds
+ * only FROW_POOL rows, which @bind(ctx, l, j, i) moves and fills (row j,
+ * entry i of the card) as the page scrolls. (Files; the Games page.)
+ */
+static void rows_sync(lv_obj_t *body, struct flist *ls, int nl,
+		      void (*bind)(void *ctx, struct flist *l, int j, int i), void *ctx)
 {
 	lv_area_t bc, cc;
 	int k, i, j;
 
-	lv_obj_get_coords(fp->body, &bc);
-	for (k = 0; k < 2; k++) {
-		struct flist *l = &fp->list[k];
+	lv_obj_get_coords(body, &bc);
+	for (k = 0; k < nl; k++) {
+		struct flist *l = &ls[k];
 		int first, last;
 
 		if (!l->card)
@@ -6403,9 +6429,19 @@ static void files_sync(struct fpage *fp)
 				continue;	/* shown already */
 			if (free_j < 0)
 				break;		/* (no row left: a taller screen than counted) */
-			files_bind(fp, l, free_j, i);
+			bind(ctx, l, free_j, i);
 		}
 	}
+}
+
+static void files_bind_cb(void *ctx, struct flist *l, int j, int i)
+{
+	files_bind(ctx, l, j, i);
+}
+
+static void files_sync(struct fpage *fp)
+{
+	rows_sync(fp->body, fp->list, 2, files_bind_cb, fp);
 }
 
 static void files_open_dir(const char *path);
@@ -6656,7 +6692,7 @@ static void build_home(void)
 	page_tile_anim(apps, open_files);
 	app_tile(apps, LV_SYMBOL_PLAY, "YouTube", M.tertiary_c, M.on_tertiary_c, open_youtube);
 	page_tile_anim(apps, open_youtube);
-	app_tile(apps, LV_SYMBOL_KEYBOARD, "Games", M.primary_c, M.on_primary_c, open_games);
+	app_tile(apps, N72_SYMBOL_GAMEPAD, "Games", M.primary_c, M.on_primary_c, open_games);
 	page_tile_anim(apps, open_games);
 	home_apps_builtin = lv_obj_get_child_count(apps);
 	app_tiles(apps);
@@ -9863,7 +9899,7 @@ static bool app_is_game(void)
 /* A game in front: the screen stays on (main.c, idle_check). */
 static bool game_playing(void)
 {
-	return app_is_game() && lv_screen_active() == app_scr;
+	return app_is_game() && lv_screen_active() == app_scr && !gp_up();	/* (paused: not) */
 }
 
 /* A video playing in front: the screen stays on (main.c, idle_check). */
