@@ -2102,6 +2102,9 @@ int main(int argc, char **argv)
 	/* (a background command: a picture made into wallpaper frames, no UI) */
 	if (argc > 1 && !strcmp(argv[1], "--wallpaper"))
 		return wp_convert_main(argc, argv);
+	/* (a Games box art made small, into its cache: ui_games.c) */
+	if (argc > 1 && !strcmp(argv[1], "--thumb"))
+		return games_thumb_main(argc, argv);
 
 	/* Keep the text console from drawing over the UI. */
 	tty_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);

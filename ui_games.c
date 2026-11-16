@@ -43,8 +43,11 @@ struct game {
 	const char *system;
 	int order;		/* the system's place in games_types */
 	lv_draw_buf_t *art;	/* its box art, small (games_art_next) */
-	int8_t art_state;	/* 0 not looked for yet, 1 none, 2 art */
+	int8_t art_state;	/* 0 not looked for yet, 1 none, 2 art, 3 being made */
 };
+
+#define GAMES_ART_CACHE	"/var/cache/n72-ui/art"	/* box art made small, by --thumb */
+static bool games_art_busy;		/* a --thumb running */
 
 #define GAMES_STATES	"/root/retro/states"	/* (defaults.cfg's savestate_directory) */
 #define GAMES_THUMBS	"/root/retro/thumbnails"	/* RetroArch's thumbnail layout */
@@ -173,20 +176,20 @@ static lv_draw_buf_t *games_png_thumb(const char *path, int max_w, int max_h)
  * A game's box art, if the user has put one: a PNG beside the game with its
  * name ("Super Mario World (USA).png"), or RetroArch's own thumbnail layout,
  * GAMES_THUMBS/<database>/Named_Boxarts/<name>.png (its characters
- * &*\/:`<>?| as _). None is downloaded.
+ * &*\\/:`<>?| as _). None is downloaded. Its path into @out; false if
+ * there is none.
  */
-static lv_draw_buf_t *games_art_load(const struct game *g)
+static bool games_art_src(const struct game *g, char *out, size_t len, struct stat *st)
 {
-	char base[128], path[PATH_MAX], *c;
-	lv_draw_buf_t *b;
+	char base[128], *c;
 	const char *dot = strrchr(g->path, '.');
 	size_t i;
 
-	if (dot && (size_t)(dot - g->path) + 5 < sizeof(path)) {
-		memcpy(path, g->path, (size_t)(dot - g->path));
-		strcpy(path + (dot - g->path), ".png");
-		if ((b = games_png_thumb(path, GAMES_ART_W, GAMES_ART_H)))
-			return b;
+	if (dot && (size_t)(dot - g->path) + 5 < len) {
+		memcpy(out, g->path, (size_t)(dot - g->path));
+		strcpy(out + (dot - g->path), ".png");
+		if (!stat(out, st) && S_ISREG(st->st_mode))
+			return true;
 	}
 	games_base(g->path, base, sizeof(base));
 	for (c = base; *c; c++)
@@ -194,11 +197,133 @@ static lv_draw_buf_t *games_art_load(const struct game *g)
 			*c = '_';
 	for (i = 0; i < sizeof(games_dbs) / sizeof(games_dbs[0]); i++)
 		if (!strcmp(g->system, games_dbs[i].system)) {
-			snprintf(path, sizeof(path), GAMES_THUMBS "/%s/Named_Boxarts/%s.png",
+			snprintf(out, len, GAMES_THUMBS "/%s/Named_Boxarts/%s.png",
 				 games_dbs[i].db, base);
-			return games_png_thumb(path, GAMES_ART_W, GAMES_ART_H);
+			return !stat(out, st) && S_ISREG(st->st_mode);
 		}
-	return NULL;
+	return false;
+}
+
+/*
+ * The cache: a picture made small once (n72-ui --thumb, in a process of its
+ * own: a large PNG takes a second or more to decode here, which on the UI
+ * thread stalled the page), kept as GAMES_ART_CACHE/<key>.argb, the key
+ * from the picture's path, size, time and the size asked for (a changed
+ * picture is made again). "N72A", width and height (16 bits each, little
+ * endian), then the pixels, ARGB8888 (straight alpha), row after row.
+ */
+static void games_art_cache_path(const char *src, const struct stat *st, int w, int h,
+				 char *out, size_t len)
+{
+	uint64_t k = 1469598103934665603ULL;	/* FNV-1a */
+	char key[PATH_MAX + 64];
+	const unsigned char *c;
+
+	snprintf(key, sizeof(key), "%s|%lld|%lld|%dx%d", src, (long long)st->st_size,
+		 (long long)st->st_mtime, w, h);
+	for (c = (const unsigned char *)key; *c; c++)
+		k = (k ^ *c) * 1099511628211ULL;
+	snprintf(out, len, GAMES_ART_CACHE "/%016llx.argb", (unsigned long long)k);
+}
+
+static lv_draw_buf_t *games_art_cache_load(const char *path)
+{
+	unsigned char hd[8];
+	lv_draw_buf_t *b = NULL;
+	FILE *f = fopen(path, "rb");
+	unsigned w, h, y;
+
+	struct stat st;
+
+	if (!f)
+		return NULL;
+	if (fread(hd, 1, 8, f) == 8 && !memcmp(hd, "N72A", 4) && !fstat(fileno(f), &st)) {
+		w = hd[4] | hd[5] << 8;
+		h = hd[6] | hd[7] << 8;
+		/* (the whole picture or nothing: its size is the header's) */
+		if (w && h && w <= 512 && h <= 512 && st.st_size == 8 + (off_t)w * h * 4 &&
+		    (b = lv_draw_buf_create(w, h, LV_COLOR_FORMAT_ARGB8888, 0))) {
+			for (y = 0; y < h; y++)
+				if (fread(b->data + y * b->header.stride, 4, w, f) != w) {
+					lv_draw_buf_destroy(b);
+					b = NULL;
+					break;
+				}
+		}
+	}
+	fclose(f);
+	if (b)
+		utimensat(AT_FDCWD, path, NULL, 0);	/* (used now: see games_art_sweep) */
+	return b;
+}
+
+/*
+ * Cache files not used for 30 days (their games gone, or their pictures
+ * replaced: a new key), and any half-written ones (.tmp: a helper killed
+ * halfway), are removed when the Games page opens.
+ */
+static void games_art_sweep(void)
+{
+	DIR *d = opendir(GAMES_ART_CACHE);
+	struct dirent *de;
+	time_t old = time(NULL) - 30 * 24 * 3600;
+
+	if (!d)
+		return;
+	while ((de = readdir(d))) {
+		char path[PATH_MAX];
+		struct stat st;
+		size_t n = strlen(de->d_name);
+
+		if (de->d_name[0] == '.' ||
+		    (size_t)snprintf(path, sizeof(path), GAMES_ART_CACHE "/%s", de->d_name) >= sizeof(path) ||
+		    stat(path, &st))
+			continue;
+		if ((n > 4 && !strcmp(de->d_name + n - 4, ".tmp") && !games_art_busy) ||
+		    st.st_mtime < old)
+			unlink(path);
+	}
+	closedir(d);
+}
+
+/* `n72-ui --thumb SRC OUT W H`: SRC fitted into W x H, written to OUT (the
+ * cache's format); 0 when done. Run by the Games page (games_art_next). */
+static int games_thumb_main(int argc, char **argv)
+{
+	char tmp[PATH_MAX + 8];
+	lv_draw_buf_t *b;
+	FILE *f;
+	unsigned y, w, h;
+	unsigned char hd[8] = { 'N', '7', '2', 'A' };
+	int ok = 1;
+
+	struct sched_param sp = { 0 };
+
+	if (argc < 6)
+		return 2;
+	/* only when the UI has nothing to do: one core, and nice alone still
+	 * took frames from a scroll (11 of 117 over 20 ms, one 47 ms) */
+	sched_setscheduler(0, SCHED_IDLE, &sp);
+	lv_init();	/* (lodepng gives its picture as an LVGL draw buffer) */
+	b = games_png_thumb(argv[2], atoi(argv[4]), atoi(argv[5]));
+	if (!b)
+		return 1;
+	w = b->header.w;
+	h = b->header.h;
+	hd[4] = w & 0xff; hd[5] = w >> 8; hd[6] = h & 0xff; hd[7] = h >> 8;
+	snprintf(tmp, sizeof(tmp), "%s.tmp", argv[3]);
+	if (!(f = fopen(tmp, "wb")))
+		return 1;
+	if (fwrite(hd, 1, 8, f) != 8)
+		ok = 0;
+	for (y = 0; ok && y < h; y++)
+		if (fwrite(b->data + y * b->header.stride, 4, w, f) != w)
+			ok = 0;
+	if (fclose(f) || !ok || rename(tmp, argv[3])) {
+		unlink(tmp);
+		return 1;
+	}
+	return 0;
 }
 
 static const char *games_system_of(const char *path, int *order)
@@ -447,10 +572,33 @@ static void games_bind(void *ctx, struct flist *l, int j, int i)
 }
 
 /*
- * Box art, a game a tick (a decode can take tens of ms: never several in
- * one frame), for the games on screen only; the timer sleeps once those
- * have been looked at, and a scroll wakes it (games_bind).
+ * Box art for the games on screen, a game a tick: from the cache when it
+ * has been made (a small file: quick), else made by n72-ui --thumb (one
+ * at a time, at low priority), the row keeping its badge until it lands
+ * (games_art_made). The timer sleeps once those games have been looked at;
+ * a scroll or a picture made wakes it.
  */
+static struct gpage *games_cur;		/* the Games page up, if any */
+
+static void games_art_made(const char *out, void *ud);
+
+/* The row showing game @i of page @g, if one does */
+static lv_obj_t *games_row_of(struct gpage *g, int i)
+{
+	int k, j;
+
+	for (k = 0; k < g->nl; k++) {
+		struct flist *l = &g->list[k];
+
+		if (i < l->base || i >= l->base + l->n)
+			continue;
+		for (j = 0; j < FROW_POOL && l->row[j]; j++)
+			if (l->at[j] == i - l->base)
+				return l->row[j];
+	}
+	return NULL;
+}
+
 static void games_art_next(lv_timer_t *t)
 {
 	struct gpage *g = lv_timer_get_user_data(t);
@@ -460,21 +608,80 @@ static void games_art_next(lv_timer_t *t)
 		struct flist *l = &g->list[k];
 
 		for (j = 0; j < FROW_POOL && l->row[j]; j++) {
+			char src[PATH_MAX], cache[PATH_MAX], q1[PATH_MAX * 2], q2[PATH_MAX * 2],
+			     cmd[PATH_MAX * 4 + 96];
 			struct game *gm;
+			struct stat st;
 
 			if (l->at[j] < 0)
 				continue;
 			gm = &g->v[l->base + l->at[j]];
 			if (gm->art_state)
 				continue;
-			gm->art = games_art_load(gm);
-			gm->art_state = gm->art ? 2 : 1;
-			if (gm->art)
+			if (!games_art_src(gm, src, sizeof(src), &st)) {
+				gm->art_state = 1;
+				continue;	/* (a stat or two: the next at once) */
+			}
+			games_art_cache_path(src, &st, GAMES_ART_W, GAMES_ART_H, cache, sizeof(cache));
+			if ((gm->art = games_art_cache_load(cache))) {
+				gm->art_state = 2;
 				games_row_art(l->row[j], gm);
-			return;		/* one a tick */
+				return;		/* one a tick */
+			}
+			if (games_art_busy)
+				continue;	/* (its turn once the one running is made) */
+			mkdir("/var/cache/n72-ui", 0755);
+			mkdir(GAMES_ART_CACHE, 0755);
+			shq(src, q1, sizeof(q1));
+			shq(cache, q2, sizeof(q2));
+			snprintf(cmd, sizeof(cmd), "nice -n 10 /proc/%d/exe --thumb %s %s %d %d",
+				 (int)getpid(), q1, q2, GAMES_ART_W, GAMES_ART_H);
+			if (job_run(cmd, NULL, games_art_made, strdup(gm->path))) {
+				gm->art_state = 1;	/* (no memory to start it) */
+				continue;
+			}
+			games_art_busy = true;
+			gm->art_state = 3;
+			return;
 		}
 	}
 	lv_timer_pause(t);
+}
+
+/* A --thumb has ended: its game's art from the cache, then the next */
+static void games_art_made(const char *out, void *ud)
+{
+	char *path = ud;
+	struct gpage *g = games_cur;
+	int i;
+
+	LV_UNUSED(out);
+	games_art_busy = false;
+	/* (the page it was made for may have gone, or been rebuilt by a turn:
+	 * the game is found by its path in the page up now) */
+	for (i = 0; g && path && i < g->n; i++) {
+		struct game *gm = &g->v[i];
+		char src[PATH_MAX], cache[PATH_MAX];
+		struct stat st;
+		lv_obj_t *r;
+
+		if (strcmp(gm->path, path))
+			continue;
+		if (gm->art_state == 2)
+			break;
+		gm->art_state = 1;
+		if (games_art_src(gm, src, sizeof(src), &st)) {
+			games_art_cache_path(src, &st, GAMES_ART_W, GAMES_ART_H, cache, sizeof(cache));
+			if ((gm->art = games_art_cache_load(cache)))
+				gm->art_state = 2;
+		}
+		if (gm->art && (r = games_row_of(g, i)))
+			games_row_art(r, gm);
+		break;
+	}
+	free(path);
+	if (g && g->art_timer)
+		lv_timer_resume(g->art_timer);	/* (the next one) */
 }
 
 static void games_page_ev(lv_event_t *e)
@@ -488,6 +695,8 @@ static void games_page_ev(lv_event_t *e)
 	}
 	if (g->art_timer)
 		lv_timer_delete(g->art_timer);
+	if (games_cur == g)
+		games_cur = NULL;
 	for (i = 0; i < g->n; i++) {
 		free(g->v[i].path);
 		if (g->v[i].art)
@@ -721,6 +930,8 @@ static void open_games(lv_event_t *e)
 	lv_obj_add_event_cb(body, games_page_ev, LV_EVENT_SCROLL, g);
 	lv_obj_add_event_cb(body, games_page_ev, LV_EVENT_SIZE_CHANGED, g);
 	g->art_timer = lv_timer_create(games_art_next, 15, g);
+	games_cur = g;
+	games_art_sweep();
 	lv_obj_update_layout(scr);
 	rows_sync(body, g->list, g->nl, games_bind, g);
 	push(scr);
