@@ -114,7 +114,7 @@ static bool games_is_cue_track(const char *path)
 	return access(cue, R_OK) == 0;
 }
 
-static void gp_named(const char *path);
+static void gp_named(const char *path, const char *system);
 
 /*
  * A .zip is an arcade set (MAME's: many files, no ROM extensions) or one
@@ -282,7 +282,7 @@ static void games_row_cb(lv_event_t *e)
 	if (i < 0 || i >= g->n)
 		return;
 	game_rot = ui_rot ? ui_rot : rot_side;
-	gp_named(g->v[i].path);
+	gp_named(g->v[i].path, g->v[i].system);
 	shq(g->v[i].path, q, sizeof(q));
 	snprintf(cmd, sizeof(cmd), GAMES_LAUNCH " --rot %d %s", game_rot, q);
 	app_launch(cmd, r);
@@ -459,7 +459,7 @@ static void gp_status(bool paused)
 	gp_later(120);		/* (taken at its next frame) then asked again */
 }
 
-static void gp_thumb_load(void);
+static bool gp_thumb_load(void);
 
 /* "GET_STATUS PLAYING Snes9x 2005,gothicvania,crc32=88d63376" */
 static void gp_reply(int fd)
@@ -502,19 +502,25 @@ static void gp_state_path(char *out, size_t len, const char *ext)
 	snprintf(out, len, GP_STATES "/%s/%s.state%s", gp.core, gp.base, ext);
 }
 
-static time_t gp_state_time(void)
+static time_t gp_state_time_of(const char *ext)
 {
 	char path[PATH_MAX];
 	struct stat st;
 
 	if (!gp.core[0])
 		return 0;
-	gp_state_path(path, sizeof(path), "");
+	gp_state_path(path, sizeof(path), ext);
 	return stat(path, &st) ? 0 : st.st_mtime;
 }
 
-/* The save's picture (RetroArch's .state.png), smaller, and its time */
-static void gp_thumb_load(void)
+static time_t gp_state_time(void)
+{
+	return gp_state_time_of("");
+}
+
+/* The save's picture (RetroArch's .state.png), smaller, and its time: true
+ * once the picture is up */
+static bool gp_thumb_load(void)
 {
 	char path[PATH_MAX], when[64];
 	unsigned char *data = NULL, *out = NULL;
@@ -525,7 +531,7 @@ static void gp_thumb_load(void)
 	long n;
 
 	if (!gp_up())
-		return;
+		return false;
 	if (gp.load_btn) {
 		if (t)
 			lv_obj_remove_state(gp.load_btn, LV_STATE_DISABLED);
@@ -534,7 +540,7 @@ static void gp_thumb_load(void)
 	}
 	if (!t) {
 		lv_label_set_text(gp.saved, "No save yet");
-		return;
+		return false;
 	}
 	{
 		struct tm tm, now_tm;
@@ -550,13 +556,13 @@ static void gp_thumb_load(void)
 	}
 	gp_state_path(path, sizeof(path), ".png");
 	if (!(f = fopen(path, "rb")))
-		return;
+		return false;
 	if (fseek(f, 0, SEEK_END) || (n = ftell(f)) <= 0 || n > (1 << 20) ||
 	    fseek(f, 0, SEEK_SET) || !(data = malloc((size_t)n)) ||
 	    fread(data, 1, (size_t)n, f) != (size_t)n) {
 		fclose(f);
 		free(data);
-		return;
+		return false;
 	}
 	fclose(f);
 	lodepng_state_init(&st);
@@ -572,7 +578,7 @@ static void gp_thumb_load(void)
 	if (err || !out) {
 		if (out)
 			lv_draw_buf_destroy((lv_draw_buf_t *)out);
-		return;
+		return false;
 	}
 	{
 		/* (LVGL's lodepng gives an LVGL draw buffer, R G B packed) */
@@ -605,6 +611,7 @@ static void gp_thumb_load(void)
 			gp.pic = b;
 		}
 		lv_draw_buf_destroy((lv_draw_buf_t *)out);
+		return b != NULL;
 	}
 }
 
@@ -616,12 +623,15 @@ static void gp_timer_cb(lv_timer_t *t)
 	if (gp.save_looks > 0) {
 		time_t now = gp_state_time();
 
-		if (now && now != gp.saved_at) {
+		/* RetroArch writes the state, then its picture: both new */
+		if (now && now != gp.saved_at && gp_state_time_of(".png") >= now &&
+		    gp_thumb_load()) {
 			gp.save_looks = 0;
-			gp_thumb_load();
 		} else if (--gp.save_looks == 0) {
-			if (gp_up())
+			if (gp_up() && (!now || now == gp.saved_at))
 				lv_label_set_text(gp.saved, "Not saved");
+			else
+				gp_thumb_load();	/* (saved; the picture as it is) */
 		} else {
 			gp_later(250);
 		}
@@ -823,10 +833,8 @@ static void gp_gone(void)
 }
 
 /* The game about to start: its name and system for the panel */
-static void gp_named(const char *path)
+static void gp_named(const char *path, const char *system)
 {
-	int order;
-
 	games_name(path, gp.name, sizeof(gp.name));
-	gp.system = games_system_of(path, &order);
+	gp.system = system;	/* (a games_types string: static) */
 }

@@ -5567,6 +5567,17 @@ static bool page_back_to_app(void)
 
 static void app_kill_cb(lv_timer_t *t);
 
+/*
+ * How long an application has to end after SIGTERM before SIGKILL. A game
+ * gets longer: RetroArch writes the game's state, its save RAM and its
+ * settings on the way out (~1 s for a SNES game on this CPU); killed
+ * halfway they may be lost.
+ */
+static uint32_t app_kill_ms(void)
+{
+	return app_is_game() ? 5000 : 600;
+}
+
 /* Home on Settings over an application: the application ends into its icon. */
 static bool page_home_over_app(void)
 {
@@ -5575,7 +5586,7 @@ static bool page_home_over_app(void)
 	page_over_app = false;
 	kill(-app_pid, SIGTERM);
 	if (!za.kill_timer) {
-		za.kill_timer = lv_timer_create(app_kill_cb, 600, NULL);
+		za.kill_timer = lv_timer_create(app_kill_cb, app_kill_ms(), NULL);
 		lv_timer_set_repeat_count(za.kill_timer, 1);
 	}
 	za.page_tile = za.tile;		/* the application's tile */
@@ -5744,7 +5755,7 @@ static bool app_end(void)
 		return true;		/* already ending */
 	za_finish();
 	kill(-app_pid, SIGTERM);
-	za.kill_timer = lv_timer_create(app_kill_cb, 600, NULL);
+	za.kill_timer = lv_timer_create(app_kill_cb, app_kill_ms(), NULL);
 	lv_timer_set_repeat_count(za.kill_timer, 1);
 	za_close();
 	return true;

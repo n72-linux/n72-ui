@@ -2,7 +2,8 @@
 """
 svg2glyph.py OUT.c NAME CODEPOINT SVG SIZE[,SIZE...] : an LVGL font per SIZE
 (NAME_SIZE) holding one glyph, an SVG icon's path (a 24x24 Material-style
-icon: absolute M L H V C A Z commands), at CODEPOINT. 8 bits per pixel, 8x8
+icon: absolute M L H V C A Z commands), at CODEPOINT. 4 bits per pixel (the
+plain formats this LVGL draws: 1, 2, 4), 8x8
 samples a pixel, nonzero fill. Sized like Montserrat's FontAwesome symbols
 (the 24-unit box at 1.08 em, centred where they are: 9/24 em above the
 baseline at 24 px). No dependencies.
@@ -134,7 +135,9 @@ for size in sizes:
     centre = size * 9 / 24			# above the baseline
     ofs_y = round(centre - h / 2)
     n = '%s_%d' % (name, size)
-    data = ', '.join('0x%02x' % v for r in bm for v in r)
+    px = [(v * 15 + 127) // 255 for r in bm for v in r]	# 4 bits, packed across rows
+    px += [0] * (len(px) & 1)
+    data = ', '.join('0x%02x' % (px[k] << 4 | px[k + 1]) for k in range(0, len(px), 2))
     c += ['static const uint8_t %s_bitmap[] = { %s };' % (n, data), '',
           'static const lv_font_fmt_txt_glyph_dsc_t %s_glyphs[] = {' % n,
           '\t{ .bitmap_index = 0, .adv_w = 0, .box_w = 0, .box_h = 0, .ofs_x = 0, .ofs_y = 0 },',
@@ -145,7 +148,7 @@ for size in sizes:
           '\t  .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY },', '};', '',
           'static const lv_font_fmt_txt_dsc_t %s_dsc = {' % n,
           '\t.glyph_bitmap = %s_bitmap, .glyph_dsc = %s_glyphs, .cmaps = %s_cmaps,' % (n, n, n),
-          '\t.cmap_num = 1, .bpp = 8,', '};', '',
+          '\t.cmap_num = 1, .bpp = 4,', '};', '',
           'const lv_font_t %s = {' % n,
           '\t.get_glyph_dsc = lv_font_get_glyph_dsc_fmt_txt,',
           '\t.get_glyph_bitmap = lv_font_get_bitmap_fmt_txt,',
