@@ -42,7 +42,164 @@ struct game {
 	char name[96];
 	const char *system;
 	int order;		/* the system's place in games_types */
+	lv_draw_buf_t *art;	/* its box art, small (games_art_next) */
+	int8_t art_state;	/* 0 not looked for yet, 1 none, 2 art */
 };
+
+#define GAMES_STATES	"/root/retro/states"	/* (defaults.cfg's savestate_directory) */
+#define GAMES_THUMBS	"/root/retro/thumbnails"	/* RetroArch's thumbnail layout */
+#define GAMES_ART_W	44	/* box art in a row: at most this */
+#define GAMES_ART_H	56
+
+/* libretro's database names: RetroArch's thumbnail folders */
+static const struct { const char *system, *db; } games_dbs[] = {
+	{ "NES", "Nintendo - Nintendo Entertainment System" },
+	{ "Super Nintendo", "Nintendo - Super Nintendo Entertainment System" },
+	{ "Game Boy", "Nintendo - Game Boy" },
+	{ "Game Boy Color", "Nintendo - Game Boy Color" },
+	{ "Game Boy Advance", "Nintendo - Game Boy Advance" },
+	{ "Mega Drive", "Sega - Mega Drive - Genesis" },
+	{ "32X", "Sega - 32X" },
+	{ "Master System", "Sega - Master System - Mark III" },
+	{ "Game Gear", "Sega - Game Gear" },
+	{ "SG-1000", "Sega - SG-1000" },
+	{ "PlayStation", "Sony - PlayStation" },
+	{ "Arcade", "MAME" },
+};
+
+/* "/x/Super_Game (USA).sfc" -> "Super_Game (USA)": the file's own name, as
+ * RetroArch names its states and thumbnails */
+static void games_base(const char *path, char *out, size_t len)
+{
+	const char *b = strrchr(path, '/'), *dot;
+	size_t n;
+
+	b = b ? b + 1 : path;
+	dot = strrchr(b, '.');
+	n = dot ? (size_t)(dot - b) : strlen(b);
+	if (n >= len)
+		n = len - 1;
+	memcpy(out, b, n);
+	out[n] = 0;
+}
+
+/*
+ * A PNG, smaller: fitted into max_w x max_h (never larger than it is),
+ * each pixel the average of the ones it covers (box art scaled down
+ * without nearest-neighbour shimmer), alpha kept (ARGB8888, straight).
+ * NULL if it cannot be read or is over 1.5 megapixels (decoding one
+ * takes w x h x 4 bytes twice). (Box art in the rows, the save pictures.)
+ */
+static lv_draw_buf_t *games_png_thumb(const char *path, int max_w, int max_h)
+{
+	unsigned char *data = NULL, *out = NULL;
+	unsigned w, h, err, tw, th, x, y;
+	lv_draw_buf_t *b = NULL;
+	LodePNGState st;
+	FILE *f = fopen(path, "rb");
+	long n;
+
+	if (!f)
+		return NULL;
+	if (fseek(f, 0, SEEK_END) || (n = ftell(f)) <= 0 || n > (8 << 20) ||
+	    fseek(f, 0, SEEK_SET) || !(data = malloc((size_t)n)) ||
+	    fread(data, 1, (size_t)n, f) != (size_t)n) {
+		fclose(f);
+		free(data);
+		return NULL;
+	}
+	fclose(f);
+	lodepng_state_init(&st);
+	st.info_raw.colortype = LCT_RGBA;
+	st.info_raw.bitdepth = 8;
+	err = lodepng_inspect(&w, &h, &st, data, (size_t)n);
+	if (!err && w && h && (uint64_t)w * h <= 1536 * 1024)
+		err = lodepng_decode(&out, &w, &h, &st, data, (size_t)n);
+	else
+		err = err ? err : 1;
+	lodepng_state_cleanup(&st);
+	free(data);
+	if (err || !out) {
+		if (out)
+			lv_draw_buf_destroy((lv_draw_buf_t *)out);
+		return NULL;
+	}
+	/* (LVGL's lodepng gives an LVGL draw buffer, R G B A packed) */
+	if ((uint64_t)w * max_h > (uint64_t)h * max_w) {	/* wide: by width */
+		tw = LV_MIN((unsigned)max_w, w);
+		th = LV_MAX(1u, (unsigned)((uint64_t)h * tw / w));
+	} else {
+		th = LV_MIN((unsigned)max_h, h);
+		tw = LV_MAX(1u, (unsigned)((uint64_t)w * th / h));
+	}
+	b = lv_draw_buf_create(tw, th, LV_COLOR_FORMAT_ARGB8888, 0);
+	if (b) {
+		const uint8_t *rgba = ((lv_draw_buf_t *)out)->data;
+
+		for (y = 0; y < th; y++) {
+			unsigned y0 = (unsigned)((uint64_t)y * h / th), y1 = (unsigned)((uint64_t)(y + 1) * h / th);
+			uint8_t *o = b->data + y * b->header.stride;
+
+			if (y1 <= y0)
+				y1 = y0 + 1;
+			for (x = 0; x < tw; x++, o += 4) {
+				unsigned x0 = (unsigned)((uint64_t)x * w / tw), x1 = (unsigned)((uint64_t)(x + 1) * w / tw);
+				uint32_t r = 0, g = 0, bl = 0, a = 0, cnt = 0, xx, yy;
+
+				if (x1 <= x0)
+					x1 = x0 + 1;
+				for (yy = y0; yy < y1; yy++)
+					for (xx = x0; xx < x1; xx++) {
+						const uint8_t *q = rgba + ((size_t)yy * w + xx) * 4;
+
+						r += q[0] * q[3];	/* (by alpha: no dark fringes) */
+						g += q[1] * q[3];
+						bl += q[2] * q[3];
+						a += q[3];
+						cnt++;
+					}
+				o[0] = a ? (uint8_t)(bl / a) : 0;
+				o[1] = a ? (uint8_t)(g / a) : 0;
+				o[2] = a ? (uint8_t)(r / a) : 0;
+				o[3] = (uint8_t)(a / cnt);
+			}
+		}
+	}
+	lv_draw_buf_destroy((lv_draw_buf_t *)out);
+	return b;
+}
+
+/*
+ * A game's box art, if the user has put one: a PNG beside the game with its
+ * name ("Super Mario World (USA).png"), or RetroArch's own thumbnail layout,
+ * GAMES_THUMBS/<database>/Named_Boxarts/<name>.png (its characters
+ * &*\/:`<>?| as _). None is downloaded.
+ */
+static lv_draw_buf_t *games_art_load(const struct game *g)
+{
+	char base[128], path[PATH_MAX], *c;
+	lv_draw_buf_t *b;
+	const char *dot = strrchr(g->path, '.');
+	size_t i;
+
+	if (dot && (size_t)(dot - g->path) + 5 < sizeof(path)) {
+		memcpy(path, g->path, (size_t)(dot - g->path));
+		strcpy(path + (dot - g->path), ".png");
+		if ((b = games_png_thumb(path, GAMES_ART_W, GAMES_ART_H)))
+			return b;
+	}
+	games_base(g->path, base, sizeof(base));
+	for (c = base; *c; c++)
+		if (strchr("&*/:`<>?\\|", *c))
+			*c = '_';
+	for (i = 0; i < sizeof(games_dbs) / sizeof(games_dbs[0]); i++)
+		if (!strcmp(g->system, games_dbs[i].system)) {
+			snprintf(path, sizeof(path), GAMES_THUMBS "/%s/Named_Boxarts/%s.png",
+				 games_dbs[i].db, base);
+			return games_png_thumb(path, GAMES_ART_W, GAMES_ART_H);
+		}
+	return NULL;
+}
 
 static const char *games_system_of(const char *path, int *order)
 {
@@ -237,9 +394,40 @@ struct gpage {
 	int n, nl;
 	lv_obj_t *body;
 	struct flist *list;	/* a card a system: v[base] ... v[base + n - 1] */
+	lv_timer_t *art_timer;	/* box art looked for, a game a tick */
+	lv_draw_buf_t *cont_pic;	/* the Continue card's picture */
+	int cont;		/* the game to continue, or -1 */
 };
 
+static void games_art_next(lv_timer_t *t);
+
 static void games_row_cb(lv_event_t *e);
+
+/*
+ * A row's picture: the box art if the game has one (the badge gives way to
+ * it), else the gamepad badge. Rows are built with an image in the badge
+ * (games_row_new).
+ */
+static void games_row_art(lv_obj_t *r, const struct game *g)
+{
+	lv_obj_t *badge = lv_obj_get_child(r, 0), *glyph = lv_obj_get_child(badge, 0),
+		 *img = lv_obj_get_child(badge, 1);
+
+	if (g->art_state == 2 && g->art) {
+		lv_obj_set_size(badge, g->art->header.w, g->art->header.h);
+		lv_obj_set_style_radius(badge, 6, 0);
+		lv_obj_set_style_bg_opa(badge, LV_OPA_TRANSP, 0);
+		lv_obj_add_flag(glyph, LV_OBJ_FLAG_HIDDEN);
+		lv_image_set_src(img, g->art);
+		lv_obj_remove_flag(img, LV_OBJ_FLAG_HIDDEN);
+	} else {
+		lv_obj_set_size(badge, 40, 40);
+		lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, 0);
+		lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+		lv_obj_remove_flag(glyph, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN);
+	}
+}
 
 static void games_bind(void *ctx, struct flist *l, int j, int i)
 {
@@ -251,8 +439,42 @@ static void games_bind(void *ctx, struct flist *l, int j, int i)
 	lv_obj_set_user_data(r, (void *)(intptr_t)(l->base + i));
 	lv_label_set_text(lv_obj_get_child(col, 0), g->name);
 	lv_label_set_text(lv_obj_get_child(col, 1), g->system);
+	games_row_art(r, g);
 	lv_obj_remove_flag(r, LV_OBJ_FLAG_HIDDEN);
 	l->at[j] = i;
+	if (!g->art_state && gp_->art_timer)
+		lv_timer_resume(gp_->art_timer);	/* (its art, a tick later) */
+}
+
+/*
+ * Box art, a game a tick (a decode can take tens of ms: never several in
+ * one frame), for the games on screen only; the timer sleeps once those
+ * have been looked at, and a scroll wakes it (games_bind).
+ */
+static void games_art_next(lv_timer_t *t)
+{
+	struct gpage *g = lv_timer_get_user_data(t);
+	int k, j;
+
+	for (k = 0; k < g->nl; k++) {
+		struct flist *l = &g->list[k];
+
+		for (j = 0; j < FROW_POOL && l->row[j]; j++) {
+			struct game *gm;
+
+			if (l->at[j] < 0)
+				continue;
+			gm = &g->v[l->base + l->at[j]];
+			if (gm->art_state)
+				continue;
+			gm->art = games_art_load(gm);
+			gm->art_state = gm->art ? 2 : 1;
+			if (gm->art)
+				games_row_art(l->row[j], gm);
+			return;		/* one a tick */
+		}
+	}
+	lv_timer_pause(t);
 }
 
 static void games_page_ev(lv_event_t *e)
@@ -264,19 +486,23 @@ static void games_page_ev(lv_event_t *e)
 		rows_sync(g->body, g->list, g->nl, games_bind, g);
 		return;
 	}
-	for (i = 0; i < g->n; i++)
+	if (g->art_timer)
+		lv_timer_delete(g->art_timer);
+	for (i = 0; i < g->n; i++) {
 		free(g->v[i].path);
+		if (g->v[i].art)
+			lv_draw_buf_destroy(g->v[i].art);
+	}
+	if (g->cont_pic)
+		lv_draw_buf_destroy(g->cont_pic);
 	free(g->v);
 	free(g->list);
 	free(g);
 }
 
-/* A row: the game starts, in landscape on the side last held */
-static void games_row_cb(lv_event_t *e)
+/* Game i starts, in landscape on the side last held, growing from @from */
+static void games_start(struct gpage *g, int i, lv_obj_t *from)
 {
-	struct gpage *g = lv_event_get_user_data(e);
-	lv_obj_t *r = lv_event_get_current_target(e);
-	int i = (int)(intptr_t)lv_obj_get_user_data(r);
 	char q[PATH_MAX * 2], cmd[PATH_MAX * 2 + 64];
 
 	if (i < 0 || i >= g->n)
@@ -285,7 +511,155 @@ static void games_row_cb(lv_event_t *e)
 	gp_named(g->v[i].path, g->v[i].system);
 	shq(g->v[i].path, q, sizeof(q));
 	snprintf(cmd, sizeof(cmd), GAMES_LAUNCH " --rot %d %s", game_rot, q);
-	app_launch(cmd, r);
+	app_launch(cmd, from);
+}
+
+/* A row */
+static void games_row_cb(lv_event_t *e)
+{
+	lv_obj_t *r = lv_event_get_current_target(e);
+
+	games_start(lv_event_get_user_data(e), (int)(intptr_t)lv_obj_get_user_data(r), r);
+}
+
+/* The Continue card (its button, or the card) */
+static void games_cont_cb(lv_event_t *e)
+{
+	struct gpage *g = lv_event_get_user_data(e);
+	lv_obj_t *card = lv_obj_get_user_data(lv_event_get_current_target(e));
+
+	games_start(g, g->cont, card ? card : lv_event_get_current_target(e));
+}
+
+/*
+ * The game last played: the newest of RetroArch's auto saves (written when
+ * a game ends; savestate_auto_load brings it back at the next start), in
+ * GAMES_STATES/<core>/<name>.state.auto, matched to a game by its file
+ * name. -1 if none. @when gets the save's time, @pic its picture's path.
+ */
+static int games_last_played(struct gpage *g, time_t *when, char *pic, size_t pic_len)
+{
+	DIR *d = opendir(GAMES_STATES), *cd;
+	struct dirent *de, *se;
+	char best[PATH_MAX] = "", bname[128] = "";
+	time_t best_t = 0;
+	int i;
+
+	if (!d)
+		return -1;
+	while ((de = readdir(d))) {
+		char dir[PATH_MAX];
+
+		if (de->d_name[0] == '.' ||
+		    (size_t)snprintf(dir, sizeof(dir), GAMES_STATES "/%s", de->d_name) >= sizeof(dir) ||
+		    !(cd = opendir(dir)))
+			continue;
+		while ((se = readdir(cd))) {
+			size_t n = strlen(se->d_name);
+			char path[PATH_MAX];
+			struct stat st;
+
+			if (n <= 11 || strcmp(se->d_name + n - 11, ".state.auto") ||
+			    (size_t)snprintf(path, sizeof(path), "%s/%s", dir, se->d_name) >= sizeof(path) ||
+			    stat(path, &st) || st.st_mtime <= best_t)
+				continue;
+			best_t = st.st_mtime;
+			snprintf(best, sizeof(best), "%s", path);
+			snprintf(bname, sizeof(bname), "%.*s", (int)(n - 11), se->d_name);
+		}
+		closedir(cd);
+	}
+	closedir(d);
+	if (!best_t)
+		return -1;
+	for (i = 0; i < g->n; i++) {
+		char base[128];
+
+		games_base(g->v[i].path, base, sizeof(base));
+		if (!strcmp(base, bname)) {
+			*when = best_t;
+			snprintf(pic, pic_len, "%s.png", best);
+			return i;
+		}
+	}
+	return -1;		/* (a game no longer in the library) */
+}
+
+/* The Continue card: the last game's picture where it was left, a button */
+static void games_cont_card(struct gpage *g, lv_obj_t *body)
+{
+	char pic[PATH_MAX + 8], when[64];
+	struct tm tm, now_tm;
+	time_t t = 0, now = time(NULL);
+	lv_obj_t *card, *frame, *col, *b, *l;
+
+	g->cont = games_last_played(g, &t, pic, sizeof(pic));
+	if (g->cont < 0)
+		return;
+	m3_section(body, "Continue");
+	card = m3_card(body, M.surface_c);
+	lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_column(card, 12, 0);
+	lv_obj_set_style_pad_all(card, 12, 0);
+
+	frame = lv_obj_create(card);
+	plain(frame);
+	lv_obj_set_size(frame, 112, 84);
+	lv_obj_set_style_pad_all(frame, 0, 0);
+	lv_obj_set_style_radius(frame, 12, 0);
+	lv_obj_set_style_clip_corner(frame, true, 0);
+	lv_obj_set_style_bg_color(frame, M.surface_c_highest, 0);
+	lv_obj_set_style_bg_opa(frame, LV_OPA_COVER, 0);
+	lv_obj_remove_flag(frame, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	if ((g->cont_pic = games_png_thumb(pic, 112, 84))) {
+		lv_obj_t *im = lv_image_create(frame);
+
+		lv_image_set_src(im, g->cont_pic);
+		lv_obj_center(im);
+	} else {
+		lv_obj_center(m3_label(frame, N72_SYMBOL_GAMEPAD, &n72_icon_24, M.on_surface_v));
+	}
+
+	col = lv_obj_create(card);
+	lv_obj_remove_style_all(col);
+	lv_obj_set_height(col, LV_SIZE_CONTENT);
+	lv_obj_set_flex_grow(col, 1);
+	lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_pad_row(col, 2, 0);
+	l = m3_label(col, g->v[g->cont].name, &lv_font_montserrat_16, M.on_surface);
+	lv_obj_set_size(l, lv_pct(100), 20);
+	lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+	localtime_r(&t, &tm);
+	localtime_r(&now, &now_tm);
+	if (tm.tm_year == now_tm.tm_year && tm.tm_yday == now_tm.tm_yday)
+		strftime(when, sizeof(when), "Played %H:%M", &tm);
+	else
+		strftime(when, sizeof(when), "Played %e %b", &tm);
+	l = m3_label(col, g->v[g->cont].system, &lv_font_montserrat_14, M.on_surface_v);
+	lv_obj_set_size(l, lv_pct(100), 18);	/* (one line, "..." when long) */
+	lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+	l = m3_label(col, when, &lv_font_montserrat_14, M.on_surface_v);
+	lv_obj_set_style_pad_bottom(l, 8, 0);
+	b = m3_button(col, LV_SYMBOL_PLAY "  Continue", true, games_cont_cb, g);
+	lv_obj_set_width(b, lv_pct(100));	/* (the column's width: it fits) */
+	lv_obj_set_style_pad_hor(b, 8, 0);
+	lv_obj_set_user_data(b, card);	/* (the game grows out of the card) */
+	lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_user_data(card, card);
+	lv_obj_add_event_cb(card, games_cont_cb, LV_EVENT_CLICKED, g);
+}
+
+/* A pooled row: m3_row_ex's, with an image in its badge for box art */
+static lv_obj_t *games_row_new(lv_obj_t *card, struct gpage *g)
+{
+	lv_obj_t *r = m3_row_ex(card, N72_SYMBOL_GAMEPAD, M.tertiary_c, M.on_tertiary_c,
+				"", "", games_row_cb, g, NULL, false);
+	lv_obj_t *img = lv_image_create(lv_obj_get_child(r, 0));
+
+	lv_obj_center(img);
+	lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN);
+	return r;
 }
 
 static void open_games(lv_event_t *e)
@@ -308,17 +682,21 @@ static void open_games(lv_event_t *e)
 		if (!i || strcmp(g->v[i - 1].system, g->v[i].system))
 			g->nl++;
 	g->list = calloc(g->nl ? g->nl : 1, sizeof(*g->list));
+	g->cont = -1;
 
 	body = m3_page("Games", &scr);
 	g->body = body;
 	lv_obj_add_event_cb(body, games_page_ev, LV_EVENT_DELETE, g);
+	if (g->list && g->n)
+		games_cont_card(g, body);
 	if (access(GAMES_LAUNCH, X_OK)) {
 		m3_note(body, "RetroArch is not installed (" GAMES_LAUNCH " is missing).");
 	} else if (!g->n || !g->list) {
 		m3_note(body, "No games yet. Put them in /root/Games, in folders by "
 			      "system or all together: NES, Super Nintendo, Game Boy "
 			      "(Color, Advance), Mega Drive, Master System, Game Gear, "
-			      "PlayStation (.cue, .chd, .pbp) and arcade (.zip).");
+			      "PlayStation (.cue, .chd, .pbp) and arcade (.zip). Box "
+			      "art: a PNG beside a game with its name.");
 	}
 	for (i = 0, k = 0; g->list && i < g->n; k++) {
 		struct flist *l = &g->list[k];
@@ -333,8 +711,7 @@ static void open_games(lv_event_t *e)
 		lv_obj_set_style_pad_all(c, FROW_PAD, 0);
 		lv_obj_set_height(c, l->n * FROW_H + 2 * FROW_PAD);
 		for (j = 0; j < FROW_POOL && j < l->n; j++) {
-			l->row[j] = m3_row_ex(c, N72_SYMBOL_GAMEPAD, M.tertiary_c, M.on_tertiary_c,
-					      "", "", games_row_cb, g, NULL, false);
+			l->row[j] = games_row_new(c, g);
 			lv_obj_add_flag(l->row[j], LV_OBJ_FLAG_HIDDEN);
 			l->at[j] = -1;
 		}
@@ -343,6 +720,7 @@ static void open_games(lv_event_t *e)
 		m3_note(body, "Only the first 600 games are shown.");
 	lv_obj_add_event_cb(body, games_page_ev, LV_EVENT_SCROLL, g);
 	lv_obj_add_event_cb(body, games_page_ev, LV_EVENT_SIZE_CHANGED, g);
+	g->art_timer = lv_timer_create(games_art_next, 15, g);
 	lv_obj_update_layout(scr);
 	rows_sync(body, g->list, g->nl, games_bind, g);
 	push(scr);
@@ -362,7 +740,7 @@ static void open_games(lv_event_t *e)
  * GET_STATUS first and toggles until the answer is what it wants.
  */
 #define GP_PORT		55355
-#define GP_STATES	"/root/retro/states"	/* (defaults.cfg's savestate_directory) */
+#define GP_STATES	GAMES_STATES
 #define GP_THUMB_H	84
 
 static struct {
@@ -523,12 +901,7 @@ static time_t gp_state_time(void)
 static bool gp_thumb_load(void)
 {
 	char path[PATH_MAX], when[64];
-	unsigned char *data = NULL, *out = NULL;
-	unsigned w, h, err;
-	LodePNGState st;
 	time_t t = gp_state_time();
-	FILE *f;
-	long n;
 
 	if (!gp_up())
 		return false;
@@ -555,63 +928,17 @@ static bool gp_thumb_load(void)
 		lv_label_set_text(gp.saved, when);
 	}
 	gp_state_path(path, sizeof(path), ".png");
-	if (!(f = fopen(path, "rb")))
-		return false;
-	if (fseek(f, 0, SEEK_END) || (n = ftell(f)) <= 0 || n > (1 << 20) ||
-	    fseek(f, 0, SEEK_SET) || !(data = malloc((size_t)n)) ||
-	    fread(data, 1, (size_t)n, f) != (size_t)n) {
-		fclose(f);
-		free(data);
-		return false;
-	}
-	fclose(f);
-	lodepng_state_init(&st);
-	st.info_raw.colortype = LCT_RGB;
-	st.info_raw.bitdepth = 8;
-	err = lodepng_inspect(&w, &h, &st, data, (size_t)n);
-	if (!err && (uint64_t)w * h <= 1024 * 1024)
-		err = lodepng_decode(&out, &w, &h, &st, data, (size_t)n);
-	else
-		err = err ? err : 1;
-	lodepng_state_cleanup(&st);
-	free(data);
-	if (err || !out) {
-		if (out)
-			lv_draw_buf_destroy((lv_draw_buf_t *)out);
-		return false;
-	}
 	{
-		/* (LVGL's lodepng gives an LVGL draw buffer, R G B packed) */
-		const uint8_t *rgb = ((lv_draw_buf_t *)out)->data;
-		unsigned step = (h + GP_THUMB_H - 1) / GP_THUMB_H, tw, th, x, y;
-		lv_draw_buf_t *b;
+		lv_draw_buf_t *b = games_png_thumb(path, 120, GP_THUMB_H);
 
-		if (!step)
-			step = 1;
-		tw = w / step;
-		th = h / step;
-		b = tw && th ? lv_draw_buf_create(tw, th, LV_COLOR_FORMAT_XRGB8888, 0) : NULL;
-		if (b) {
-			for (y = 0; y < th; y++) {
-				uint8_t *o = b->data + y * b->header.stride;
-
-				for (x = 0; x < tw; x++, o += 4) {
-					const uint8_t *q = rgb + ((size_t)y * step * w + x * step) * 3;
-
-					o[0] = q[2];
-					o[1] = q[1];
-					o[2] = q[0];
-					o[3] = 0xff;
-				}
-			}
-			lv_image_set_src(gp.thumb, b);
-			lv_obj_set_size(gp.thumb, tw, th);
-			if (gp.pic)
-				lv_draw_buf_destroy(gp.pic);
-			gp.pic = b;
-		}
-		lv_draw_buf_destroy((lv_draw_buf_t *)out);
-		return b != NULL;
+		if (!b)
+			return false;
+		lv_image_set_src(gp.thumb, b);
+		lv_obj_set_size(gp.thumb, b->header.w, b->header.h);
+		if (gp.pic)
+			lv_draw_buf_destroy(gp.pic);
+		gp.pic = b;
+		return true;
 	}
 }
 
