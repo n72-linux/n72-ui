@@ -16,6 +16,7 @@
 #include <spawn.h>
 #include <strings.h>
 #include <linux/rtnetlink.h>
+#include <sys/timerfd.h>
 #include <sys/stat.h>
 #include "lvgl/src/indev/lv_indev_private.h"	/* the throw velocity */
 #include "lvgl/src/core/lv_obj_scroll_private.h"	/* lv_obj_scroll_by_raw() */
@@ -2548,6 +2549,7 @@ static void push(lv_obj_t *scr)
 struct job {
 	pid_t pid;
 	int fd;
+	int pidfd;		/* -1: watched by the 150 ms timer instead */
 	char buf[8192];
 	size_t len;
 	void (*done)(const char *out, void *ud);
@@ -2555,24 +2557,109 @@ struct job {
 	lv_obj_t *owner;
 };
 
-static void job_poll(lv_timer_t *t)
-{
-	struct job *j = lv_timer_get_user_data(t);
-	ssize_t n;
-	int st;
+/*
+ * A job ends when its shell does (a command it started in the background
+ * may keep the output pipe open): the shell's pidfd turns readable then.
+ * The pipe is watched too, read as output comes (a job writing more than
+ * the pipe holds would otherwise wait for us). Without a pidfd, or with
+ * the main loop's watch table full, a 150 ms timer looks instead.
+ */
+#define JOB_WATCHED 8
+static struct job *job_w[JOB_WATCHED];
 
-	while ((n = read(j->fd, j->buf + j->len, sizeof(j->buf) - 1 - j->len)) > 0)
+/* Read what the job wrote; true at the end of its output (EOF). */
+static bool job_drain(struct job *j)
+{
+	ssize_t n = -1;
+
+	while (j->len < sizeof(j->buf) - 1 &&
+	       (n = read(j->fd, j->buf + j->len, sizeof(j->buf) - 1 - j->len)) > 0)
 		j->len += n;
-	if (waitpid(j->pid, &st, WNOHANG) == 0)
-		return;
-	while ((n = read(j->fd, j->buf + j->len, sizeof(j->buf) - 1 - j->len)) > 0)
-		j->len += n;
+	if (j->len >= sizeof(j->buf) - 1) {
+		char sink[512];	/* (beyond 8 KiB: dropped, so the job is not held up) */
+
+		while ((n = read(j->fd, sink, sizeof(sink))) > 0)
+			;
+	}
+	return n == 0;
+}
+
+static void job_end(struct job *j)
+{
+	job_drain(j);
 	j->buf[j->len] = 0;
 	close(j->fd);
-	lv_timer_delete(t);
 	if (j->done && (!j->owner || lv_obj_is_valid(j->owner)))
 		j->done(j->buf, j->ud);
 	free(j);
+}
+
+static struct job *job_by_fd(int fd, int *slot)
+{
+	for (int i = 0; i < JOB_WATCHED; i++)
+		if (job_w[i] && (job_w[i]->fd == fd || job_w[i]->pidfd == fd)) {
+			*slot = i;
+			return job_w[i];
+		}
+	return NULL;
+}
+
+static void job_ev(int fd)
+{
+	int slot, st;
+	struct job *j = job_by_fd(fd, &slot);
+
+	if (!j) {
+		ui_unwatch(fd);
+		return;
+	}
+	if (fd == j->fd) {
+		/* at EOF the pipe stays readable: watch only the shell from here */
+		if (job_drain(j))
+			ui_unwatch(j->fd);
+		return;
+	}
+	/* the shell ended */
+	if (waitpid(j->pid, &st, WNOHANG) == 0)
+		return;		/* (not yet reaped: the next readiness) */
+	ui_unwatch(j->fd);
+	ui_unwatch(j->pidfd);
+	close(j->pidfd);
+	job_w[slot] = NULL;
+	job_end(j);
+}
+
+static bool job_watch(struct job *j)
+{
+	int slot = -1;
+
+	for (int i = 0; i < JOB_WATCHED; i++)
+		if (!job_w[i]) {
+			slot = i;
+			break;
+		}
+	if (slot < 0 || nwatch > NWATCH - 2)
+		return false;
+	j->pidfd = syscall(SYS_pidfd_open, j->pid, 0);
+	if (j->pidfd < 0)
+		return false;
+	fcntl(j->pidfd, F_SETFD, FD_CLOEXEC);
+	job_w[slot] = j;
+	ui_watch(j->fd, job_ev);
+	ui_watch(j->pidfd, job_ev);
+	return true;
+}
+
+static void job_poll(lv_timer_t *t)
+{
+	struct job *j = lv_timer_get_user_data(t);
+	int st;
+
+	job_drain(j);
+	if (waitpid(j->pid, &st, WNOHANG) == 0)
+		return;
+	lv_timer_delete(t);
+	job_end(j);
 }
 
 static int job_run(const char *cmd, lv_obj_t *owner,
@@ -2654,7 +2741,9 @@ static int job_run(const char *cmd, lv_obj_t *owner,
 	j->done = done;
 	j->ud = ud;
 	j->owner = owner;
-	lv_timer_create(job_poll, 150, j);
+	j->pidfd = -1;
+	if (!job_watch(j))
+		lv_timer_create(job_poll, 150, j);
 	return 0;
 }
 
@@ -2798,6 +2887,7 @@ static bool wifi_powered(void)
 }
 static bool wifi_up;
 static bool bt_powered;
+static void bt_auto_kick(void);
 
 static void net_ui_sync(void);
 
@@ -2816,8 +2906,13 @@ static void wifi_status_done(const char *out, void *ud)
 
 static void bt_show_done(const char *out, void *ud)
 {
+	static bool was;
+
 	LV_UNUSED(ud);
 	bt_powered = strstr(out, "Powered: yes") != NULL;
+	if (bt_powered && !was)
+		bt_auto_kick();		/* (switched on: look for the devices now) */
+	was = bt_powered;
 	net_ui_sync();
 }
 
@@ -3482,10 +3577,50 @@ static lv_obj_t *home_bright, *shade, *scrim, *qs_settings_btn;
 static bool shade_open;
 
 /* Screen back on: bring the clock up to date now, not at the next run. */
+/*
+ * The clock set (Date & Time, chrony's first step after the network came
+ * up): the shown time follows at once, not at the minute timer's next run.
+ * A timerfd armed years ahead with TFD_TIMER_CANCEL_ON_SET turns readable
+ * only then: nothing wakes in between.
+ */
+static int clockset_fd = -1;
+
+static void clockset_arm(void)
+{
+	struct itimerspec it = { .it_value = { .tv_sec = time(NULL) + 10L * 365 * 86400 } };
+
+	if (timerfd_settime(clockset_fd, TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET, &it, NULL) &&
+	    errno != ECANCELED)
+		fprintf(stderr, "n72-ui: clock-set timer: %s\n", strerror(errno));
+}
+
+static void clockset_ev(int fd)
+{
+	uint64_t n;
+
+	if (read(fd, &n, sizeof(n)) < 0 && errno != ECANCELED && errno != EAGAIN)
+		return;
+	clockset_arm();
+	if (getenv("N72_STATUS_LOG"))
+		fprintf(stderr, "n72-ui: status event: clock set\n");
+	if (home_timer)
+		lv_timer_ready(home_timer);	/* (dark: paused, the wake runs it) */
+}
+
+static void clockset_init(void)
+{
+	clockset_fd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK | TFD_CLOEXEC);
+	if (clockset_fd < 0)
+		return;
+	clockset_arm();
+	ui_watch(clockset_fd, clockset_ev);
+}
+
 static void home_wake(void)
 {
 	if (home_timer)
 		lv_timer_ready(home_timer);
+	bt_auto_kick();
 	lock_wake();
 }
 
@@ -7479,6 +7614,25 @@ static void open_bt_dev_cb(lv_event_t *e)
  * costs a page of the radio, ~5 s). n72-audio-route has the sound follow.
  */
 static bool bt_auto_busy;
+/*
+ * Not a fixed 30 s: after each try that finds nothing the next waits twice
+ * as long (30 s to 5 min: a page of a device that is off costs the radio
+ * ~5 s); the screen waking, Bluetooth switched on and a sound device going
+ * start again from 2 s and 30 s (bt_auto_kick).
+ */
+#define BT_AUTO_MIN_MS	30000
+#define BT_AUTO_MAX_MS	300000
+static lv_timer_t *bt_auto_timer;
+static uint32_t bt_auto_gap = BT_AUTO_MIN_MS;
+
+static void bt_auto_kick(void)
+{
+	bt_auto_gap = BT_AUTO_MIN_MS;
+	if (bt_auto_timer) {
+		lv_timer_set_period(bt_auto_timer, 2000);
+		lv_timer_reset(bt_auto_timer);
+	}
+}
 
 static void bt_auto_try_done(const char *out, void *ud)
 {
@@ -7515,6 +7669,8 @@ static void bt_auto_paired_done(const char *out, void *ud)
 		if (p)
 			p++;
 	}
+	if (connected)
+		bt_auto_gap = BT_AUTO_MIN_MS;
 	if (connected || !n) {
 		bt_auto_busy = false;
 		return;
@@ -7526,7 +7682,8 @@ static void bt_auto_paired_done(const char *out, void *ud)
 
 static void bt_auto_tick(lv_timer_t *t)
 {
-	LV_UNUSED(t);
+	if (t->period != bt_auto_gap)
+		lv_timer_set_period(t, bt_auto_gap);
 	if (!bt_powered)
 		memset(bt_user_off, 0, sizeof(bt_user_off));	/* (off and on: a fresh start) */
 	if (bt_auto_busy || screen_off || locked || !bt_powered || bt_want >= 0 ||
@@ -7534,6 +7691,10 @@ static void bt_auto_tick(lv_timer_t *t)
 	    !have_tool("bluetoothctl"))
 		return;
 	bt_auto_busy = true;
+	if (getenv("N72_STATUS_LOG"))
+		fprintf(stderr, "n72-ui: connect automatically: a try (next in %u s)\n",
+			(unsigned)bt_auto_gap / 1000);
+	bt_auto_gap = LV_MIN(bt_auto_gap * 2, BT_AUTO_MAX_MS);	/* (a find sets it back) */
 	/* paired, and not connected to anything else of ours ("C " lines: connected) */
 	if (job_run("c=$(bluetoothctl devices Connected | grep Device); "
 		    "if [ -n \"$c\" ]; then echo \"$c\" | sed 's/^/C /'; else bluetoothctl devices Paired; fi",
@@ -9774,6 +9935,10 @@ static void vc_show(bool on)
 	if (!vc.ui)
 		return;
 	vc.shown = on;
+	if (on && vc.poll) {
+		lv_timer_set_period(vc.poll, 250);	/* the position, fresh */
+		lv_timer_ready(vc.poll);
+	}
 	lv_anim_delete(vc.ui, vc_opa_exec);
 	if (on)
 		lv_obj_remove_flag(vc.ui, LV_OBJ_FLAG_HIDDEN);
@@ -9811,14 +9976,20 @@ static void vc_update(void)
 static void vc_build(void);
 
 /* The player's state, a few times a second. */
-static void vc_poll(lv_timer_t *t)
+/*
+ * The player answers "status" requests (it does not send by itself): the
+ * answers are read when they come (the socket is watched by the main loop),
+ * and the requests go out 4 a second only while the controls show the
+ * position, else every 2 s, enough to notice the player pausing itself.
+ */
+static void vc_rx(int fd)
 {
 	char buf[256], st[16];
 	long long pos, dur;
 	int r;
 	ssize_t n;
 
-	LV_UNUSED(t);
+	LV_UNUSED(fd);
 	while ((n = recv(vc.sock, buf, sizeof(buf) - 1, MSG_DONTWAIT)) > 0) {
 		buf[n] = 0;
 		if (sscanf(buf, "%15s %lld %lld %d", st, &pos, &dur, &r) != 4)
@@ -9859,6 +10030,16 @@ static void vc_poll(lv_timer_t *t)
 		vc.prot = ui_rot;
 	}
 	vc_update();
+}
+
+static void vc_poll(lv_timer_t *t)
+{
+	uint32_t period = !vc.up || vc.shown || vc.dragging ? 250 : 2000;
+
+	if (t->period != period)
+		lv_timer_set_period(t, period);
+	if (vc.up && vc.prot != ui_rot)
+		vc_rx(vc.sock);		/* (a turn: tell the player now) */
 	vc_send("status");
 }
 
@@ -10130,6 +10311,8 @@ static void vc_start(void)
 		while (recv(vc.sock, b, sizeof(b), MSG_DONTWAIT) > 0)
 			;
 	}
+	if (vc.sock >= 0)
+		ui_watch(vc.sock, vc_rx);
 	if (!vc.poll)
 		vc.poll = lv_timer_create(vc_poll, 250, NULL);
 	fprintf(stderr, "n72-ui: video controls for %s (socket %d)\n", app_cmd, vc.sock);
@@ -10137,6 +10320,8 @@ static void vc_start(void)
 
 static void vc_stop(void)
 {
+	if (vc.sock >= 0)
+		ui_unwatch(vc.sock);
 	if (vc.poll) {
 		lv_timer_delete(vc.poll);
 		vc.poll = NULL;
@@ -10168,8 +10353,14 @@ static void bz_start(lv_timer_t *t);
 static void bz_changed(lv_timer_t *t)
 {
 	LV_UNUSED(t);
+	static bool had_audio;
+	bool audio = !access("/run/n72-audio", F_OK);
+
 	bz_timer = NULL;
 	bz_last = lv_tick_get();
+	if (had_audio && !audio)
+		bt_auto_kick();		/* the sound device went: try again soon */
+	had_audio = audio;
 	job_run("bluetoothctl show", NULL, bt_show_done, NULL);	/* on or off */
 	if (bt_page && lv_obj_is_valid(bt_page))
 		bt_page_refresh();
@@ -10242,9 +10433,10 @@ static void ui_apply_saved(void)
 	if (conf.bt == 0 && have_tool("bluetoothctl"))
 		job_run(BT_OFF_CMD, NULL, bt_set_done, NULL);
 	rtnl_init();		/* the status bar's Wi-Fi follows rtnetlink */
+	clockset_init();	/* and the time a clock change */
 	unlink(BT_AUTO_RUN);	/* (left by an n72-ui that ended mid-run) */
 	unlink(BT_MANUAL_RUN);
-	awake_timer(bt_auto_tick, 30000, NULL);	/* Connect automatically */
+	bt_auto_timer = awake_timer(bt_auto_tick, BT_AUTO_MIN_MS, NULL);	/* Connect automatically */
 	apps_watch();		/* the home tiles follow APPS_DIR and DESKTOP_DIR */
 	bz_start(NULL);		/* BlueZ's signals: the Bluetooth views follow */
 }

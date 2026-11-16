@@ -684,7 +684,7 @@ static void screen_set(bool on)
  * timers that look (the headphone jack, a file in /run changing, BlueZ's
  * D-Bus signals). Each has a callback, run when it is readable.
  */
-#define NWATCH 12
+#define NWATCH 32	/* (background commands take two each: ui_m3.c job_watch) */
 static struct { int fd; short events; void (*cb)(int fd); } watch[NWATCH];
 static int nwatch;
 
