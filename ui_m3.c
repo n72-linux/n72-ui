@@ -27,6 +27,7 @@
 #include "lvgl/src/misc/lv_anim_private.h"	/* the animation list (turning) */
 #include "lvgl/src/core/lv_global.h"
 #include <sys/wait.h>
+#include <sys/prctl.h>
 #include <sys/un.h>
 #include <sys/statvfs.h>
 #include <sys/inotify.h>
@@ -10442,25 +10443,94 @@ static void bz_ev(int fd)
 	}
 }
 
+#define BZ_MATCH "type='signal',sender='org.bluez'"
+
+/*
+ * Monitors an earlier n72-ui left behind (it ended, crashed or was
+ * restarted: the child lived on under init, and with Bluetooth quiet it
+ * never wrote, so never saw the broken pipe). 34 of them, 17 MB, after a
+ * night of restarts.
+ */
+static void bz_reap_orphans(void)
+{
+	DIR *d = opendir("/proc");
+	struct dirent *de;
+
+	while (d && (de = readdir(d))) {
+		char path[64], buf[160], *q;
+		int pid = atoi(de->d_name), ppid = -1;
+		ssize_t n;
+		FILE *f;
+		int fd;
+
+		if (pid <= 1 || pid == getpid())
+			continue;
+		snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+		if (!(f = fopen(path, "r")))
+			continue;
+		n = (ssize_t)fread(buf, 1, sizeof(buf) - 1, f);
+		fclose(f);
+		buf[n > 0 ? n : 0] = 0;
+		/* "pid (comm) S ppid": after the last ')' */
+		if (!(q = strrchr(buf, ')')) || sscanf(q + 1, " %*c %d", &ppid) != 1 || ppid != 1 ||
+		    !strstr(buf, "(dbus-monitor)"))
+			continue;
+		snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+		if ((fd = open(path, O_RDONLY | O_CLOEXEC)) < 0)
+			continue;
+		n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			continue;
+		buf[n] = 0;
+		for (ssize_t i = 0; i < n; i++)
+			if (!buf[i])
+				buf[i] = ' ';
+		if (strstr(buf, BZ_MATCH))
+			kill(pid, SIGTERM);
+	}
+	if (d)
+		closedir(d);
+}
+
 static void bz_start(lv_timer_t *t)
 {
-	char *const argv[] = { "dbus-monitor", "--system", "type='signal',sender='org.bluez'",
-			       NULL };
-	posix_spawn_file_actions_t fa;
-	int p[2];
+	static bool reaped;
+	int p[2], nul;
+	pid_t me = getpid(), pid;
 
 	LV_UNUSED(t);
+	if (!reaped) {
+		reaped = true;
+		bz_reap_orphans();
+	}
 	if (bz_fd >= 0 || !have_tool("dbus-monitor") || pipe2(p, O_CLOEXEC))
 		return;
 	fcntl(p[0], F_SETFL, O_NONBLOCK);	/* (ours only: dbus-monitor writes and waits) */
-	posix_spawn_file_actions_init(&fa);
-	posix_spawn_file_actions_adddup2(&fa, p[1], 1);
-	posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
-	if (posix_spawnp(&bz_pid, "dbus-monitor", &fa, NULL, argv, environ)) {
+	nul = open("/dev/null", O_WRONLY | O_CLOEXEC);
+	/*
+	 * vfork, not posix_spawn: the child asks to be ended when n72-ui
+	 * ends (PR_SET_PDEATHSIG), however n72-ui ends. (Only syscalls run in
+	 * the child before the exec.)
+	 */
+	pid = vfork();
+	if (pid == 0) {
+		prctl(PR_SET_PDEATHSIG, SIGTERM);
+		if (getppid() != me)
+			_exit(0);	/* (n72-ui gone already) */
+		dup2(p[1], 1);
+		if (nul >= 0)
+			dup2(nul, 2);
+		execlp("dbus-monitor", "dbus-monitor", "--system", BZ_MATCH, (char *)NULL);
+		_exit(127);
+	}
+	bz_pid = pid;
+	if (nul >= 0)
+		close(nul);
+	if (pid < 0) {
 		close(p[0]);
 		p[0] = -1;
 	}
-	posix_spawn_file_actions_destroy(&fa);
 	close(p[1]);
 	if (p[0] < 0)
 		return;
