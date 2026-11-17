@@ -760,7 +760,20 @@ static bool rt_claim;			/* ... and ui_drag() has it */
 #define RT_SLOTS	16
 static bool rt_mt_b;
 static int rt_nslots, rt_cur;
-static struct { int id, x, y; } rt_sl[RT_SLOTS];
+static int rt_frame_slot0;		/* the slot the frame being read began in */
+/*
+ * (lift-off hold, rt_lift: major = the contact's long axis as last
+ * reported, was = the report before; hist = its last positions that were
+ * passed on, newest last)
+ */
+static struct {
+	int id, x, y;
+	int major, was;
+	bool major_new, hold, resync;
+	int hist[3][2], nh;
+} rt_sl[RT_SLOTS];
+static int rt_rest_x, rt_rest_y;	/* "resting": no further than this in three frames */
+static bool rt_lift_hold = true;	/* (N72_TOUCH_RAW=1: every frame as the panel gives it) */
 
 static void rt_put(struct input_event *v, int *n, int type, int code, int value)
 {
@@ -768,6 +781,134 @@ static void rt_put(struct input_event *v, int *n, int type, int code, int value)
 	v[*n].code = code;
 	v[*n].value = value;
 	(*n)++;
+}
+
+/*
+ * A finger that lifts takes its contact off the panel over a few frames,
+ * and the panel's position for it, the middle of what still touches,
+ * wanders as it goes: 2 to 4.5 pixels in the last one or two frames of a
+ * tap (recorded on the device, 2026-11-18: eleven taps, the long axis
+ * falling from ~125 to ~30 in two frames). An application that scrolls at
+ * the first movement takes that for a drag, and the tap is lost (Spore's
+ * buttons). So the application is not told where a lifting finger wanders
+ * to: from a frame in which the contact's long axis has fallen to under
+ * 85 % of the frame before, and for as long as it goes on falling, the
+ * position stays where it was, if the finger was resting (within two
+ * pixels over its last three frames). A finger that moves as it lifts (the
+ * end of a drag, a flick: its last movements are its speed) is passed on
+ * as it is; so is one whose contact shrinks slowly, or shrinks and grows
+ * again (rolled, or half off the panel's edge), with its position sent
+ * afresh. On the recording the taps' movement falls to under 2 pixels and
+ * both drags are unchanged.
+ *
+ * Called at the end of every frame, before it is routed.
+ */
+static void rt_lift(void)
+{
+	int i;
+
+	for (i = 0; i < rt_nslots; i++) {
+		typeof(rt_sl[0]) *s = &rt_sl[i];
+
+		if (s->id < 0) {
+			s->hold = s->major_new = false;
+			continue;
+		}
+		if (s->major_new && s->was >= 0) {
+			if (s->hold) {
+				if (s->major > s->was) {	/* not a lift after all */
+					s->hold = false;
+					s->resync = true;
+				}
+			} else if (rt_lift_hold && s->nh && s->major * 100 < s->was * 85) {
+				int *ref = s->hist[0], *last = s->hist[s->nh - 1];
+
+				if (abs(last[0] - ref[0]) <= rt_rest_x && abs(last[1] - ref[1]) <= rt_rest_y)
+					s->hold = true;
+			}
+		}
+		if (s->major_new)
+			s->was = s->major;
+		s->major_new = false;
+		if (!s->hold) {
+			if (s->nh == 3) {
+				s->hist[0][0] = s->hist[1][0];
+				s->hist[0][1] = s->hist[1][1];
+				s->hist[1][0] = s->hist[2][0];
+				s->hist[1][1] = s->hist[2][1];
+				s->nh = 2;
+			}
+			s->hist[s->nh][0] = s->x;
+			s->hist[s->nh][1] = s->y;
+			s->nh++;
+		}
+	}
+}
+
+/* The contact the single-touch axes follow (the kernel's: the oldest). */
+static int rt_first_slot(void)
+{
+	int i, first = -1;
+
+	for (i = 0; i < rt_nslots; i++)
+		if (rt_sl[i].id >= 0 && (first < 0 || rt_sl[i].id < rt_sl[first].id))
+			first = i;
+	return first;
+}
+
+/*
+ * The frame for the application: as it came, without the positions of
+ * contacts that are held (rt_lift), and with the position of one whose
+ * hold has ended.
+ */
+static void rt_app_frame(void)
+{
+	struct input_event v[sizeof(rt_frame) / sizeof(rt_frame[0]) + RT_SLOTS * 3 + 4] = { 0 };
+	int n = 0, i, slot = rt_frame_slot0, first = rt_first_slot();
+	bool any = false;
+
+	for (i = 0; i < rt_nslots; i++)
+		any |= rt_sl[i].id >= 0 && (rt_sl[i].hold || rt_sl[i].resync);
+	if (!any) {
+		if (write(rt_uinput, rt_frame, rt_n * sizeof(rt_frame[0])) < 0)
+			;
+		return;
+	}
+	for (i = 0; i < rt_n; i++) {
+		const struct input_event *e = &rt_frame[i];
+
+		if (e->type == EV_ABS && e->code == ABS_MT_SLOT)
+			slot = LV_CLAMP(0, e->value, RT_SLOTS - 1);
+		else if (e->type == EV_ABS && rt_sl[slot].hold &&
+			 (e->code == ABS_MT_POSITION_X || e->code == ABS_MT_POSITION_Y))
+			continue;
+		else if (e->type == EV_ABS && first >= 0 && rt_sl[first].hold &&
+			 (e->code == ABS_X || e->code == ABS_Y))
+			continue;
+		if (e->type == EV_SYN && e->code == SYN_REPORT) {
+			int k, back = slot;
+
+			for (k = 0; k < rt_nslots; k++) {
+				if (rt_sl[k].id < 0 || !rt_sl[k].resync)
+					continue;
+				rt_put(v, &n, EV_ABS, ABS_MT_SLOT, k);
+				rt_put(v, &n, EV_ABS, ABS_MT_POSITION_X, rt_sl[k].x);
+				rt_put(v, &n, EV_ABS, ABS_MT_POSITION_Y, rt_sl[k].y);
+				slot = k;
+				if (k == first) {
+					rt_put(v, &n, EV_ABS, ABS_X, rt_raw_x);
+					rt_put(v, &n, EV_ABS, ABS_Y, rt_raw_y);
+				}
+			}
+			if (slot != back)
+				rt_put(v, &n, EV_ABS, ABS_MT_SLOT, back);
+		}
+		v[n++] = *e;
+	}
+	for (i = 0; i < rt_nslots; i++)
+		rt_sl[i].resync = false;
+	if (write(rt_uinput, v, n * sizeof(v[0])) < 0)
+		;
 }
 
 /* A touch becomes the application's: one frame with everything down now. */
@@ -872,6 +1013,8 @@ static bool rt_frame_done(void)
 	lv_point_t p = rt_map(rt_raw_x, rt_raw_y), l = rt_logical(p);
 	bool news = false;
 
+	if (rt_mt_b)
+		rt_lift();
 	if (rt_owner == RT_NONE && rt_down) {
 		rt_owner = app_pid > 0 && !ui_wants_touch(l.x, l.y) ? RT_APP : RT_UI;
 		if (rt_owner == RT_APP && rt_mt_b) {
@@ -881,7 +1024,9 @@ static bool rt_frame_done(void)
 		}
 	}
 	if (rt_owner == RT_APP) {
-		if (write(rt_uinput, rt_frame, rt_n * sizeof(rt_frame[0])) < 0)
+		if (rt_mt_b)
+			rt_app_frame();
+		else if (write(rt_uinput, rt_frame, rt_n * sizeof(rt_frame[0])) < 0)
 			;
 	} else {
 		if (rt_down || rt_ui_touch) {
@@ -930,6 +1075,8 @@ static void rt_feed(int fd, lv_indev_t *indev)
 			 * contact; with slots, another finger's MT position would
 			 * move it); the slots are kept for the application.
 			 */
+			if (rt_n == 0)
+				rt_frame_slot0 = rt_cur;
 			if (e->type == EV_ABS && e->code == ABS_X)
 				rt_raw_x = e->value;
 			else if (e->type == EV_ABS && e->code == ABS_Y)
@@ -938,8 +1085,19 @@ static void rt_feed(int fd, lv_indev_t *indev)
 				rt_down = e->value != 0;
 			else if (e->type == EV_ABS && e->code == ABS_MT_SLOT)
 				rt_cur = LV_CLAMP(0, e->value, RT_SLOTS - 1);
-			else if (e->type == EV_ABS && e->code == ABS_MT_TRACKING_ID)
+			else if (e->type == EV_ABS && e->code == ABS_MT_TRACKING_ID) {
+				if (e->value >= 0 && rt_sl[rt_cur].id < 0) {
+					/* a new contact: nothing known of it yet */
+					rt_sl[rt_cur].was = -1;
+					rt_sl[rt_cur].nh = 0;
+					rt_sl[rt_cur].hold = rt_sl[rt_cur].resync = false;
+					rt_sl[rt_cur].major_new = false;
+				}
 				rt_sl[rt_cur].id = e->value;
+			} else if (e->type == EV_ABS && e->code == ABS_MT_TOUCH_MAJOR) {
+				rt_sl[rt_cur].major = e->value;
+				rt_sl[rt_cur].major_new = true;
+			}
 			else if (e->type == EV_ABS && e->code == ABS_MT_POSITION_X)
 				rt_sl[rt_cur].x = e->value;
 			else if (e->type == EV_ABS && e->code == ABS_MT_POSITION_Y)
@@ -997,6 +1155,12 @@ static bool rt_init(int fd, const char *cal, const char *swap)
 	rt_mt_b = absbits[ABS_MT_SLOT / (8 * sizeof(long))] & (1UL << (ABS_MT_SLOT % (8 * sizeof(long))));
 	if (rt_mt_b && ioctl(fd, EVIOCGABS(ABS_MT_SLOT), &ai) == 0)
 		rt_nslots = LV_MIN(ai.maximum + 1, RT_SLOTS);
+	/* resting: within two of the panel's 320 x 480 pixels (rt_lift) */
+	if (rt_mt_b && ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &ai) == 0)
+		rt_rest_x = (ai.maximum - ai.minimum) / 160;
+	if (rt_mt_b && ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &ai) == 0)
+		rt_rest_y = (ai.maximum - ai.minimum) / 240;
+	rt_lift_hold = !getenv("N72_TOUCH_RAW") && rt_rest_x > 0 && rt_rest_y > 0;
 	for (c = 0; c < RT_SLOTS; c++)
 		rt_sl[c].id = -1;
 	ioctl(u, UI_SET_EVBIT, EV_SYN);
