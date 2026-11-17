@@ -1390,6 +1390,10 @@ static bool audio_playing(void);
  * in suspend to idle, which wakes quickly and keeps Wi-Fi associated.
  */
 #define DEEP_AFTER_S	180
+/* (deep_sleep: a refused suspend to RAM backs off) */
+#define DEEP_RETRY_MIN_S	180
+#define DEEP_RETRY_MAX_S	1800
+static time_t deep_retry_at, deep_retry_gap = DEEP_RETRY_MIN_S;
 
 /*
  * May the sleep go deep now? Not on USB power, where the charger's events
@@ -1403,8 +1407,19 @@ static bool deep_allowed(void)
 
 	if ((e && !strcmp(e, "freeze")) || usb_powered() || audio_playing() || app_pid > 0)
 		return false;
+	if (deep_retry_at && boot_s() < deep_retry_at)
+		return false;		/* refused lately: deep_sleep */
 	return deep_offered();
 }
+
+/*
+ * A suspend to RAM the kernel refused (a driver's suspend failed: the
+ * attempt costs seconds of the CPU and the radio each time) is not tried
+ * again at once: the next one waits 3 min, then twice as long after each
+ * further refusal, up to 30 min, meanwhile suspend to idle. A deep sleep
+ * that works starts over. (Before, a refusing kernel was asked again
+ * every ~9 s all night: #57 on 2026-11-16, hci's resume timing out.)
+ */
 
 /* One suspend to RAM: "mem" as deep for this sleep, s2idle again after. */
 static bool deep_sleep(void)
@@ -1415,6 +1430,15 @@ static bool deep_sleep(void)
 		return false;
 	ok = write_sleep_state("mem");
 	mem_sleep_set("s2idle");
+	if (ok) {
+		deep_retry_gap = DEEP_RETRY_MIN_S;
+	} else {
+		deep_retry_at = boot_s() + deep_retry_gap;
+		fprintf(stderr, "n72-ui: suspend to RAM refused: suspend to idle, again in %ld s\n",
+			(long)deep_retry_gap);
+		deep_retry_gap = deep_retry_gap * 2 > DEEP_RETRY_MAX_S ? DEEP_RETRY_MAX_S :
+					 deep_retry_gap * 2;
+	}
 	return ok;
 }
 
@@ -1451,6 +1475,8 @@ static bool system_sleep(void)
 			char at[16];
 			time_t in = DEEP_AFTER_S - (boot_s() - start);
 
+			if (in <= 0 && deep_retry_at > boot_s())
+				in = deep_retry_at - boot_s();	/* (deep held back: wake for the retry) */
 			snprintf(at, sizeof(at), "+%ld", (long)(in > 0 ? in : DEEP_AFTER_S));
 			wake_alarm(at);
 			own = true;
