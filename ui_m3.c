@@ -60,6 +60,18 @@ static void rot_kick(void);
 static bool ui_turn(int rot);
 static void vc_start(void);
 static void vc_stop(void);
+/* background playback (with the video controls, at the end) */
+static bool bg_start(void);
+static void bg_end(void);
+static bool bg_busy(void);
+static void np_build(lv_obj_t *shade, int32_t y);
+static void np_sync(void);
+static void np_opened(void);
+/* the shade's card for it, and the status bar's note symbol */
+static struct {
+	lv_obj_t *card, *title, *sub, *play_sym;
+} np;
+static lv_obj_t *status_np;
 
 /* ------------------------------------------------------------ settings */
 
@@ -3655,6 +3667,8 @@ static void home_bright_cb(lv_event_t *e)
 /* 312 upright (two tiles a row, two rows), 240 turned (three in one row) */
 static int32_t shade_h = 312;
 #define SHADE_H shade_h
+static int32_t shade_base_h = 312, shade_card_y;	/* (shade_relayout) */
+static lv_obj_t *shade_bright_row;
 
 static void shade_closed(void)
 {
@@ -3694,6 +3708,7 @@ static void shade_set(bool open, bool anim)
 	if (open) {
 		lv_slider_set_value(home_bright, backlight_get(), LV_ANIM_OFF);
 		home_wake();
+		np_opened();
 	}
 	lv_obj_remove_flag(scrim, LV_OBJ_FLAG_HIDDEN);
 	if (anim && sd_animate(open))
@@ -3901,13 +3916,16 @@ static void build_shade(void)
 		qs_bt = qs_tile(row, LV_SYMBOL_BLUETOOTH, "Bluetooth", &qs_bt_sub, qs_open_bt);
 		qs_rot = qs_tile(row, LV_SYMBOL_REFRESH, "Auto-rotate", &qs_rot_sub, qs_rot_cb);
 		qs_rot_sync();
-		/* the slider 12 below; the handle 52 below it */
-		shade_h = 128 + th + 12 + 56 + 52;
+		/* the slider 12 below; the handle 52 below it (the background
+		 * player's card, when there is one, between: shade_relayout) */
+		shade_base_h = 128 + th + 12 + 56 + 52;
+		shade_card_y = 128 + th + 8;
+		shade_h = shade_base_h;
 		lv_obj_set_height(shade, shade_h);
 		lv_obj_set_y(shade, -shade_h);
 	}
 
-	row = lv_obj_create(shade);
+	row = shade_bright_row = lv_obj_create(shade);
 	plain(row);
 	lv_obj_set_size(row, W - 2 * STATUS_PAD, 56);
 	lv_obj_align(row, LV_ALIGN_TOP_MID, 0, shade_h - 52 - 56);
@@ -3935,6 +3953,8 @@ static void build_shade(void)
 	lv_obj_set_style_bg_color(h, M.outline, 0);
 	lv_obj_align(h, LV_ALIGN_BOTTOM_MID, 0, -14);
 	lv_obj_remove_flag(h, LV_OBJ_FLAG_CLICKABLE);
+
+	np_build(shade, shade_card_y);	/* (hidden while nothing plays: np_sync) */
 }
 
 /* ------------------------------------------------------- applications */
@@ -4388,6 +4408,7 @@ static void sd_end(bool open)
 		lv_obj_remove_flag(scrim, LV_OBJ_FLAG_HIDDEN);
 		lv_slider_set_value(home_bright, backlight_get(), LV_ANIM_OFF);
 		home_wake();
+		np_opened();
 	} else {
 		shade_closed();
 		if ((app_pid > 0 || on_page()) && !sd.to_page)
@@ -5747,19 +5768,31 @@ static void app_kill_cb(lv_timer_t *t)
 		kill(-app_pid, SIGKILL);	/* app_poll reaps it */
 }
 
-/* Home: end the application, if one runs (without waiting for it). */
-static bool app_end(void)
+/*
+ * End the application, if one runs (without waiting for it). Home with
+ * sound playing (a video, a song: n72-player) sends the player to the
+ * background instead (@bg): the sound goes on, the shade has its controls.
+ */
+static bool app_end_ex(bool bg)
 {
 	if (app_pid <= 0)
 		return false;
 	if (za.kill_timer || (za.phase && za.phase >= 4))
 		return true;		/* already ending */
+	if (bg && bg_start())
+		return true;
 	za_finish();
 	kill(-app_pid, SIGTERM);
 	za.kill_timer = lv_timer_create(app_kill_cb, app_kill_ms(), NULL);
 	lv_timer_set_repeat_count(za.kill_timer, 1);
 	za_close();
 	return true;
+}
+
+/* Home: playing sound goes to the background, anything else ends. */
+static bool app_end(void)
+{
+	return app_end_ex(true);
 }
 
 /*
@@ -5783,6 +5816,14 @@ static void za_spawn_cb(lv_timer_t *t)
 	LV_UNUSED(t);
 	if (app_pid != -1)
 		return;		/* (the launch was given up meanwhile) */
+	if (bg_busy()) {
+		/* the player in the background is still ending (it holds the
+		 * player's socket name and the sound): once it has gone */
+		lv_timer_t *again = lv_timer_create(za_spawn_cb, 30, NULL);
+
+		lv_timer_set_repeat_count(again, 1);
+		return;
+	}
 	za_fill_layer0(za.col);
 	while (environ[n])
 		n++;
@@ -5835,11 +5876,28 @@ static void za_spawn_cb(lv_timer_t *t)
 	 * za_next gives it full priority when the grow ends */
 }
 
+/* The screen over applications (once). */
+static void app_scr_make(void)
+{
+	if (app_scr)
+		return;
+	/* nothing on it: transparent, the application shows */
+	app_scr = lv_obj_create(NULL);
+	lv_obj_remove_style_all(app_scr);
+	lv_obj_remove_flag(app_scr, LV_OBJ_FLAG_SCROLLABLE);
+	/* LVGL draws its bottom layer under a screen that is not
+	 * opaque, and the theme has given that one a background */
+	lv_obj_remove_style_all(lv_layer_bottom());
+	lv_obj_add_event_cb(app_scr, app_gesture_cb, LV_EVENT_GESTURE, NULL);
+	app_bar_build();
+}
+
 /* Start @cmd as the application, growing out of @tile (a tile, or a row). */
 static void app_launch(const char *cmd, lv_obj_t *tile)
 {
 	if (app_pid != 0 || za.phase || !mbx_gpu_on_shell_layer())
 		return;
+	bg_end();		/* one player at a time: the one in the background ends */
 	free(app_cmd);
 	app_cmd = strdup(cmd ? cmd : "");
 	if (!app_cmd)
@@ -5860,17 +5918,7 @@ static void app_launch(const char *cmd, lv_obj_t *tile)
 	}
 	if (cmd_is_video(cmd))
 		vc_start();
-	if (!app_scr) {
-		/* nothing on it: transparent, the application shows */
-		app_scr = lv_obj_create(NULL);
-		lv_obj_remove_style_all(app_scr);
-		lv_obj_remove_flag(app_scr, LV_OBJ_FLAG_SCROLLABLE);
-		/* LVGL draws its bottom layer under a screen that is not
-		 * opaque, and the theme has given that one a background */
-		lv_obj_remove_style_all(lv_layer_bottom());
-		lv_obj_add_event_cb(app_scr, app_gesture_cb, LV_EVENT_GESTURE, NULL);
-		app_bar_build();
-	}
+	app_scr_make();
 	tr_finish();
 	shade_set(false, false);
 
@@ -6643,6 +6691,13 @@ static void build_home(void)
 	lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_add_event_cb(bar, shade_tap_cb, LV_EVENT_CLICKED, (void *)1);
 	status_row(bar, &status_time, &status_wifi, &status_bt, &batt_lbl);
+	/* a note before Wi-Fi while something plays in the background */
+	status_np = m3_label(bar, LV_SYMBOL_AUDIO, &lv_font_montserrat_14, M.on_surface_v);
+	lv_obj_move_to_index(status_np, (int32_t)lv_obj_get_index(status_wifi));
+	lv_obj_add_flag(status_np, LV_OBJ_FLAG_HIDDEN);
+	if (home_wp)
+		lv_obj_set_style_text_color(status_np, WP_TEXT, 0);
+	np_sync();
 	home_bar = bar;
 	if (home_wp) {
 		lv_obj_set_style_text_color(status_time, WP_TEXT, 0);
@@ -9383,6 +9438,7 @@ static void ui_rebuild_overlays_free(void)
 			&clock_lbl, &date_lbl,
 			&qs_wifi, &qs_bt, &qs_wifi_sub, &qs_bt_sub, &qs_rot, &qs_rot_sub,
 			&home_bright, &qs_settings_btn, &vol_hud_slider, &vol_hud_icon,
+			&np.card, &np.title, &np.sub, &np.play_sym, &shade_bright_row,
 		};
 
 		for (i = 0; i < (int)(sizeof(gone) / sizeof(gone[0])); i++)
@@ -9452,7 +9508,7 @@ static void ui_rebuild(bool load)
 	 * while the new ones are built: they skip what is NULL) */
 	{
 		lv_obj_t **gone[] = {
-			&status_time, &status_wifi, &status_bt, &batt_lbl,
+			&status_time, &status_wifi, &status_bt, &batt_lbl, &status_np,
 			&home_clock, &home_date, &home_batt, &home_net,
 			&settings_tile, &home_apps, &home_bar, &home_dots, &home_dock, &home_view,
 		};
@@ -9529,7 +9585,7 @@ static void home_fresh(void)
 	pg_home_gone();
 	{
 		lv_obj_t **gone[] = {
-			&status_time, &status_wifi, &status_bt, &batt_lbl,
+			&status_time, &status_wifi, &status_bt, &batt_lbl, &status_np,
 			&home_clock, &home_date, &home_batt, &home_net,
 			&settings_tile, &home_apps, &home_bar, &home_dots, &home_dock, &home_view,
 		};
@@ -9869,6 +9925,16 @@ static void ui_upright(void)
 #define VC_FADE_MS 150
 
 
+/* the player in the background (bg_start, below) */
+static struct {
+	pid_t pid;
+	int pidfd;
+	char *cmd;
+	bool ending;
+	bool video;		/* it has pictures to come back to */
+	lv_timer_t *kill, *poll;
+} bgp = { .pidfd = -1 };
+
 static struct {
 	lv_obj_t *root, *ui, *title, *play_sym, *slider, *pos, *dur, *rot_lbl, *rot_btn;
 	lv_timer_t *poll, *hide;
@@ -10039,9 +10105,28 @@ static void vc_rx(int fd)
 
 	LV_UNUSED(fd);
 	while ((n = recv(vc.sock, buf, sizeof(buf) - 1, MSG_DONTWAIT)) > 0) {
+		int bgf = 0, vid = 1;
+
 		buf[n] = 0;
-		if (sscanf(buf, "%15s %lld %lld %d", st, &pos, &dur, &r) != 4)
+		if (sscanf(buf, "%15s %lld %lld %d %d %d", st, &pos, &dur, &r, &bgf, &vid) < 4)
 			continue;
+		if (bgp.pid > 0 && app_pid < 0)
+			continue;	/* (the ending background player's, not the next one's) */
+		if (bgp.pid > 0 && app_pid == 0) {
+			/* in the background: the shade's card follows it */
+			const char *nl = strchr(buf, '\n');
+
+			if (nl && strcmp(vc.name, nl + 1))
+				snprintf(vc.name, sizeof(vc.name), "%s", nl + 1);
+			bgp.video = vid != 0;
+			if (lv_tick_elaps(vc.quiet_ms) >= 700) {
+				vc.playing = !strcmp(st, "playing");
+				vc.pos_ms = pos;
+				vc.dur_ms = dur;
+			}
+			np_sync();
+			continue;
+		}
 		if (!vc.up) {
 			const char *nl = strchr(buf, '\n');
 
@@ -10072,6 +10157,8 @@ static void vc_rx(int fd)
 		vc.pos_ms = pos;
 		vc.dur_ms = dur;
 	}
+	if (app_pid == 0)
+		return;		/* (no controls over it: the background's) */
 	if (vc.up && vc.prot != ui_rot) {
 		snprintf(buf, sizeof(buf), "rot %d", ui_rot);
 		vc_send(buf);
@@ -10082,7 +10169,15 @@ static void vc_rx(int fd)
 
 static void vc_poll(lv_timer_t *t)
 {
-	uint32_t period = !vc.up || vc.shown || vc.dragging ? 250 : 2000;
+	uint32_t period = bgp.pid > 0 && app_pid == 0 ? (shade_open ? 500 : 2000) :
+			  !vc.up || vc.shown || vc.dragging ? 250 : 2000;
+
+	if (bgp.pid > 0 && app_pid == 0) {
+		if (t->period != period)
+			lv_timer_set_period(t, period);
+		vc_send("status");
+		return;
+	}
 
 	if (t->period != period)
 		lv_timer_set_period(t, period);
@@ -10151,7 +10246,7 @@ static void vc_slider_cb(lv_event_t *e)
 static void vc_back_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
-	app_end();		/* back to where it was started (Files) */
+	app_end_ex(false);	/* back to where it was started (Files); Back stops it */
 }
 
 static void vc_rot_show(void);
@@ -10366,14 +10461,10 @@ static void vc_start(void)
 	fprintf(stderr, "n72-ui: video controls for %s (socket %d)\n", app_cmd, vc.sock);
 }
 
+
+
 static void vc_stop(void)
 {
-	if (vc.sock >= 0)
-		ui_unwatch(vc.sock);
-	if (vc.poll) {
-		lv_timer_delete(vc.poll);
-		vc.poll = NULL;
-	}
 	if (vc.hide) {
 		lv_timer_delete(vc.hide);
 		vc.hide = NULL;
@@ -10381,8 +10472,358 @@ static void vc_stop(void)
 	if (vc.root && lv_obj_is_valid(vc.root))
 		lv_obj_delete(vc.root);
 	vc.root = vc.ui = vc.rot_btn = vc.rot_lbl = NULL;
-	vc.up = vc.shown = false;
+	vc.shown = false;
 	video_rot = -1;
+	if (bgp.pid > 0)
+		return;		/* (the player plays on: its state for the shade) */
+	if (vc.sock >= 0)
+		ui_unwatch(vc.sock);
+	if (vc.poll) {
+		lv_timer_delete(vc.poll);
+		vc.poll = NULL;
+	}
+	vc.up = false;
+}
+
+/*
+ * Background playback. Home while the player plays (a video, a song,
+ * YouTube's Listen) does not end it: it is told "bg" (the picture off the
+ * screen, its video decoder idle, the sound going on) and leaves the front;
+ * the launcher is back as after any application, and the shade has a card
+ * for it (the title, where it is, back 10 s, play/pause, on 10 s, close).
+ * A tap on the card brings it to the front again ("fg"), the controls up;
+ * starting anything else, or the close button, ends it. Its end (the media
+ * over, an error) is a pidfd event as for applications. The status replies
+ * keep coming over the controls' socket, every 2 s (twice a second while
+ * the shade is open). The screen and sleep need nothing of their own: sound
+ * playing keeps the system up with the screen off (main.c,
+ * screen_off_or_sleep), and paused it sleeps as usual.
+ */
+static bool bg_busy(void)
+{
+	return bgp.pid > 0;
+}
+
+static void bg_reaped(void)
+{
+	if (bgp.pidfd >= 0) {
+		ui_unwatch(bgp.pidfd);
+		close(bgp.pidfd);
+		bgp.pidfd = -1;
+	}
+	if (bgp.kill) {
+		lv_timer_delete(bgp.kill);
+		bgp.kill = NULL;
+	}
+	if (bgp.poll) {
+		lv_timer_delete(bgp.poll);
+		bgp.poll = NULL;
+	}
+	free(bgp.cmd);
+	bgp.cmd = NULL;
+	bgp.pid = 0;
+	bgp.ending = false;
+	if (app_pid == 0)
+		vc_stop();	/* (now with the socket: nothing plays) */
+	np_sync();
+}
+
+static void bg_check(void)
+{
+	int st;
+
+	if (bgp.pid > 0 && waitpid(bgp.pid, &st, WNOHANG) == bgp.pid)
+		bg_reaped();
+}
+
+static void bg_pidfd_ev(int fd)
+{
+	LV_UNUSED(fd);
+	bg_check();
+}
+
+static void bg_poll_cb(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	bg_check();
+}
+
+static void bg_kill_cb(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	bgp.kill = NULL;
+	if (bgp.pid > 0)
+		kill(-bgp.pid, SIGKILL);	/* (reaped by its pidfd event) */
+}
+
+/* The application (a playing n72-player) to the background: true if it went. */
+static bool bg_start(void)
+{
+	if (!app_is_video() || !vc.up || !vc.playing || lv_screen_active() != app_scr ||
+	    bgp.pid > 0 || locked)
+		return false;
+	za_finish();
+	vc_send("bg");
+	bgp.pid = app_pid;
+	bgp.cmd = app_cmd;
+	app_cmd = NULL;
+	bgp.ending = false;
+	if (app_pidfd >= 0) {
+		ui_unwatch(app_pidfd);
+		bgp.pidfd = app_pidfd;
+		app_pidfd = -1;
+		ui_watch(bgp.pidfd, bg_pidfd_ev);
+	} else {
+		bgp.poll = lv_timer_create(bg_poll_cb, 1000, NULL);	/* (no pidfd: look) */
+	}
+	if (app_timer) {
+		lv_timer_delete(app_timer);
+		app_timer = NULL;
+	}
+	app_pid = 0;
+	kbd_app_gone();
+	rot_kick();		/* (no player in front: the launcher's own turn) */
+	fprintf(stderr, "n72-ui: %s to the background (pid %d)\n", bgp.cmd ? bgp.cmd : "player",
+		(int)bgp.pid);
+	np_sync();
+	za_close();		/* as an application ends: into its icon */
+	return true;
+}
+
+/* The player in the background ends (the shade's close, anything started). */
+static void bg_end(void)
+{
+	if (bgp.pid <= 0 || bgp.ending)
+		return;
+	bgp.ending = true;
+	kill(-bgp.pid, SIGTERM);
+	bgp.kill = lv_timer_create(bg_kill_cb, 600, NULL);
+	lv_timer_set_repeat_count(bgp.kill, 1);
+	np_sync();		/* (the card goes now) */
+}
+
+/* The card: the player to the front again, its controls up. */
+static void bg_front(void)
+{
+	if (bgp.pid <= 0 || bgp.ending || app_pid != 0 || za.phase || locked ||
+	    !mbx_gpu_on_shell_layer())
+		return;
+	ui_settle_all();
+	tr_finish();
+	shade_set(false, false);
+	free(app_cmd);
+	app_cmd = bgp.cmd;
+	bgp.cmd = NULL;
+	app_pid = bgp.pid;
+	if (bgp.pidfd >= 0) {
+		ui_unwatch(bgp.pidfd);
+		app_pidfd = bgp.pidfd;
+		bgp.pidfd = -1;
+		ui_watch(app_pidfd, app_pidfd_ev);
+	} else if (!app_timer) {
+		app_timer = lv_timer_create(app_poll, 200, NULL);
+	}
+	if (bgp.poll) {
+		lv_timer_delete(bgp.poll);
+		bgp.poll = NULL;
+	}
+	bgp.pid = 0;
+	app_scr_make();
+	launch_from = lv_screen_active();	/* (home, or a page) */
+	za.tile = NULL;				/* (no icon to grow from: it simply shows) */
+	lv_obj_set_parent(scrim, lv_layer_top());
+	lv_obj_set_parent(shade, lv_layer_top());
+	/* the controls are built at its next answer, shown a moment */
+	vc.up = vc.shown = vc.dragging = false;
+	vc.prot = -1;			/* (its turn told again) */
+	video_rot = -1;
+	vc_send("fg");
+	mbx_gpu_set_transparent(true);
+	lv_screen_load(app_scr);
+	rot_kick();
+	np_sync();
+	if (vc.poll)
+		lv_timer_ready(vc.poll);
+}
+
+/* ---- the shade's card */
+
+static void np_play_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	vc_send("toggle");
+	vc.playing = !vc.playing;
+	vc_quiet();
+	np_sync();
+}
+
+static void np_skip_cb(lv_event_t *e)
+{
+	char m[32];
+
+	snprintf(m, sizeof(m), "skip %d", (int)(intptr_t)lv_event_get_user_data(e));
+	vc_send(m);
+	vc_quiet();
+}
+
+static void np_close_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	bg_end();
+}
+
+static void np_front_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	bg_front();
+}
+
+/* A round icon button of the card (tonal when @filled). */
+static lv_obj_t *np_btn(lv_obj_t *parent, const char *sym, bool filled, lv_event_cb_t cb, void *ud)
+{
+	lv_obj_t *b = lv_button_create(parent), *l;
+
+	plain(b);
+	lv_obj_set_size(b, 40, 40);
+	lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_bg_color(b, filled ? M.primary : M.surface_c_highest, 0);
+	lv_obj_set_style_bg_opa(b, filled ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+	lv_obj_set_style_shadow_width(b, 0, 0);
+	lv_obj_set_style_transform_scale(b, 240, LV_STATE_PRESSED);
+	l = m3_label(b, sym, &lv_font_montserrat_16, filled ? M.on_primary : M.on_surface);
+	lv_obj_center(l);
+	lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, ud);
+	lv_obj_remove_flag(b, LV_OBJ_FLAG_GESTURE_BUBBLE);
+	return b;
+}
+
+#define NP_H 72		/* the card; 8 above it */
+
+/*
+ * In the shade, under the tiles: a rounded surface card, the title and
+ * where it is (a tap there: to the front), the buttons on the right.
+ * Hidden while nothing plays in the background.
+ */
+static void np_build(lv_obj_t *parent, int32_t y)
+{
+	lv_obj_t *c, *col, *row;
+
+	c = np.card = lv_obj_create(parent);
+	plain(c);
+	lv_obj_set_size(c, W - 2 * STATUS_PAD, NP_H);
+	lv_obj_align(c, LV_ALIGN_TOP_MID, 0, y);
+	lv_obj_set_style_bg_color(c, M.surface_c_high, 0);
+	lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
+	lv_obj_set_style_radius(c, 20, 0);
+	lv_obj_set_style_pad_hor(c, 14, 0);
+	lv_obj_set_style_pad_ver(c, 0, 0);
+	lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_add_event_cb(c, np_front_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(c, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_column(c, 6, 0);
+
+	col = lv_obj_create(c);
+	lv_obj_remove_style_all(col);
+	lv_obj_set_height(col, LV_SIZE_CONTENT);
+	lv_obj_set_flex_grow(col, 1);
+	lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_add_flag(col, LV_OBJ_FLAG_EVENT_BUBBLE);
+	lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_pad_row(col, 2, 0);
+	np.title = m3_label(col, "", &lv_font_montserrat_14, M.on_surface);
+	lv_obj_set_width(np.title, lv_pct(100));
+	lv_label_set_long_mode(np.title, LV_LABEL_LONG_DOT);
+	np.sub = m3_label(col, "", &lv_font_montserrat_12, M.on_surface_v);
+
+	row = lv_obj_create(c);
+	lv_obj_remove_style_all(row);
+	lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_column(row, 2, 0);
+	np_btn(row, LV_SYMBOL_PREV, false, np_skip_cb, (void *)(intptr_t)-10000);
+	np.play_sym = lv_obj_get_child(np_btn(row, LV_SYMBOL_PAUSE, true, np_play_cb, NULL), 0);
+	np_btn(row, LV_SYMBOL_NEXT, false, np_skip_cb, (void *)(intptr_t)10000);
+	np_btn(row, LV_SYMBOL_CLOSE, false, np_close_cb, NULL);
+	lv_obj_add_flag(c, LV_OBJ_FLAG_HIDDEN);
+	np_sync();
+}
+
+static void shade_relayout(void);
+
+/*
+ * The shade as tall as what it holds: the background player's card adds
+ * its height (NP_H and 8) above the brightness slider. Its pictures are
+ * taken again; closed, it waits above the screen at the new height.
+ */
+static void shade_relayout(void)
+{
+	bool card = np.card && !lv_obj_has_flag(np.card, LV_OBJ_FLAG_HIDDEN);
+	int32_t h = shade_base_h + (card ? NP_H + 8 : 0);
+
+	if (!shade || !shade_bright_row || h == shade_h)
+		return;
+	shade_h = h;
+	lv_obj_set_height(shade, shade_h);
+	lv_obj_align(shade_bright_row, LV_ALIGN_TOP_MID, 0, shade_h - 52 - 56);
+	if (!shade_open && !sd.on && !sd.scr)
+		lv_obj_set_y(shade, -shade_h);
+	shade_pic_dirty = true;
+}
+
+/* The card and the status bar's symbol as the background player is now. */
+static void np_sync(void)
+{
+	bool on = bgp.pid > 0 && !bgp.ending;
+	char b[64], p[24], d[24];
+
+	if (status_np && lv_obj_has_flag(status_np, LV_OBJ_FLAG_HIDDEN) == on) {
+		if (on)
+			lv_obj_remove_flag(status_np, LV_OBJ_FLAG_HIDDEN);
+		else
+			lv_obj_add_flag(status_np, LV_OBJ_FLAG_HIDDEN);
+	}
+	if (!np.card)
+		return;
+	if (lv_obj_has_flag(np.card, LV_OBJ_FLAG_HIDDEN) == on) {
+		if (on)
+			lv_obj_remove_flag(np.card, LV_OBJ_FLAG_HIDDEN);
+		else
+			lv_obj_add_flag(np.card, LV_OBJ_FLAG_HIDDEN);
+		shade_relayout();
+	}
+	if (!on)
+		return;
+	label_set_if_changed(np.title, vc.name[0] ? vc.name : "Playing");
+	label_set_if_changed(np.play_sym, vc.playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+	/*
+	 * Where it is only while the shade is open: each change of a label in
+	 * the shade has its picture taken again (shade_changed), every 2 s
+	 * for nothing while it is closed. Opening it asks the player at once
+	 * (np_opened).
+	 */
+	if (!shade_open && lv_label_get_text(np.sub)[0])
+		return;
+	vc_fmt(p, sizeof(p), vc.pos_ms);
+	if (vc.dur_ms > 0) {
+		vc_fmt(d, sizeof(d), vc.dur_ms);
+		snprintf(b, sizeof(b), "%s / %s%s", p, d, vc.playing ? "" : "  Paused");
+	} else {
+		snprintf(b, sizeof(b), "%s%s", p, vc.playing ? "" : "  Paused");
+	}
+	label_set_if_changed(np.sub, b);
+}
+
+/* The shade opened: the card's position fresh now, then twice a second. */
+static void np_opened(void)
+{
+	if (bgp.pid > 0 && app_pid == 0 && vc.poll) {
+		lv_timer_set_period(vc.poll, 500);
+		lv_timer_ready(vc.poll);
+	}
 }
 
 /*
