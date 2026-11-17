@@ -2224,12 +2224,22 @@ static bool flip_setup(uint32_t size)
 		if (!scan[i])
 			return false;	/* (the regions stay mapped; unused) */
 	}
-	/* start from what is on the screen, then show buffer 0 */
+	/*
+	 * Start from what is on the screen, then show buffer 0. An application
+	 * on layer 0 (N72_LAYER0) starts from black instead: fb.gpu_addr is the
+	 * boot frame buffer, which still holds the boot console's text, and it
+	 * would show until the application's first frame (the "console flash"
+	 * when the browser opens).
+	 */
 	{
 		uint32_t w[16];
 
-		submit(w, put_copy(w, gpu_addr(scan[0]), fb.stride, fb.gpu_addr, fb.stride,
-				   0, 0, 0, 0, fb.width, fb.height));
+		if (getenv("N72_LAYER0"))
+			submit(w, put_fill(w, gpu_addr(scan[0]), fb.stride, 0xff000000,
+					   0, 0, fb.width, fb.height));
+		else
+			submit(w, put_copy(w, gpu_addr(scan[0]), fb.stride, fb.gpu_addr, fb.stride,
+					   0, 0, 0, 0, fb.width, fb.height));
 		gpu_wait(last_seq);
 		last_seq = 0;
 	}
