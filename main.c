@@ -1885,6 +1885,41 @@ static void idle_kick(void)
 
 /* -------------------------------------------------------------- buttons */
 
+/*
+ * The screen as the launcher believes it, against the panel and the
+ * backlight as they are. Another program may have switched one off under
+ * a launcher that holds the screen lit (a test script putting back "what
+ * it found", 2026-11-18: the backlight off under a freshly started
+ * launcher, then the panel too): the launcher drew and took touches
+ * unseen, Home went home unseen, and Power put the dark screen "to sleep".
+ * Looked at when Home or Power is pressed, the keys one reaches for then:
+ * a dark screen that should be lit is lit, and that press does no more.
+ */
+static bool screen_lit_check(void)
+{
+	char p[160];
+	bool fixed = false;
+
+	if (screen_off)
+		return false;
+	if (access(PANEL_POWER, W_OK) == 0 && read_int(PANEL_POWER, 1) == 0) {
+		write_int(PANEL_POWER, 1);
+		fixed = true;
+	}
+	if (bl_dir[0]) {
+		snprintf(p, sizeof(p), "%s/bl_power", bl_dir);
+		if (read_int(p, 0) != 0) {
+			backlight_power(true);
+			fixed = true;
+		}
+	}
+	if (fixed) {
+		fprintf(stderr, "n72-ui: the screen was dark under a lit launcher: lit again\n");
+		lv_obj_invalidate(lv_screen_active());
+	}
+	return fixed;
+}
+
 static void keys_poll(lv_timer_t *t)
 {
 	struct input_event ev;
@@ -1910,6 +1945,10 @@ static void keys_poll(lv_timer_t *t)
 			continue;
 		}
 		lv_display_trigger_activity(NULL);
+		if ((ev.code == KEY_HOMEPAGE || ev.code == KEY_POWER) && screen_lit_check()) {
+			home_down_us = 0;
+			continue;	/* (the press that brought the picture back) */
+		}
 		switch (ev.code) {
 		case KEY_HOMEPAGE:
 			if (screen_off) {
@@ -2339,8 +2378,9 @@ int main(int argc, char **argv)
 	 */
 	if (access(PANEL_POWER, W_OK) == 0)
 		write_int(PANEL_POWER, 1);
-	else
-		backlight_power(true);
+	/* (the driver lights the backlight when the panel goes on; a panel
+	 * already on with the backlight switched off stayed dark) */
+	backlight_power(true);
 
 	disp = NULL;
 	if (!getenv("N72_GPU") || strcmp(getenv("N72_GPU"), "0"))
