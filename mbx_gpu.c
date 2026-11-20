@@ -1510,7 +1510,7 @@ static bool cur_all;
 
 static int notify_pipe[2] = { -1, -1 };
 static int kms_fd = -1;			/* /dev/dri/card0 when flipping through KMS */
-static void kms_flip(int r);
+static bool kms_flip(int r);
 
 /* a finished frame is waiting for the display (drawing another is wasted) */
 bool mbx_gpu_frame_waiting(void)
@@ -1562,8 +1562,10 @@ static void *flip_main(void *arg)
 				;
 		}
 		t0 = gpu_now_us();
+		bool shown = true;
+
 		if (kms_fd >= 0) {
-			kms_flip(r);		/* waits for the flip's event */
+			shown = kms_flip(r);	/* waits for the flip's own event */
 		} else {
 			f.handle = scan_handle[r];
 			mbx_flip(mbx, &f);	/* address now ... */
@@ -1571,7 +1573,8 @@ static void *flip_main(void *arg)
 		}
 		pthread_mutex_lock(&flip_mx);
 		mbx_gpu_stats.flip_us += gpu_now_us() - t0;
-		st_front = r;
+		if (shown)		/* (a flip refused: the old front is still on screen) */
+			st_front = r;
 		st_latching = -1;
 		pthread_cond_broadcast(&flip_cv);
 	}
@@ -2045,15 +2048,53 @@ static int kms_open(void)
 	return -1;
 }
 
-static void kms_flip(int r)
+/*
+ * Wait for the completion event of flip @seq (its user_data), up to @ms;
+ * events of earlier flips are dropped. Each flip used to wait 200 ms and
+ * read one event, whatever it was: after one wait that ran out (a stall
+ * of a few hundred milliseconds), every later wait read the previous
+ * flip's event at once, the launcher took a buffer still being scanned
+ * out for free and drew into it, and its layer flickered until two events
+ * happened to arrive in one read (2026-11-20, after a slow wake; found by
+ * the Hardware gaps session in the vblank-wait statistic, 0.2-0.5 ms where
+ * 14-16 is normal). True when it came.
+ */
+static bool kms_wait_flip(uint64_t seq, int ms)
+{
+	struct pollfd p = { .fd = kms_fd, .events = POLLIN };
+	char buf[512] __attribute__((aligned(8)));
+	double until = gpu_now_us() + ms * 1000.0;
+
+	for (;;) {
+		int left = (int)((until - gpu_now_us()) / 1000);
+		ssize_t n, o;
+
+		if (left <= 0 || poll(&p, 1, left) <= 0)
+			return false;
+		n = read(kms_fd, buf, sizeof(buf));
+		for (o = 0; n > 0 && o + (ssize_t)sizeof(struct drm_event) <= n;) {
+			struct drm_event *e = (struct drm_event *)(buf + o);
+
+			if (e->length < sizeof(*e))
+				break;
+			if (e->type == DRM_EVENT_FLIP_COMPLETE &&
+			    ((struct drm_event_vblank *)e)->user_data == seq)
+				return true;
+			o += e->length;
+		}
+	}
+}
+
+static uint64_t kms_seq;
+
+/* The flip to buffer @r, waited for: true once it is on the screen. */
+static bool kms_flip(int r)
 {
 	uint64_t want = ROT_BITS(buf_rot[r]);
 	struct drm_mode_crtc_page_flip pf = {
 		.crtc_id = kms_crtc, .fb_id = buf_rot[r] ? kms_fb_l[r] : kms_fb[r],
-		.flags = DRM_MODE_PAGE_FLIP_EVENT,
+		.flags = DRM_MODE_PAGE_FLIP_EVENT, .user_data = ++kms_seq,
 	};
-	struct pollfd p = { .fd = kms_fd, .events = POLLIN };
-	char buf[256];
 	int tries;
 
 	if (kms_can_turn && want != kms_rot_cur) {
@@ -2070,11 +2111,12 @@ static void kms_flip(int r)
 			.flags = DRM_MODE_PAGE_FLIP_EVENT, .count_objs = 1,
 			.objs_ptr = (uintptr_t)objs, .count_props_ptr = (uintptr_t)counts,
 			.props_ptr = (uintptr_t)props, .prop_values_ptr = (uintptr_t)vals,
+			.user_data = pf.user_data,
 		};
 
 		if (ioctl(kms_fd, DRM_IOCTL_MODE_ATOMIC, &a)) {
 			fprintf(stderr, "n72-ui: turning the layer: %s\n", strerror(errno));
-			return;
+			return false;
 		}
 		kms_rot_cur = want;
 		goto wait;
@@ -2083,14 +2125,23 @@ static void kms_flip(int r)
 		if (!ioctl(kms_fd, DRM_IOCTL_MODE_PAGE_FLIP, &pf))
 			break;
 		if (errno != EBUSY)
-			return;
+			return false;
 		usleep(2000);		/* a flip still pending (not expected) */
 	}
+	if (tries == 50)
+		return false;
 wait:
-	if (poll(&p, 1, 200) > 0 && read(kms_fd, buf, sizeof(buf)) < 0)
-		;
+	/*
+	 * Its own event, for up to a second (only this thread waits; the
+	 * renderer has its third buffer). Lost after that: taken as shown,
+	 * and its event, if it ever comes, is dropped by the next wait.
+	 */
+	if (!kms_wait_flip(pf.user_data, 1000))
+		fprintf(stderr, "n72-ui: flip %llu: no completion in 1 s\n",
+			(unsigned long long)pf.user_data);
 	if (handoff_n)
 		kms_drop_handoff();	/* (the old picture is off the layer now) */
+	return true;
 }
 
 static bool kms_setup(void)
