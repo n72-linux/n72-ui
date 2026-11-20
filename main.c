@@ -1736,14 +1736,51 @@ static bool system_sleep(void)
 	return ok;
 }
 
-/* Is sound playing? (any ALSA playback stream running) */
+/*
+ * Is the Bluetooth output playing? bluealsa has no kernel sound card, so
+ * the cards' status says nothing about it: while n72-audio-route names a
+ * Bluetooth output (/run/n72-audio: pcm=), bluealsa is asked whether that
+ * PCM is running (bluealsa-cli info: "Running: true"). Without this a
+ * screen turned off during music into earbuds on battery put the system
+ * to sleep, and the kernel's Bluetooth suspend dropped the earbuds' link
+ * (2026-11-20, found by the Hardware gaps session from the logs). Only
+ * asked while such a route exists: a few times at a screen-off and every
+ * 2 s while the screen is off for sound (playback_check).
+ */
+static bool bt_audio_playing(void)
+{
+	char line[192], pcm[160] = "", cmd[224];
+	bool on = false;
+	FILE *f = fopen("/run/n72-audio", "r");
+
+	if (!f)
+		return false;
+	while (fgets(line, sizeof(line), f))
+		if (!strncmp(line, "pcm=", 4))
+			snprintf(pcm, sizeof(pcm), "%s", line + 4);
+	fclose(f);
+	pcm[strcspn(pcm, "\n")] = 0;
+	if (!pcm[0] || strchr(pcm, '\'') || !have_tool("bluealsa-cli"))
+		return false;
+	snprintf(cmd, sizeof(cmd), "bluealsa-cli info '%s' 2>/dev/null", pcm);
+	f = popen(cmd, "r");
+	if (!f)
+		return false;
+	while (fgets(line, sizeof(line), f))
+		if (!strncmp(line, "Running: true", 13))
+			on = true;
+	pclose(f);
+	return on;
+}
+
+/* Is sound playing? (any ALSA playback stream running, or Bluetooth's) */
 static bool audio_playing(void)
 {
 	glob_t g;
 	bool on = false;
 
 	if (glob("/proc/asound/card*/pcm*p/sub*/status", 0, NULL, &g))
-		return false;
+		return bt_audio_playing();
 	for (size_t i = 0; i < g.gl_pathc && !on; i++) {
 		char buf[64] = "";
 		FILE *f = fopen(g.gl_pathv[i], "r");
@@ -1754,7 +1791,7 @@ static bool audio_playing(void)
 		fclose(f);
 	}
 	globfree(&g);
-	return on;
+	return on || bt_audio_playing();
 }
 
 /*
