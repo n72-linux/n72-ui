@@ -1317,17 +1317,24 @@ static bool mem_sleep_set(const char *mode)
 	return ok;
 }
 
+static int sleep_errno;		/* why the last write_sleep_state failed */
+
 static bool write_sleep_state(const char *state)
 {
 	int fd = open("/sys/power/state", O_WRONLY | O_CLOEXEC);
 	ssize_t r;
 
-	if (fd < 0)
+	sleep_errno = 0;
+	if (fd < 0) {
+		sleep_errno = errno;
 		return false;
+	}
 	r = write(fd, state, strlen(state));
+	if (r != (ssize_t)strlen(state))
+		sleep_errno = errno;
 	close(fd);
 	if (r != (ssize_t)strlen(state))
-		fprintf(stderr, "n72-ui: %s failed: %s\n", state, strerror(errno));
+		fprintf(stderr, "n72-ui: %s failed: %s\n", state, strerror(sleep_errno));
 	return r == (ssize_t)strlen(state);
 }
 
@@ -1377,6 +1384,14 @@ static void wake_marks(struct wake_marks *m)
 			m->alarm = 0;
 		fclose(f);
 	}
+	/*
+	 * An alarm whose time has passed still reads as set. Taken for
+	 * somebody else's, it kept the system out of deep sleep for good (no
+	 * alarm of our own is set while another is: 2026-11-20, one left by a
+	 * test). It will not ring again: none.
+	 */
+	if (m->alarm && m->alarm < time(NULL))
+		m->alarm = 0;
 	f = fopen("/proc/interrupts", "r");
 	if (!f)
 		return;
@@ -1669,6 +1684,7 @@ static bool system_sleep(void)
 	const char *e = getenv("N72_SLEEP");
 	time_t start = boot_s();
 	bool ok, own = false;	/* the alarm set is ours */
+	int busy_tries = 0;
 
 	if (e && !strcmp(e, "0"))
 		return false;
@@ -1700,6 +1716,22 @@ static bool system_sleep(void)
 			ok = deep && deep_sleep();
 			if (!ok)	/* not deep, or the PMU refused: suspend to idle */
 				ok = write_sleep_state("freeze");
+			/*
+			 * Given up at once because a wakeup event came while the
+			 * tasks were being frozen (EBUSY: "Freezing user space
+			 * processes aborted"): not a refusal, the sleep is wanted
+			 * still. Before, n72-ui stayed up with the screen dark for
+			 * good (2026-11-20). Served in the dark like any other
+			 * wake, and tried again; a run of them ends it.
+			 */
+			if (!ok && sleep_errno == EBUSY && ++busy_tries <= 10) {
+				woke_us = mono_us();
+				if (woke_for_screen(&before) || dark_linger()) {
+					ok = true;	/* (a wake like any other: the screen goes on) */
+					break;
+				}
+				continue;
+			}
 		}
 		woke_us = mono_us();
 		if (deep && ok && getenv("N72_WAKE_LOG")) {
