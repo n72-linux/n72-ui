@@ -1340,20 +1340,15 @@ struct wake_marks {
 	int wlan_irq, home_irq, power_irq;
 	bool usb;		/* the cable is in */
 	long alarm;		/* the RTC's wake alarm, seconds since 1970, or 0 */
+	bool jack;		/* earphones in the jack */
 	unsigned pmu_int[3];	/* the PMU's last interrupt (INT1..INT3) ... */
 	unsigned long pmu_n;	/* ... and how many it has had (apple-n72-pmu last_irq) */
 };
 
 /*
- * After a suspend to RAM the SoC was off: Power or Home wakes the PMU, the
- * boot loader brings Linux back, and the SoC's own button interrupts never
- * see that press (2026-11-20: the screen stayed dark until a second
- * press). The PMU does: its INT3 bits 0 and 1 were set by the press that
- * woke it (read on the device: last_irq "04 00 03" after one press of
- * Power from deep sleep, the buttons' SoC counters unchanged).
+ * (the PMU's last interrupt, logged at each deep wake: N72_WAKE_LOG=1)
  */
 #define PMU_LAST_IRQ	"/sys/bus/i2c/devices/0-0073/last_irq"
-#define PMU_INT3_BUTTONS	0x03
 
 static void wake_marks(struct wake_marks *m)
 {
@@ -1363,6 +1358,12 @@ static void wake_marks(struct wake_marks *m)
 	memset(m, 0, sizeof(*m));
 	m->wlan_irq = m->home_irq = m->power_irq = -1;
 	m->usb = usb_powered();
+	{	/* (read without changing jack_in: jack_poll notices the change itself) */
+		unsigned long sw[1] = { 0 };
+
+		m->jack = jack_fd >= 0 && ioctl(jack_fd, EVIOCGSW(sizeof(sw)), sw) >= 0 &&
+			  (sw[0] & (1UL << SW_HEADPHONE_INSERT));
+	}
 	f = fopen(PMU_LAST_IRQ, "r");
 	if (f) {
 		if (fscanf(f, "%x %x %x %lu", &m->pmu_int[0], &m->pmu_int[1], &m->pmu_int[2],
@@ -1440,14 +1441,36 @@ static bool woke_for_screen(const struct wake_marks *before)
 	wake_marks(&now);
 	if (now.home != before->home || now.power != before->power)
 		return true;
-	/* (the PMU interrupted since the sleep began, for a button) */
-	if (now.pmu_n != before->pmu_n && (now.pmu_int[2] & PMU_INT3_BUTTONS))
-		return true;
 	if (irq >= 0 && (irq == now.home_irq || irq == now.power_irq))
 		return true;
 	if (now.usb != before->usb && conf.wake_plug)	/* Settings > Display */
 		return true;
 	return before->alarm && time(NULL) >= before->alarm;
+}
+
+/*
+ * After a suspend to RAM the SoC was off: Power or Home wakes the PMU in
+ * hardware, the boot loader brings Linux back, and the SoC's own button
+ * interrupts never see that press (2026-11-20: the screen stayed dark until
+ * a second press, inside the dark linger). The PMU leaves no event for it
+ * either. What else can end a deep sleep is known: the PMU's unmasked
+ * events (the cable in or out, the headphone jack; read on the device:
+ * masks f7 bf bb), and an alarm (ours is cleared before a deep sleep). So
+ * a deep wake with the cable and the jack as they were and no alarm due
+ * was a button. (Wi-Fi is off in deep sleep; its host wake is masked.)
+ */
+static bool deep_woke_by_button(const struct wake_marks *before)
+{
+	struct wake_marks now;
+
+	wake_marks(&now);
+	if (now.usb != before->usb)
+		return false;		/* (woke_for_screen has decided that one) */
+	if (before->alarm && time(NULL) >= before->alarm)
+		return false;
+	if (now.jack != before->jack)
+		return false;		/* the headphone jack: the screen stays dark */
+	return true;
 }
 
 /*
@@ -1687,7 +1710,7 @@ static bool system_sleep(void)
 				w.pmu_int[0], w.pmu_int[1], w.pmu_int[2], w.pmu_n, before.pmu_n,
 				before.home, w.home, before.power, w.power, before.usb, w.usb);
 		}
-		if (!ok || woke_for_screen(&before))
+		if (!ok || woke_for_screen(&before) || (deep && deep_woke_by_button(&before)))
 			break;
 		if (own) {
 			struct wake_marks now;
