@@ -3,12 +3,17 @@
 A touch launcher for Linux on the iPod touch 2G (N72AP), built on
 [LVGL](https://lvgl.io) 9.2.2 with its Linux framebuffer and evdev drivers.
 
-- Home screen with a clock and six apps: LVGL's Widgets and Music demos,
-  Paint (finger drawing), Settings (brightness), System (live stats) and Power.
+- Home screen with a clock and weather card, pages of tiles with a dock,
+  quick settings shade, lock screen and on-screen keyboard. Built in:
+  Settings (Wi-Fi, Bluetooth, Display, Wallpaper, Sound, Power, Date & Time,
+  Weather, Storage, About, Logs), Paint (finger drawing), Files, YouTube and
+  Games (RetroArch). Other programs add a tile with a manifest
+  (`/usr/share/n72-ui/apps/NAME.app`).
 ![Home screen](screenshot-home.png)
 
-- Buttons: Home returns to the launcher (the demos restart the process),
-  Power turns the backlight off and on, the volume keys change the brightness.
+- Buttons: Home returns to the launcher (held for a second it opens Logs; in
+  a game it opens the pause panel), Power turns the screen off or puts the
+  system to sleep and wakes it, the volume keys change the sound volume.
 
 ## Gestures and animations (frame rates measured on the device)
 
@@ -43,8 +48,8 @@ A touch launcher for Linux on the iPod touch 2G (N72AP), built on
 - The lock screen goes up whenever the screen goes off; its clock is
   Montserrat SemiBold at 88 px through LVGL's tiny_ttf (`clock_font.h`, SIL
   Open Font License 1.1, from LVGL's demos).
-- Manifests may set `icon=` (video, image, music, gears, file, list, ...) and
-  `color=#rrggbb` for the tile.
+- Manifests (`name=`, `exec=`) may set `icon=` (a symbol name), `color=#rrggbb`
+  and `image=` (a .n72i picture) for the tile.
 - `N72_FPS=1` logs every burst of frames and the animation phases.
 - `N72_TRACE=1` (with `N72_FPS=1`) logs, for every frame that came more than
   20 ms after the one before, what the main loop did in between (timers,
@@ -84,16 +89,21 @@ at 4.5 MHz, ~0.2 ms per frame) touch reports arrive at ~60 Hz instead of ~42.
 
 ## Build
 
-LVGL goes in `../lvgl-src/lvgl` (`git clone -b v9.2.2 https://github.com/lvgl/lvgl`).
-From the workspace root, on the Mac (the cross gcc of
-`n72-alpine/toolchain`, see its README; `N72_CC=clang` for clang, the build
-`pgo/n72ui.profdata` applies to, into `../n72-ui-build-clang/`):
+LVGL goes in `../lvgl-src/lvgl`: v9.2.2 with our patches on top (the working
+tree's is v9.2.2 plus seven commits marked `(n72)`). The GPU part links
+`../n72-gles` (`build/libGLESv1_CM.a`; `build-clang/` for clang). From the workspace root, on the Mac (the cross gcc of
+`n72-alpine/toolchain`, GCC 16.2, see its README, into `../n72-ui-build/`;
+`N72_CC=clang` for clang, the build `pgo/n72ui.profdata` applies to, into
+`../n72-ui-build-clang/`):
 
     sh n72-ui/build.sh
 
-The static binary lands in `../n72-ui-build/n72-ui`;
-`linux-s5l87xx/freemyipod/build-initramfs-n72.sh` installs it and starts it at
-boot (add `noui` to the kernel command line to skip it).
+The static binary is `n72-ui` in that folder (`n72-ui.debug` beside it is the
+unstripped copy). `n72-alpine/build.sh` packs it as the `n72-ui` package
+(`/usr/bin/n72-ui`) for the Alpine root; the OpenRC service `n72-ui`
+(`n72-alpine/pkg/n72-ui/files/etc/init.d/n72-ui`) starts it at boot, restarts
+it if it dies, and logs to `/tmp/n72-ui.log`. Add `noui` to the kernel command
+line to skip it.
 
 ## Environment
 
@@ -105,12 +115,35 @@ boot (add `noui` to the kernel command line to skip it).
 | `N72_TOUCH_SWAP` | `1` swaps the touch axes |
 | `N72_GPU` | `0` draws with the CPU only (default: GPU when `/dev/mbx` exists) |
 | `N72_LATENCY` | `1` logs touch-to-screen latency every 2 s (stderr) |
-| `TZ` | Clock time zone (the initramfs sets it from `/etc/TZ`) |
+| `N72_FPS` | `1` logs frame bursts and animation phases (see above) |
+| `N72_TRACE` | With `N72_FPS=1`: logs what the main loop did before each late frame (see above) |
+| `N72_FADE` | `0`: no backlight fades |
+| `N72_IDLE_SLEEP` | Seconds without input before the screen goes off or the system sleeps (`0`: never); overrides the setting |
+| `N72_APPS_DIR` | Folder of tile manifests (default `/usr/share/n72-ui/apps`; test hook) |
+| `N72_UI_OPEN` | Internal: the page to reopen after a restart from a settings change |
+| `N72_STATUS_LOG` | Logs status events (battery, Wi-Fi, clock set) and Bluetooth auto-connect tries |
+| `N72_NO_SCROLL_CACHE` / `N72_NO_PREFETCH` | Set: no scroll pictures / prefetch (for measurements) |
+| `N72_SC_KEEP` | Set: scroll pictures are kept after the scroll (test) |
+| `N72_SLEEP` | `freeze`: never deep sleep; `0`: no system sleep (the screen only blanks) |
+| `N72_TOUCH_RAW` | Touch frames as the panel gives them (no holding of a lifting finger) (debug) |
+| `N72_ROT` | `90` or `270`: start turned (test hook) |
+| `N72_DRAGS` | `wait:x0,y0,x1,y1,ms ...` replays drags through a virtual pointer (test hook) |
+| `N72_BENCH_SHOT` | With `--bench`: leaves the last frame up 2 s for a screenshot (test hook) |
+| `N72_FRAMES` | Logs every frame: time, interval, render time (debug) |
+| `N72_WAKE_LOG` | Logs the wake sources after each deep sleep (debug) |
+| `N72_LAYER0` | Draws on the display's layer 0 (n72-clcd), not the shell layer; n72-browser sets it |
+| `N72_NOFLIP` | No page flipping: one draw buffer copied to the framebuffer (debug) |
+| `N72_NO_TRIM` | Large background fills are not held back and trimmed (debug) |
+| `N72_GPU_ADBG` | Logs every task the GPU draws (debug) |
+| `N72_ALPHACHECK` | Reports non-opaque pixels in opaque frames (debug) |
+| `N72_KMS_HANDOFF` | Internal: set by n72-ui for the n72-ui it execs (theme change) to take over the display |
+| `TZ` | Clock time zone (the OpenRC service sets it from `/etc/TZ`) |
 
 ## Kernel
 
 Runs on the n72 branch of [kailashrs/linux](https://github.com/kailashrs/linux/tree/n72)
-(simplefb display, Zephyr2 touchscreen, gpio-keys).
+(n72-clcd display (KMS; `/dev/fb0` for the console layer), Zephyr2 touchscreen,
+gpio-keys).
 
 ## License
 
