@@ -11,7 +11,7 @@
  *
  * Touch: a sideways move of 10 px takes the touch (the content then tracks
  * from there, no jump); past the first or last page it moves at half the
- * finger. The lift chooses the page: faster than 0.3 px/ms goes on one page
+ * finger, and so does a home of one page, which then springs back. The lift chooses the page: faster than 0.3 px/ms goes on one page
  * from where it is, otherwise the nearer one; a touch during the settle
  * catches the strip at once, and a flick the same way again during the
  * settle goes one page further. The settle is UIScrollView's spring
@@ -116,7 +116,23 @@ static struct {
 	int pic_mode, pic_w, pic_dots;
 	bool fb0_ok;			/* /dev/fb0 holds the home wallpaper */
 	int fb0_w;
+	/* the tiles' pages (pg_layout): the page of each child of the strip */
+	signed char page_of[160];
+	bool new_page;			/* an empty page after the last: an icon carried there */
 } pg = { .n = 1, .pic_ver = ~0UL, .pic_dots = -1 };
+
+/*
+ * A tile with this flag starts a page of its own (an icon carried past the
+ * last page made one; ui.conf's order has "/" before its name). Pages also
+ * start where the one before is full.
+ */
+#define PG_BREAK	LV_OBJ_FLAG_USER_3
+
+/* the page child @i of the strip is on (-1: the card, or none) */
+static int pg_page_of(int i)
+{
+	return i > 0 && i < (int)sizeof(pg.page_of) ? pg.page_of[i] : -1;
+}
 
 #include <linux/fb.h>
 
@@ -197,7 +213,7 @@ static void pg_show_page(int p)
  */
 static void pg_layout(void)
 {
-	int bottom = PB - PG_TOP - PG_DOTS_H, per0, pern, i, k, page, slot, cnt;
+	int bottom = PB - PG_TOP - PG_DOTS_H, per0, pern, i, k, page, slot, cnt;	/* (tiles past PG_MAX pages: off to the right, as before) */
 	int x0;
 
 	if (!home_apps)
@@ -209,24 +225,26 @@ static void pg_layout(void)
 	pern = pg.cols * pg.rowsn;
 	x0 = (PW - pg.cols * PG_TILE_W) / 2;
 	cnt = (int)lv_obj_get_child_count(home_apps) - 1;	/* (the card) */
+	page = 0;
+	slot = 0;
 	for (i = 0; i < cnt; i++) {
 		lv_obj_t *t = lv_obj_get_child(home_apps, i + 1);
 		int row, col, top;
 
-		if (i < per0) {
-			page = 0;
-			slot = i;
-			top = PG_GRID0;
-		} else {
-			page = 1 + (i - per0) / pern;
-			slot = (i - per0) % pern;
-			top = PG_GRIDN;
+		/* the next page: this one full, or the tile starts one */
+		if (slot >= (page ? pern : per0) || (slot > 0 && lv_obj_has_flag(t, PG_BREAK))) {
+			page++;
+			slot = 0;
 		}
+		if (i + 1 < (int)sizeof(pg.page_of))
+			pg.page_of[i + 1] = (signed char)LV_MIN(page, 127);
+		top = page ? PG_GRIDN : PG_GRID0;
 		row = slot / pg.cols;
 		col = slot % pg.cols;
 		lv_obj_set_pos(t, page * PW + x0 + col * PG_TILE_W, top + row * (PG_TILE_H + PG_ROW_GAP));
+		slot++;
 	}
-	k = cnt <= per0 ? 1 : 1 + (cnt - per0 + pern - 1) / pern;
+	k = page + 1 + (pg.new_page ? 1 : 0);
 	pg.n = LV_MIN(k, PG_MAX);
 	lv_obj_set_size(home_apps, pg.n * PW, bottom);	/* (not over the dots: see pg_frames_begin) */
 	pg_show_page(pg.cur);
@@ -568,8 +586,9 @@ static void pg_frame(int off)
 		lv_obj_set_x(pg.strip_img, k * PW - off);
 		lv_obj_set_x(pg.strip_img2, (k + 1) * PW - off);
 	}
-	/* the time: nothing on page 0, all of it a page on */
-	lv = LV_CLAMP(0, (off * PG_TIME_LEVELS + PW / 2) / PW, PG_TIME_LEVELS);
+	/* the time: nothing on page 0, all of it a page on (pulled past the
+	 * last page: as on it, so a single page never shows it) */
+	lv = LV_CLAMP(0, (LV_MIN(off, pg_max_off()) * PG_TIME_LEVELS + PW / 2) / PW, PG_TIME_LEVELS);
 	if (pg.time_img && lv != pg.time_lv && pg.time_pic[lv]) {
 		pg.time_lv = lv;		/* (a new picture only when the level moves) */
 		lv_image_set_src(pg.time_img, pg.time_pic[lv]);
@@ -920,7 +939,9 @@ static bool pg_drag(int phase, int x, int y)
 			pg_take(x, pg.off);
 			return true;
 		}
-		if (pg.n < 2 || lv_screen_active() != home_scr || tr.scr || za.phase ||
+		/* (one page too: it follows the finger at half its way and
+		 * springs back, as a single-page UIScrollView that bounces) */
+		if (lv_screen_active() != home_scr || tr.scr || za.phase ||
 		    shade_open || sd.on || screen_off)
 			return false;
 		if (home_dock && in_obj(home_dock, x, y))
@@ -979,7 +1000,7 @@ static bool pg_drag(int phase, int x, int y)
 static void pg_warm(lv_timer_t *t)
 {
 	LV_UNUSED(t);
-	if (pg.n < 2 || screen_off || locked || pg.scr || lv_screen_active() != home_scr ||
+	if (screen_off || locked || pg.scr || lv_screen_active() != home_scr ||
 	    tr.scr || za.phase || sd.on || lv_anim_count_running() ||
 	    (touch_indev && lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
 		return;

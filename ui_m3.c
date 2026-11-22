@@ -72,6 +72,12 @@ static struct {
 	lv_obj_t *card, *title, *sub, *play_sym;
 } np;
 static lv_obj_t *status_np;
+/* the same on the lock screen (np_lock_build) */
+static struct {
+	lv_obj_t *card, *title, *sub, *play_sym;
+} npl;
+static void np_lock_build(lv_obj_t *scr);
+static void np_lock_sync(void);
 
 /* ------------------------------------------------------------ settings */
 
@@ -4671,6 +4677,7 @@ static void lock_update(void)
 	label_set_if_changed(lock_date, buf);
 	battery_text(buf, sizeof(buf));
 	label_set_if_changed(lock_batt, strstr(buf, LV_SYMBOL_CHARGE) ? buf : "");
+	np_lock_sync();
 }
 
 static void lock_build(void)
@@ -4693,6 +4700,7 @@ static void lock_build(void)
 			     lv_color_white());
 	lv_obj_align(lock_time, LV_ALIGN_TOP_MID, 0, 90);
 	wx_lock_build(lock_scr, 196);	/* (hidden while there is none) */
+	np_lock_build(lock_scr);	/* (hidden while nothing plays) */
 	lock_batt = m3_label(lock_scr, "", &lv_font_montserrat_14, lv_color_hex(0xc8c0d0));
 	lv_obj_align(lock_batt, LV_ALIGN_BOTTOM_MID, 0, -74);
 	o = m3_label(lock_scr, "Swipe up to unlock", &lv_font_montserrat_14, lv_color_hex(0xb0a8b8));
@@ -10157,6 +10165,8 @@ static void vc_rx(int fd)
 		vc.pos_ms = pos;
 		vc.dur_ms = dur;
 	}
+	if (locked)
+		np_lock_sync();	/* (the player in front, under the lock) */
 	if (app_pid == 0)
 		return;		/* (no controls over it: the background's) */
 	if (vc.up && vc.prot != ui_rot) {
@@ -10752,6 +10762,93 @@ static void np_build(lv_obj_t *parent, int32_t y)
 	np_sync();
 }
 
+/*
+ * On the lock screen, while something plays (in the background, or the
+ * player in front under the lock): what it is, where it is, and back,
+ * play/pause, on. No tap to the front: that would need the unlock. The
+ * buttons are LVGL's (the unlock takes only a swipe up).
+ */
+static void np_lock_build(lv_obj_t *scr)
+{
+	lv_obj_t *c, *row;
+
+	c = npl.card = lv_obj_create(scr);
+	plain(c);
+	lv_obj_set_size(c, W - 2 * STATUS_PAD, 104);
+	lv_obj_align(c, LV_ALIGN_BOTTOM_MID, 0, -100);
+	lv_obj_set_style_bg_color(c, lv_color_black(), 0);
+	lv_obj_set_style_bg_opa(c, LV_OPA_50, 0);
+	lv_obj_set_style_radius(c, 20, 0);
+	lv_obj_set_style_pad_hor(c, 14, 0);
+	lv_obj_set_style_pad_top(c, 10, 0);
+	lv_obj_set_style_pad_bottom(c, 6, 0);
+	lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_flex_align(c, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_row(c, 2, 0);
+	npl.title = m3_label(c, "", &lv_font_montserrat_14, lv_color_white());
+	lv_obj_set_width(npl.title, lv_pct(100));
+	lv_obj_set_style_text_align(npl.title, LV_TEXT_ALIGN_CENTER, 0);
+	lv_label_set_long_mode(npl.title, LV_LABEL_LONG_DOT);
+	npl.sub = m3_label(c, "", &lv_font_montserrat_12, lv_color_hex(0xc8c0d0));
+
+	row = lv_obj_create(c);
+	lv_obj_remove_style_all(row);
+	lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_column(row, 24, 0);
+	lv_obj_set_style_pad_top(row, 4, 0);
+	{
+		lv_obj_t *b;
+
+		b = np_btn(row, LV_SYMBOL_PREV, false, np_skip_cb, (void *)(intptr_t)-10000);
+		lv_obj_set_style_text_color(lv_obj_get_child(b, 0), lv_color_white(), 0);
+		npl.play_sym = lv_obj_get_child(np_btn(row, LV_SYMBOL_PAUSE, true, np_play_cb, NULL), 0);
+		b = np_btn(row, LV_SYMBOL_NEXT, false, np_skip_cb, (void *)(intptr_t)10000);
+		lv_obj_set_style_text_color(lv_obj_get_child(b, 0), lv_color_white(), 0);
+	}
+	lv_obj_add_flag(c, LV_OBJ_FLAG_HIDDEN);
+	np_lock_sync();
+}
+
+/* something the controls can act on: the background player, or the player in front */
+static bool np_playing_any(void)
+{
+	return (bgp.pid > 0 && !bgp.ending) || (app_is_video() && vc.up);
+}
+
+/* The lock screen's card as the player is now (its position while the lock screen shows). */
+static void np_lock_sync(void)
+{
+	bool on = np_playing_any();
+	char b[64], p[24], d[24];
+
+	if (!npl.card || !lv_obj_is_valid(npl.card))
+		return;
+	if (lv_obj_has_flag(npl.card, LV_OBJ_FLAG_HIDDEN) == on) {
+		if (on)
+			lv_obj_remove_flag(npl.card, LV_OBJ_FLAG_HIDDEN);
+		else
+			lv_obj_add_flag(npl.card, LV_OBJ_FLAG_HIDDEN);
+	}
+	if (!on)
+		return;
+	label_set_if_changed(npl.title, vc.name[0] ? vc.name : "Playing");
+	label_set_if_changed(npl.play_sym, vc.playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+	if (!locked || screen_off)
+		return;		/* (where it is: only while it shows) */
+	vc_fmt(p, sizeof(p), vc.pos_ms);
+	if (vc.dur_ms > 0) {
+		vc_fmt(d, sizeof(d), vc.dur_ms);
+		snprintf(b, sizeof(b), "%s / %s%s", p, d, vc.playing ? "" : "  Paused");
+	} else {
+		snprintf(b, sizeof(b), "%s%s", p, vc.playing ? "" : "  Paused");
+	}
+	label_set_if_changed(npl.sub, b);
+}
+
 static void shade_relayout(void);
 
 /*
@@ -10780,6 +10877,7 @@ static void np_sync(void)
 	bool on = bgp.pid > 0 && !bgp.ending;
 	char b[64], p[24], d[24];
 
+	np_lock_sync();
 	if (status_np && lv_obj_has_flag(status_np, LV_OBJ_FLAG_HIDDEN) == on) {
 		if (on)
 			lv_obj_remove_flag(status_np, LV_OBJ_FLAG_HIDDEN);

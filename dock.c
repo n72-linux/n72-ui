@@ -108,14 +108,26 @@ static void dock_order_apply(void)
 
 	if (!conf.order_set)
 		return;
+	cnt = lv_obj_get_child_count(home_apps);
+	for (i = 1; i < cnt; i++)
+		lv_obj_remove_flag(lv_obj_get_child(home_apps, i), PG_BREAK);
 	snprintf(names, sizeof(names), "%s", conf.order);
 	for (n = strtok_r(names, "|", &save); n; n = strtok_r(NULL, "|", &save)) {
+		bool brk = n[0] == '/';	/* (starts a page) */
+
+		if (brk)
+			n++;
 		cnt = lv_obj_get_child_count(home_apps);
-		for (i = k; i < cnt; i++)
-			if (!strcmp(tile_name(lv_obj_get_child(home_apps, i)), n)) {
-				lv_obj_move_to_index(lv_obj_get_child(home_apps, i), (int32_t)k++);
+		for (i = k; i < cnt; i++) {
+			lv_obj_t *t = lv_obj_get_child(home_apps, i);
+
+			if (!strcmp(tile_name(t), n)) {
+				lv_obj_move_to_index(t, (int32_t)k++);
+				if (brk)
+					lv_obj_add_flag(t, PG_BREAK);
 				break;
 			}
+		}
 	}
 }
 
@@ -306,8 +318,10 @@ static void dock_shake(void)
  * place it will land in. Over the grid that place moves to the slot under
  * the finger, over the dock into the dock (while it has room: a full one
  * shakes once), and the tiles between slide over (0.2 s, only those that
- * show). Held at a side of the pages for 0.6 s, the next page glides in.
- * On the lift the picture settles into the place; the order of the grid
+ * show). Held at a side of the pages for 0.6 s, the next page glides in;
+ * held at the right side of the last page, a new empty page does, and the
+ * icon put down there starts it (PG_BREAK). A page left empty goes on the
+ * lift. On the lift the picture settles into the place; the order of the grid
  * and the dock goes into ui.conf ("order=", "dock="). The touch is the
  * router's from the long press on (ui_drag): no swipe, no shade, no tap.
  */
@@ -358,8 +372,35 @@ static void carry_slide(lv_obj_t *o, int32_t x0, int32_t y0)
 	lv_obj_set_pos(o, x0, y0);
 }
 
-/* the carried tile to @idx of the grid or of the dock, the others sliding over */
-static void carry_place(bool in_dock, int idx)
+/*
+ * The carried tile leaves its place: if it started a page, the tile after
+ * it on that page starts it now (if none, the page goes with it).
+ */
+static void carry_leave_break(lv_obj_t *t)
+{
+	int i, n, p, ti;
+
+	if (!lv_obj_has_flag(t, PG_BREAK))
+		return;
+	lv_obj_remove_flag(t, PG_BREAK);
+	if (tile_docked(t))
+		return;
+	ti = (int)lv_obj_get_index(t);
+	p = pg_page_of(ti);
+	n = (int)lv_obj_get_child_count(home_apps);
+	for (i = ti + 1; i < n; i++)
+		if (pg_page_of(i) == p) {
+			lv_obj_add_flag(lv_obj_get_child(home_apps, i), PG_BREAK);
+			break;
+		}
+}
+
+/*
+ * The carried tile to child @idx of the grid (@brk: starting a page; the
+ * tile that started it, @was_first, no longer does) or to @idx of the dock,
+ * the others sliding over.
+ */
+static void carry_place(bool in_dock, int idx, bool brk, lv_obj_t *was_first)
 {
 	lv_obj_t *t = carry.tile, *seen[48];
 	int32_t ox[48], oy[48];
@@ -388,11 +429,18 @@ static void carry_place(bool in_dock, int idx)
 			oy[n++] = lv_obj_get_y(o);
 		}
 	}
+	carry_leave_break(t);
 	if (lv_obj_get_parent(t) != par) {
 		lv_obj_set_parent(t, par);
 		dock_tile_style(t, in_dock);
 	}
-	lv_obj_move_to_index(t, in_dock ? idx : idx + 1);	/* (the card first in the grid) */
+	lv_obj_move_to_index(t, idx);
+	if (!in_dock && brk) {
+		lv_obj_add_flag(t, PG_BREAK);
+		if (was_first && was_first != t)
+			lv_obj_remove_flag(was_first, PG_BREAK);
+		pg.new_page = false;	/* (it is a page of its own now) */
+	}
 	dock_layout();
 	pg_layout();
 	for (i = 0; i < n; i++)
@@ -400,10 +448,18 @@ static void carry_place(bool in_dock, int idx)
 	bp_changed(home_scr);
 }
 
-/* where the finger at (@x, @y) would put the tile: grid or dock, and the index */
-static bool carry_target(int32_t x, int32_t y, bool *in_dock, int *idx)
+/*
+ * Where the finger at (@x, @y) would put the tile: grid or dock, the index
+ * (the grid's counts the card), and in the grid whether it would start the
+ * page (@brk) in place of @first.
+ */
+static bool carry_target(int32_t x, int32_t y, bool *in_dock, int *idx, bool *brk, lv_obj_t **first)
 {
-	bool docked = tile_docked(carry.tile);
+	lv_obj_t *t = carry.tile;
+	bool docked = tile_docked(t);
+
+	*brk = false;
+	*first = NULL;
 
 	if (home_dock && in_obj(home_dock, x, y)) {
 		int n = (int)lv_obj_get_child_count(home_dock) + (docked ? 0 : 1), along, len;
@@ -427,37 +483,75 @@ static bool carry_target(int32_t x, int32_t y, bool *in_dock, int *idx)
 	if (x < PX || x >= PX + PW || y < PG_TOP || y >= PB - PG_DOTS_H)
 		return false;
 	{
-		int top = pg.cur ? PG_GRIDN : PG_GRID0, rows = pg.cur ? pg.rowsn : pg.rows0;
+		int p = pg.cur, top = p ? PG_GRIDN : PG_GRID0, rows = p ? pg.rowsn : pg.rows0;
 		int x0 = (PW - pg.cols * PG_TILE_W) / 2, gx = x - PX - x0, gy = y - PG_TOP - top;
 		int col = LV_CLAMP(0, gx / PG_TILE_W, pg.cols - 1);
 		int row = LV_CLAMP(0, gy / (PG_TILE_H + PG_ROW_GAP), rows - 1);
 		int slot = row * pg.cols + col;
-		int per0 = pg.cols * pg.rows0, pern = pg.cols * pg.rowsn;
-		int count = (int)lv_obj_get_child_count(home_apps) - 1 + (docked ? 1 : 0);
+		int n = (int)lv_obj_get_child_count(home_apps), ti = docked ? n : (int)lv_obj_get_index(t);
+		int on = 0, i, first_i = -1, last_i = -1, nth = -1;
 
 		if (gy < -PG_ROW_GAP)
 			return false;	/* (over the card) */
 		*in_dock = false;
-		*idx = LV_CLAMP(0, pg.cur ? per0 + (pg.cur - 1) * pern + slot : slot, count - 1);
+		/* the page's other tiles: the slot-th of them is where it goes */
+		for (i = 1; i < n; i++) {
+			if (i == ti || pg_page_of(i) != p)
+				continue;
+			if (first_i < 0)
+				first_i = i;
+			if (on == slot)
+				nth = i;
+			last_i = i;
+			on++;
+		}
+		if (!on) {
+			if (!docked && pg_page_of(ti) == p) {
+				*idx = ti;	/* alone on its page: stays */
+				*brk = lv_obj_has_flag(t, PG_BREAK);
+				return true;
+			}
+			if (!(pg.new_page && p == pg.n - 1))
+				return false;
+			/* the new page: at the end, starting it */
+			*idx = n - (docked ? 0 : 1);
+			*brk = true;
+			return true;
+		}
+		/* (the indices without the carried tile: where it lands) */
+		if (nth >= 0) {
+			*idx = nth - (!docked && ti < nth ? 1 : 0);
+			if (nth == first_i && p > 0) {
+				/* first on the page: it starts the page if its first
+				 * tile does, or if it did itself (put back in front) */
+				*first = lv_obj_get_child(home_apps, first_i);
+				*brk = lv_obj_has_flag(*first, PG_BREAK) ||
+				       (!docked && ti < first_i && pg_page_of(ti) == p &&
+					lv_obj_has_flag(t, PG_BREAK));
+			}
+		} else {
+			*idx = last_i + 1 - (!docked && ti < last_i + 1 ? 1 : 0);
+		}
 	}
 	return true;
 }
 
 static void carry_follow(void)
 {
-	bool in_dock;
+	bool in_dock, brk;
+	lv_obj_t *first;
 	int idx;
 
 	if (carry.img)
 		lv_obj_set_pos(carry.img, carry.x + carry.dx, carry.y + carry.dy);
 	if (pg.scr)
 		return;		/* (a page gliding in: the place is found after) */
-	if (!carry_target(carry.x, carry.y, &in_dock, &idx))
+	if (!carry_target(carry.x, carry.y, &in_dock, &idx, &brk, &first))
 		return;
-	if (in_dock == tile_docked(carry.tile) &&
-	    idx == (int)lv_obj_get_index(carry.tile) - (in_dock ? 0 : 1))
+	if (in_dock == tile_docked(carry.tile) && idx == (int)lv_obj_get_index(carry.tile) &&
+	    (in_dock || brk == lv_obj_has_flag(carry.tile, PG_BREAK)))
 		return;
-	carry_place(in_dock, idx);
+	carry_place(in_dock, idx, brk, first);
 }
 
 /* held at a side: the next page */
@@ -481,7 +575,21 @@ static void carry_tick(lv_timer_t *t)
 		carry.edge_ms = lv_tick_get();
 		return;
 	}
-	if (e && lv_tick_elaps(carry.edge_ms) >= CARRY_EDGE_MS && pg_glide_to(pg.cur + e))
+	if (!e || lv_tick_elaps(carry.edge_ms) < CARRY_EDGE_MS)
+		return;
+	if (e > 0 && pg.cur == pg.n - 1 && !pg.new_page && pg.n < PG_MAX) {
+		/* past the last page: a new one, unless the icon is alone on it */
+		int i, n = (int)lv_obj_get_child_count(home_apps), others = 0;
+
+		for (i = 1; i < n; i++)
+			if (lv_obj_get_child(home_apps, i) != carry.tile && pg_page_of(i) == pg.cur)
+				others++;
+		if (!others)
+			return;
+		pg.new_page = true;
+		pg_layout();
+	}
+	if (pg_glide_to(pg.cur + e))
 		carry.edge_ms = lv_tick_get();
 }
 
@@ -493,9 +601,12 @@ static void carry_save(void)
 
 	conf.order[0] = 0;
 	n = lv_obj_get_child_count(home_apps);
-	for (i = 1; i < n && len < sizeof(conf.order); i++)
-		len += snprintf(conf.order + len, sizeof(conf.order) - len, "%s%s", len ? "|" : "",
-				tile_name(lv_obj_get_child(home_apps, i)));
+	for (i = 1; i < n && len < sizeof(conf.order); i++) {
+		lv_obj_t *t = lv_obj_get_child(home_apps, i);
+
+		len += snprintf(conf.order + len, sizeof(conf.order) - len, "%s%s%s", len ? "|" : "",
+				i > 1 && lv_obj_has_flag(t, PG_BREAK) ? "/" : "", tile_name(t));
+	}
 	conf.order_set = true;
 	dock_save();	/* (and conf_save_later) */
 	/* the order every rebuild comes back to (dock_undock_all) */
@@ -524,6 +635,11 @@ static void carry_end(bool drop)
 		carry.tile = NULL;
 		return;
 	}
+	/* an empty new page goes; the first tile never starts a page */
+	pg.new_page = false;
+	if (lv_obj_get_child_count(home_apps) > 1)
+		lv_obj_remove_flag(lv_obj_get_child(home_apps, 1), PG_BREAK);
+	pg_layout();
 	if (drop)
 		carry_save();
 	/* the picture settles into the place (dock_fly's flight, from here) */
