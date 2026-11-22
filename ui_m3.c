@@ -3604,7 +3604,9 @@ static void app_tile(lv_obj_t *parent, const char *icon, const char *name,
 		lv_obj_t *l = m3_label(t, name, &lv_font_montserrat_14, home_wp ? WP_TEXT : M.on_surface);
 
 		lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
-		lv_obj_set_width(l, 74);
+		/* one line: the dots need a height to cut at (unbounded, a long
+		 * name wrapped, and the tile, centred, moved its badge up) */
+		lv_obj_set_size(l, 74, lv_font_get_line_height(&lv_font_montserrat_14));
 		lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
 	}
 	lv_obj_add_event_cb(t, cb, LV_EVENT_CLICKED, NULL);
@@ -6013,6 +6015,9 @@ static void app_cmd_free_cb(lv_event_t *e)
 	free(lv_event_get_user_data(e));
 }
 
+/* a tile made from a manifest or a .desktop file, not one of our own */
+#define APP_TILE_MANIFEST	LV_OBJ_FLAG_USER_4
+
 static void app_tile_cmd(lv_obj_t *parent, const char *name, const char *cmd,
 			 const char *icon, const char *image, bool have_rgb, unsigned rgb)
 {
@@ -6045,6 +6050,8 @@ static void app_tile_cmd(lv_obj_t *parent, const char *name, const char *cmd,
 	if (lv_obj_get_child_count(parent) > before) {
 		lv_obj_t *t = lv_obj_get_child(parent, before);
 		char *c = strdup(cmd);
+
+		lv_obj_add_flag(t, APP_TILE_MANIFEST);	/* (apps_reload makes it again) */
 
 		lv_obj_remove_event_cb(t, app_launch_cb);
 		lv_obj_add_event_cb(t, app_launch_cb, LV_EVENT_CLICKED, c);
@@ -6265,20 +6272,25 @@ static void app_tiles(lv_obj_t *parent)
 #include "paging.c"	/* home pages: layout, the swipe, its frames */
 #include "dock.c"	/* the dock under them */
 
-static uint32_t home_apps_builtin;	/* tiles of our own, before the manifests' */
 static lv_timer_t *apps_timer;
 
 static void apps_reload(void)
 {
+	int i;
+
 	if (!home_apps || app_pid != 0 || za.phase) {
 		apps_stale = true;
 		return;
 	}
 	apps_stale = false;
-	dock_before_reload();	/* (every tile back in the grid's order) */
-	while (lv_obj_get_child_count(home_apps) > home_apps_builtin) {
-		lv_obj_t *t = lv_obj_get_child(home_apps, -1);
+	dock_before_reload();	/* (every tile back in the grid, in its order) */
+	/* the manifests' tiles, wherever they were carried to (and their
+	 * pictures with them: no tile is left pointing at a freed one) */
+	for (i = (int)lv_obj_get_child_count(home_apps) - 1; i >= 1; i--) {
+		lv_obj_t *t = lv_obj_get_child(home_apps, i);
 
+		if (!lv_obj_has_flag(t, APP_TILE_MANIFEST))
+			continue;
 		if (za.tile == t)
 			za.tile = NULL;
 		lv_obj_delete(t);
@@ -6796,7 +6808,6 @@ static void build_home(void)
 	page_tile_anim(apps, open_youtube);
 	app_tile(apps, N72_SYMBOL_GAMEPAD, "Games", M.primary_c, M.on_primary_c, open_games);
 	page_tile_anim(apps, open_games);
-	home_apps_builtin = lv_obj_get_child_count(apps);
 	app_tiles(apps);
 
 	home_dots = lv_obj_create(home_scr);

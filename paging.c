@@ -248,6 +248,9 @@ static void pg_layout(void)
 	pg.n = LV_MIN(k, PG_MAX);
 	lv_obj_set_size(home_apps, pg.n * PW, bottom);	/* (not over the dots: see pg_frames_begin) */
 	pg_show_page(pg.cur);
+	/* the tiles may have moved: pictures of the pages taken before are old
+	 * (pg_show_page keeps them, a change of page alone does not age them) */
+	bp_changed(home_scr);
 }
 
 /* --------------------------------------------------------- the pictures */

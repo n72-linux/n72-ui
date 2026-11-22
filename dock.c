@@ -223,6 +223,7 @@ static void dock_build(void)
 /* The grid's manifests change (apps_reload): every tile back first. */
 static void dock_before_reload(void)
 {
+	dock_carry_stop();	/* (a carried tile may be one that goes) */
 	if (home_dock)
 		dock_undock_all();
 }
@@ -253,8 +254,10 @@ static void dock_fly_end(void)
 		dock_fly.img = NULL;
 	}
 	tr_free(&dock_fly.pic);
-	if (dock_fly.tile && lv_obj_is_valid(dock_fly.tile))
+	if (dock_fly.tile && lv_obj_is_valid(dock_fly.tile)) {
 		lv_obj_remove_flag(dock_fly.tile, LV_OBJ_FLAG_HIDDEN);
+		bp_changed(home_scr);	/* (pictures taken while it was hidden are old now) */
+	}
 	dock_fly.tile = NULL;
 }
 
