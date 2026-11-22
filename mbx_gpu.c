@@ -47,7 +47,7 @@ void n72_trace(const char *what, long v);
 
 static int mbx = -1;
 static struct mbx_fb_info fb;
-static uint32_t pool_handle, pool_gpu;
+static uint32_t pool_gpu;
 static uint8_t *pool;
 
 struct mbx_gpu_stats mbx_gpu_stats;
@@ -167,41 +167,12 @@ static void sync_range(const void *p, uint32_t size, uint32_t op)
 }
 
 /*
- * Asynchronous jobs (kernel MBX_IOC_SET_ASYNC): an async submit returns its
- * sequence number; the job's completion is polled with MBX_IOC_WAIT.
+ * Jobs run synchronously (the kernel's default, no MBX_IOC_SET_ASYNC); a
+ * job's ioctl may return its sequence number, which is success.
  */
-static int gpu_async;
-static uint32_t last_seq;		/* of the last job started */
-
 static int gpu_ret(int ret)
 {
-	if (ret > 0) {
-		last_seq = ret;
-		return 0;
-	}
-	return ret;
-}
-
-static void gpu_wait(uint32_t seq)
-{
-	struct mbx_wait w = { .wait_seq = seq };
-
-	if (gpu_async && seq)
-		mbx_wait_jobs(mbx, &w);
-}
-
-static int gpu_done(uint32_t seq)
-{
-	struct mbx_wait w = { 0 };
-
-	if (mbx_wait_jobs(mbx, &w))
-		return 1;
-	/*
-	 * Submits return 31-bit sequence numbers (an ioctl's return value is
-	 * not negative); the kernel's seq_done counts on in 32 bits. Compared
-	 * in 31 bits, the answer holds across both wraps.
-	 */
-	return (int32_t)((w.seq_done - seq) << 1) >= 0;
+	return ret > 0 ? 0 : ret;
 }
 
 static int submit(const uint32_t *w, int n)
@@ -400,13 +371,6 @@ static bool image_scaled_ok(const lv_draw_task_t *t)
 	       d->clip_radius == 0 && !d->bitmap_mask_src;
 }
 
-/* GPU text (below) */
-static int gtext = -1;
-static bool gt_cpu_only;
-
-static bool gt_init(void);
-static bool gt_worth_it(const lv_draw_task_t *t);
-
 /* Is nothing drawn before @t in its layer where @t draws? */
 static bool first_over(const lv_draw_task_t *t)
 {
@@ -501,11 +465,6 @@ static int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 		     !(((const lv_image_dsc_t *)d->src)->header.flags & LV_IMAGE_FLAGS_PREMULTIPLIED)))
 			return 0;
 		if (dcf != LV_COLOR_FORMAT_XRGB8888 && dcf != LV_COLOR_FORMAT_ARGB8888)
-			return 0;
-	} else if (t->type == LV_DRAW_TASK_TYPE_LABEL) {
-		if (gtext < 0)
-			gtext = gt_init();
-		if (!gtext || dcf != LV_COLOR_FORMAT_XRGB8888 || !gt_worth_it(t))
 			return 0;
 	} else {
 		return 0;
@@ -714,8 +673,6 @@ static void mbx_fill(lv_draw_unit_t *u, lv_draw_task_t *t)
 		rect_add(layer, clip, &band, d->color);
 	}
 	rect_flush();
-	gpu_wait(last_seq);
-	last_seq = 0;
 	for (i = 0; i < 4; i++) {
 		corner.x1 = i & 1 ? c->x2 - r + 1 : c->x1;
 		corner.x2 = corner.x1 + r - 1;
@@ -914,8 +871,6 @@ static bool mbx_image_premul(lv_draw_unit_t *u, lv_draw_task_t *t, lv_draw_buf_t
 	submit(w, put_copy(w, gpu_addr(b->data), b->header.stride, gpu_addr(sb->data),
 			   sb->header.stride, sa.x1, sa.y1, da.x1, da.y1,
 			   lv_area_get_width(&a), lv_area_get_height(&a)));
-	gpu_wait(last_seq);
-	last_seq = 0;
 	if (b->data == lv_display_get_default()->buf_1->data && pm_skip_n < PM_SKIP_MAX &&
 	    !later_over(t, &a))
 		pm_skip[pm_skip_n++] = a;	/* (screen = buffer coordinates here) */
@@ -978,302 +933,9 @@ static void mbx_image(lv_draw_unit_t *u, lv_draw_task_t *t)
 	mbx_gpu_stats.images++;
 }
 
-/*
- * A task may finish asynchronously only if the CPU cannot share a cache line
- * with its target area while the GPU writes it: the area's left and right
- * edges on 32-byte boundaries (8 pixels at 32 bpp).
- */
-static bool async_ok(const lv_draw_task_t *t)
-{
-	return gpu_async && !(t->area.x1 & 7) && !((t->area.x2 + 1) & 7);
-}
-
+/* (debug) N72_GPU_ADBG: every task the GPU draws, on stderr */
 static int async_dbg = -1;
 #define ADBG(...) do { if (async_dbg) fprintf(stderr, __VA_ARGS__); } while (0)
-static lv_draw_task_t *inflight;
-static uint32_t inflight_seq;
-
-
-/* ------------------------------------------------------------ GPU text */
-
-/*
- * Labels through OpenGL ES 1.1 (n72-gles) on the MBX: the glyphs LVGL
- * hands over (A8 bitmaps) are cached in a 512x512 A8 atlas texture, and a
- * label becomes one batch of textured quads modulated by its colour and
- * alpha-blended into the target (a pixmap surface over the label's
- * rectangle: the existing pixels are the background). One TA frame per
- * label, so only labels with enough glyphs are worth it; the rest stay on
- * the CPU. N72_GPU_TEXT=1 enables it.
- */
-#include <EGL/egl.h>
-#include <GLES/gl.h>
-#include "n72egl.h"
-
-#define ATL		512
-#define GT_MIN_GLYPHS	40		/* fewer: the CPU is cheaper than a TA frame */
-#define GT_MAX_QUADS	2048
-#define GT_CACHE	2048		/* glyph cache slots (power of two) */
-
-static EGLDisplay gt_dpy;
-static EGLSurface gt_surf;
-static EGLContext gt_ctx;
-static GLuint gt_tex;
-static uint8_t *gt_atlas_cpu;
-static int gt_shelf_y, gt_shelf_h, gt_x;
-static struct gt_glyph {
-	const void *font;
-	uint32_t gid;
-	uint16_t x, y, w, h;
-} gt_cache[GT_CACHE];
-static GLfloat *gt_pos, *gt_uv;
-static int gt_n;			/* quads collected */
-static int gt_ox, gt_oy;		/* target rectangle origin (screen) */
-unsigned long mbx_gpu_text_labels, mbx_gpu_text_glyphs;
-
-static void gt_reset_atlas(void)
-{
-	memset(gt_cache, 0, sizeof(gt_cache));
-	memset(gt_atlas_cpu, 0, ATL * ATL);
-	/* a 2x2 opaque texel block at (0,0) for solid fills (underline etc.) */
-	gt_atlas_cpu[0] = gt_atlas_cpu[1] = gt_atlas_cpu[ATL] = gt_atlas_cpu[ATL + 1] = 0xff;
-	gt_shelf_y = 0;
-	gt_shelf_h = 2;
-	gt_x = 4;
-	glBindTexture(GL_TEXTURE_2D, gt_tex);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, ATL, ATL, 0, GL_ALPHA, GL_UNSIGNED_BYTE, gt_atlas_cpu);
-}
-
-static bool gt_init(void)
-{
-	static const EGLint attr[] = {
-		EGL_SURFACE_TYPE, EGL_PIXMAP_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES_BIT,
-		EGL_RED_SIZE, 8, EGL_DEPTH_SIZE, 0, EGL_NONE,
-	};
-	struct n72_native_pixmap pm = {
-		.gpu_addr = pool_gpu, .cpu = pool,
-		.width = 64, .height = 16, .stride = fb.stride, .format = N72_PIXMAP_XRGB8888,
-	};
-	EGLConfig cfg;
-	EGLint n;
-
-	if (!getenv("N72_GPU_TEXT") || (fb.stride & 63))
-		return false;
-	gt_cpu_only = !strcmp(getenv("N72_GPU_TEXT"), "cpu");
-	n72_egl_set_mbx_fd(mbx);
-	gt_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-	if (!eglInitialize(gt_dpy, NULL, NULL) || !eglChooseConfig(gt_dpy, attr, &cfg, 1, &n) || !n) {
-		fprintf(stderr, "n72-ui: GPU text: no EGL display/config (%#x)\n", eglGetError());
-		return false;
-	}
-	gt_ctx = eglCreateContext(gt_dpy, cfg, EGL_NO_CONTEXT, NULL);
-	gt_surf = eglCreatePixmapSurface(gt_dpy, cfg, (EGLNativePixmapType)&pm, NULL);
-	if (gt_ctx == EGL_NO_CONTEXT || gt_surf == EGL_NO_SURFACE ||
-	    !eglMakeCurrent(gt_dpy, gt_surf, gt_surf, gt_ctx)) {
-		fprintf(stderr, "n72-ui: GPU text: no EGL context/surface (%#x)\n", eglGetError());
-		return false;
-	}
-	gt_atlas_cpu = malloc(ATL * ATL);
-	gt_pos = malloc(GT_MAX_QUADS * 12 * sizeof(GLfloat));
-	gt_uv = malloc(GT_MAX_QUADS * 12 * sizeof(GLfloat));
-	if (!gt_atlas_cpu || !gt_pos || !gt_uv)
-		return false;
-	glGenTextures(1, &gt_tex);
-	glBindTexture(GL_TEXTURE_2D, gt_tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	gt_reset_atlas();
-	glEnable(GL_TEXTURE_2D);
-	glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-	glEnable(GL_BLEND);
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-	glDisable(GL_DEPTH_TEST);
-	glEnableClientState(GL_VERTEX_ARRAY);
-	glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-	glVertexPointer(2, GL_FLOAT, 0, gt_pos);
-	glTexCoordPointer(2, GL_FLOAT, 0, gt_uv);
-	fprintf(stderr, "n72-ui: GPU text (OpenGL ES: %s)\n", (const char *)glGetString(GL_RENDERER));
-	return true;
-}
-
-/* The glyph's atlas rectangle, uploading it on a miss; NULL if it cannot be placed. */
-static struct gt_glyph *gt_glyph(const lv_font_glyph_dsc_t *g, const lv_draw_buf_t *bm)
-{
-	uint32_t key = (uint32_t)(uintptr_t)g->resolved_font * 31 + g->gid.index, k;
-	struct gt_glyph *e;
-	int w = g->box_w, h = g->box_h, y;
-
-	for (k = 0; k < 8; k++) {
-		e = &gt_cache[(key + k) & (GT_CACHE - 1)];
-		if (e->font == g->resolved_font && e->gid == g->gid.index)
-			return e;
-		if (!e->font)
-			break;
-	}
-	if (k == 8 || w > 64 || h > 64)
-		return NULL;
-	if (gt_x + w + 1 > ATL) {		/* next shelf */
-		gt_shelf_y += gt_shelf_h + 1;
-		gt_shelf_h = 0;
-		gt_x = 0;
-	}
-	if (gt_shelf_y + h > ATL)
-		return NULL;			/* full: caller resets at a safe point */
-	{
-		uint8_t tmp[64 * 64];
-
-		for (y = 0; y < h; y++) {
-			memcpy(gt_atlas_cpu + (gt_shelf_y + y) * ATL + gt_x,
-			       bm->data + y * bm->header.stride, w);
-			memcpy(tmp + y * w, bm->data + y * bm->header.stride, w);
-		}
-		glBindTexture(GL_TEXTURE_2D, gt_tex);
-		glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-		glTexSubImage2D(GL_TEXTURE_2D, 0, gt_x, gt_shelf_y, w, h, GL_ALPHA,
-				GL_UNSIGNED_BYTE, tmp);
-	}
-	e->font = g->resolved_font;
-	e->gid = g->gid.index;
-	e->x = gt_x;
-	e->y = gt_shelf_y;
-	e->w = w;
-	e->h = h;
-	gt_x += w + 1;
-	if (h > gt_shelf_h)
-		gt_shelf_h = h;
-	return e;
-}
-
-static void gt_quad(const lv_area_t *a, float u0, float v0, float u1, float v1)
-{
-	GLfloat x0 = a->x1 - gt_ox, y0 = a->y1 - gt_oy, x1 = a->x2 + 1 - gt_ox, y1 = a->y2 + 1 - gt_oy;
-	GLfloat *p = gt_pos + gt_n * 12, *t = gt_uv + gt_n * 12;
-	const GLfloat q[12] = { x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1 };
-	const GLfloat uv[12] = { u0, v0, u1, v0, u1, v1, u0, v0, u1, v1, u0, v1 };
-
-	if (gt_n >= GT_MAX_QUADS)
-		return;
-	memcpy(p, q, sizeof(q));
-	memcpy(t, uv, sizeof(uv));
-	gt_n++;
-}
-
-static bool gt_failed;
-static int gt_stats = -1;
-
-
-static uint64_t gt_now_us(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
-}
-
-static void gt_glyph_cb(lv_draw_unit_t *u, lv_draw_glyph_dsc_t *gd, lv_draw_fill_dsc_t *fd,
-			const lv_area_t *fill_area)
-{
-	LV_UNUSED(u);
-	if (fd && fill_area)			/* underline, strike-through, selection bg */
-		gt_quad(fill_area, 0.5f / ATL, 0.5f / ATL, 1.5f / ATL, 1.5f / ATL);
-	if (!gd || gd->format < LV_FONT_GLYPH_FORMAT_A1 || gd->format > LV_FONT_GLYPH_FORMAT_A8 ||
-	    !gd->glyph_data)
-		return;
-	{
-		struct gt_glyph *e = gt_glyph(gd->g, gd->glyph_data);
-
-		if (!e) {
-			gt_failed = true;
-			return;
-		}
-		gt_quad(gd->letter_coords, (float)e->x / ATL, (float)e->y / ATL,
-			(float)(e->x + e->w) / ATL, (float)(e->y + e->h) / ATL);
-		mbx_gpu_text_glyphs++;
-	}
-}
-
-static bool gt_worth_it(const lv_draw_task_t *t)
-{
-	const lv_draw_label_dsc_t *d = t->draw_dsc;
-	size_t n;
-
-	if (!d->text || d->sel_start != LV_DRAW_LABEL_NO_TXT_SEL || d->opa < LV_OPA_MIN)
-		return false;
-	n = strnlen(d->text, GT_MIN_GLYPHS * 2);
-	return n >= GT_MIN_GLYPHS;
-}
-
-
-/* Draw one label task with GL; false: draw it in software instead. */
-static bool mbx_label(lv_draw_unit_t *u, lv_draw_task_t *t)
-{
-	lv_layer_t *layer = u->target_layer;
-	lv_draw_buf_t *b = layer->draw_buf;
-	lv_draw_label_dsc_t *d = t->draw_dsc;
-	lv_area_t a, coords = t->area;
-	struct n72_native_pixmap pm;
-	uint64_t ts0 = 0, ts1 = 0, ts2 = 0;
-	int ax, aw, h;
-
-	if (!lv_area_intersect(&a, &t->area, u->clip_area))
-		return true;
-	/* the target: the clipped rectangle, x aligned down to 32 px (128 bytes) */
-	ax = (a.x1 - layer->buf_area.x1) & ~31;
-	aw = ((a.x2 - layer->buf_area.x1 + 1 - ax) + 31) & ~31;
-	if (ax + aw > (int)(b->header.stride / 4))
-		aw = b->header.stride / 4 - ax;
-	h = lv_area_get_height(&a);
-	gt_ox = layer->buf_area.x1 + ax;
-	gt_oy = a.y1;
-	pm.gpu_addr = gpu_addr(b->data) + (a.y1 - layer->buf_area.y1) * b->header.stride + ax * 4;
-	pm.cpu = b->data + (a.y1 - layer->buf_area.y1) * b->header.stride + ax * 4;
-	pm.handle = 0;
-	pm.width = aw;
-	pm.height = h;
-	pm.stride = b->header.stride;
-	pm.format = N72_PIXMAP_XRGB8888;
-	if (n72_egl_pixmap_retarget(gt_surf, &pm))
-		return false;
-
-	gt_n = 0;
-	gt_failed = false;
-	if (gt_stats < 0)
-		gt_stats = getenv("N72_GPU_TEXT_STATS") != NULL;
-	if (gt_stats)
-		ts0 = gt_now_us();
-	lv_draw_label_iterate_characters(u, d, &coords, gt_glyph_cb);
-	if (gt_stats)
-		ts1 = gt_now_us();
-	if (gt_failed) {			/* atlas full: start over next time */
-		gt_reset_atlas();
-		return false;
-	}
-	{
-		lv_area_t ba = a;
-
-		lv_area_move(&ba, -layer->buf_area.x1, -layer->buf_area.y1);
-		buf_invalidate(b, &ba);		/* CPU lines over the rectangle out */
-	}
-	glViewport(0, 0, aw, h);
-	glMatrixMode(GL_PROJECTION);
-	glLoadIdentity();
-	glOrthof(0, aw, h, 0, -1, 1);		/* screen-like: y down */
-	glMatrixMode(GL_MODELVIEW);
-	glLoadIdentity();
-	glEnable(GL_SCISSOR_TEST);
-	glScissor(a.x1 - gt_ox, 0, lv_area_get_width(&a), h);
-	glColor4ub(d->color.red, d->color.green, d->color.blue, d->opa);
-	glDrawArrays(GL_TRIANGLES, 0, gt_n * 6);
-	if (gt_stats)
-		ts2 = gt_now_us();
-	glFinish();
-	if (gt_stats)
-		fprintf(stderr, "gtext: %d quads %dx%d: glyphs %u us, GL %u us, finish %u us\n", gt_n, aw, h,
-			(unsigned)(ts1 - ts0), (unsigned)(ts2 - ts1), (unsigned)(gt_now_us() - ts2));
-	mbx_gpu_text_labels++;
-	return true;
-}
 
 static lv_layer_t *defer_layer;		/* a fill is held back in this layer */
 static lv_draw_task_t *defer_t, *defer_tail;
@@ -1287,34 +949,6 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 
 	if (async_dbg < 0)
 		async_dbg = getenv("N72_GPU_ADBG") != NULL;
-	if (inflight) {
-		static unsigned long spins;
-
-		if (!gpu_done(inflight_seq)) {
-			if (spins < 3)
-				ADBG("mbx: poll %lu, seq %u still running\n", spins, inflight_seq);
-			if (++spins % 200000 == 0) {
-				struct mbx_wait w = { 0 };
-
-				mbx_wait_jobs(mbx, &w);
-				fprintf(stderr, "mbx: waiting on seq %u: submitted %u done %u (task type %d state %d)\n",
-					inflight_seq, w.seq_submitted, w.seq_done,
-					inflight->type, inflight->state);
-			}
-			/*
-			 * Still running; the CPU draws on. Ask for another
-			 * dispatch: without an OS, LVGL waits for one to poll again.
-			 */
-			lv_draw_dispatch_request();
-			return 0;
-		}
-		spins = 0;
-		ADBG("mbx: seq %u done, task %p ready\n", inflight_seq, (void *)inflight);
-		inflight->state = LV_DRAW_TASK_STATE_READY;
-		inflight = NULL;
-		mbx_gpu_stats.async_done++;
-		lv_draw_dispatch_request();
-	}
 	t = lv_draw_get_next_available_task(layer, NULL, DRAW_UNIT_ID_MBX);
 	if (!t || t->preferred_draw_unit_id != DRAW_UNIT_ID_MBX)
 		return LV_DRAW_UNIT_IDLE;
@@ -1352,17 +986,6 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 		mbx_layer(u, t);
 	else if (t->type == LV_DRAW_TASK_TYPE_IMAGE)
 		mbx_image(u, t);
-	else if (t->type == LV_DRAW_TASK_TYPE_LABEL) {
-		if (gt_cpu_only) {	/* N72_GPU_TEXT=cpu: time the software path on the same labels */
-			uint64_t t0 = gt_now_us();
-
-			lv_draw_sw_label(u, t->draw_dsc, &t->area);
-			fprintf(stderr, "ctext: %d rows: cpu %u us\n", lv_area_get_height(&t->area),
-				(unsigned)(gt_now_us() - t0));
-		} else if (!mbx_label(u, t)) {
-			lv_draw_sw_label(u, t->draw_dsc, &t->area);
-		}
-	}
 	else if (((lv_draw_fill_dsc_t *)t->draw_dsc)->opa >= LV_OPA_MAX)
 		mbx_fill(u, t);
 	else if (layer->color_format == LV_COLOR_FORMAT_ARGB8888)
@@ -1370,18 +993,8 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 	else
 		mbx_fill_blend(u, t);
 	ADBG("mbx: dispatch on layer %p\n", (void *)layer);
-	ADBG("mbx: task %p type %d area %d,%d-%d,%d seq %u %s\n", (void *)t, t->type,
-	     (int)t->area.x1, (int)t->area.y1, (int)t->area.x2, (int)t->area.y2, last_seq,
-	     last_seq && async_ok(t) ? "async" : "sync");
-	if (last_seq && async_ok(t)) {
-		inflight = t;			/* finished in a later dispatch */
-		inflight_seq = last_seq;
-		last_seq = 0;
-		lv_draw_dispatch_request();	/* so LVGL comes back to poll it */
-		return 1;
-	}
-	gpu_wait(last_seq);			/* synchronous after all */
-	last_seq = 0;
+	ADBG("mbx: task %p type %d area %d,%d-%d,%d\n", (void *)t, t->type,
+	     (int)t->area.x1, (int)t->area.y1, (int)t->area.x2, (int)t->area.y2);
 	t->state = LV_DRAW_TASK_STATE_READY;
 	lv_draw_dispatch_request();
 	return 1;
@@ -1402,7 +1015,6 @@ static uint8_t *disp_buf;		/* copy mode: the draw buffer */
 #define NSCAN 3
 static uint8_t *scan[NSCAN];		/* flip mode: the scan-out buffers */
 static uint32_t scan_handle[NSCAN];
-static uint32_t flush_seq;		/* the last display copy */
 static uint32_t flush_words[16 * 64];
 static int flush_n;
 static bool flipping;
@@ -1618,8 +1230,6 @@ static void sync_rect(int dst, int src, const lv_area_t *a)
 	sync_range(scan[dst] + c.y1 * ss, lv_area_get_height(&c) * ss, MBX_SYNC_FLUSH);
 	if (flush_n > (int)(sizeof(flush_words) / 4) - 16) {
 		submit(flush_words, flush_n);
-		gpu_wait(last_seq);
-		last_seq = 0;
 		flush_n = 0;
 	}
 	flush_n += put_copy(flush_words + flush_n, gpu_addr(scan[dst]), ss,
@@ -1675,8 +1285,6 @@ static void render_start_cb(lv_event_t *e)
 		}
 		if (flush_n) {
 			submit(flush_words, flush_n);
-			gpu_wait(last_seq);
-			last_seq = 0;
 			flush_n = 0;
 		}
 	}
@@ -1744,8 +1352,6 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 		}
 
 		n72_trace("cleaned", 0);
-		gpu_wait(last_seq);		/* the GPU's part of the frame is done */
-		last_seq = 0;
 		memcpy(hist[k].a, cur_areas, sizeof(cur_areas));
 		hist[k].n = cur_n;
 		hist[k].all = cur_all;
@@ -1765,8 +1371,6 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 	lv_display_flush_ready(disp);
 }
 
-static int flush3d = -1;
-
 static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
 	uint32_t stride = fb.stride;
@@ -1775,46 +1379,20 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 		flush_flip(disp, area, px_map);
 		return;
 	}
-	if (flush3d < 0)
-		flush3d = getenv("N72_FLUSH3D") != NULL;	/* no faster: memory bound */
 	sync_range(disp_buf + area->y1 * stride, lv_area_get_height(area) * stride,
 		   MBX_SYNC_CLEAN);
 	if (flush_n > (int)(sizeof(flush_words) / 4) - 16) {
 		submit(flush_words, flush_n);
-		gpu_wait(last_seq);
-		last_seq = 0;
 		flush_n = 0;
-	}
-	if (flush3d) {
-		uint32_t cw[48];
-		int n = mbx_cmd_copy(cw, 0, fb.stride, stride, area->x1, area->y1, area->x1,
-				     area->y1, lv_area_get_width(area),
-				     lv_area_get_height(area), LV_OPA_COVER);
-
-		if (flush_n) {
-			submit(flush_words, flush_n);
-			gpu_wait(last_seq);
-			last_seq = 0;
-			flush_n = 0;
-		}
-		if (!blit3d(8, fb.gpu_addr, gpu_addr(disp_buf), cw, n)) {
-			gpu_wait(last_seq);
-			last_seq = 0;
-			goto copied;
-		}
 	}
 	flush_n += put_copy(flush_words + flush_n, fb.gpu_addr, fb.stride,
 			    gpu_addr(disp_buf), stride, area->x1, area->y1,
 			    area->x1, area->y1, lv_area_get_width(area),
 			    lv_area_get_height(area));
-copied:
 	mbx_gpu_stats.flushes++;
 	if (lv_display_flush_is_last(disp)) {
 		if (flush_n) {
 			submit(flush_words, flush_n);
-			/* the next frame waits for it before drawing (refr_start_cb) */
-			flush_seq = last_seq;
-			last_seq = 0;
 			flush_n = 0;
 		}
 		n72_frame_shown();
@@ -1822,13 +1400,10 @@ copied:
 	lv_display_flush_ready(disp);
 }
 
-/* Before the CPU draws the next frame into disp_buf: the copy must be done. */
+/* Before the CPU draws the next frame into disp_buf. */
 static void refr_start_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
-	ADBG("mbx: refresh start, waiting for flush seq %u\n", flush_seq);
-	gpu_wait(flush_seq);
-	flush_seq = 0;
 	n72_refr_start();
 }
 
@@ -2291,8 +1866,6 @@ static bool flip_setup(uint32_t size)
 		else
 			submit(w, put_copy(w, gpu_addr(scan[0]), fb.stride, fb.gpu_addr, fb.stride,
 					   0, 0, 0, 0, fb.width, fb.height));
-		gpu_wait(last_seq);
-		last_seq = 0;
 	}
 	kms = kms_setup();
 	if (!kms && mbx_is_drm(mbx)) {
@@ -2320,22 +1893,9 @@ lv_display_t *mbx_gpu_display_create(void)
 	mbx = mbx_open();		/* the render node, else /dev/mbx */
 	if (mbx < 0)
 		return NULL;
-	{
-		const char *e = getenv("N72_GPU_ASYNC");
-
-		/*
-		 * Opt-in (N72_GPU_ASYNC=1): correct (the home screen renders
-		 * pixel-identical) but not faster yet, since most UI tasks
-		 * overlap and the CPU has little to draw meanwhile. Older
-		 * kernels have no MBX_IOC_SET_ASYNC: stay synchronous.
-		 */
-		if (e && !strcmp(e, "1") && !mbx_set_async(mbx, 1))
-			gpu_async = 1;
-	}
 	if (mbx_fb_info(mbx, &fb) || mbx_alloc(mbx, POOL_SIZE, MBX_ALLOC_CACHED, &a))
 		goto fail;
 	pool = a.cpu;
-	pool_handle = a.handle;
 	pool_gpu = a.gpu;
 	regions[nregions++] = (struct region){ pool, POOL_SIZE, a.gpu, a.handle };
 	blocks[0].off = 0;
@@ -2374,8 +1934,8 @@ lv_display_t *mbx_gpu_display_create(void)
 	fprintf(stderr, "n72-ui: %s; MBX GPU (%s):", kms_fd < 0 ? "no KMS" :
 		kms_shell ? "KMS (n72-clcd-shell, layer 1)" : "KMS (n72-clcd)",
 		mbx_is_drm(mbx) ? "DRM render node" : "/dev/mbx");
-	fprintf(stderr, "  framebuffer at GPU %08x, %u KiB draw pool at %08x, %s jobs, %s\n",
-	       fb.gpu_addr, POOL_SIZE / 1024, pool_gpu, gpu_async ? "async" : "sync",
+	fprintf(stderr, "  framebuffer at GPU %08x, %u KiB draw pool at %08x, sync jobs, %s\n",
+	       fb.gpu_addr, POOL_SIZE / 1024, pool_gpu,
 	       flipping ? "page flipping at vblank" : "copy to the framebuffer");
 	return disp;
 
@@ -2416,8 +1976,6 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void)
 	 * this thread draws, so nothing writes it meanwhile. Waiting for it to
 	 * reach the screen cost up to a frame at every slide's start.
 	 */
-	gpu_wait(flush_seq);		/* the last frame is complete */
-	flush_seq = 0;
 	buf_invalidate(b, &all);
 	{
 		/* the 3D copy: ~3 ms a screen against the 2D engine's ~8 */
@@ -2431,8 +1989,6 @@ lv_draw_buf_t *mbx_gpu_grab_screen(void)
 		if (blit3d(8, gpu_addr(b->data), src, w3, n)) {
 			submit(w, put_copy(w, gpu_addr(b->data), b->header.stride, src,
 					   ss, 0, 0, 0, 0, b->header.w, b->header.h));
-			gpu_wait(last_seq);
-			last_seq = 0;
 		}
 	}
 	return b;
@@ -2463,8 +2019,6 @@ lv_draw_buf_t *mbx_gpu_flatten(const lv_draw_buf_t *src, lv_color_t bg)
 	buf_invalidate(b, &all);
 	submit(w, put_fill(w, gpu_addr(b->data), b->header.stride,
 			   0xff000000 | lv_color_to_u32(bg), 0, 0, b->header.w, b->header.h));
-	gpu_wait(last_seq);
-	last_seq = 0;
 	n = mbx_cmd_copy(w, 1, b->header.stride, src->header.stride, 0, 0, 0, 0,
 			 b->header.w, b->header.h, LV_OPA_COVER);
 	mbx_cmd_copy_blend(w, MBX_COPY_ALPHA);
@@ -2472,8 +2026,6 @@ lv_draw_buf_t *mbx_gpu_flatten(const lv_draw_buf_t *src, lv_color_t bg)
 		lv_draw_buf_destroy(b);
 		return NULL;
 	}
-	gpu_wait(last_seq);
-	last_seq = 0;
 	return b;
 }
 
@@ -2608,8 +2160,6 @@ bool mbx_gpu_set_rotation(int deg)
 			return false;
 	}
 	flip_wait();
-	gpu_wait(flush_seq);
-	flush_seq = 0;
 	/* the GPU writes the scan-out buffers now (or the CPU again): no
 	 * cache lines of the other way may be written back over them */
 	for (i = 0; i < NSCAN; i++)
@@ -2628,11 +2178,6 @@ bool mbx_gpu_set_rotation(int deg)
 	pthread_mutex_unlock(&flip_mx);
 	lv_obj_invalidate(lv_screen_active());
 	return true;
-}
-
-int mbx_gpu_rotation(void)
-{
-	return rot_deg;
 }
 
 /* LVGL draws into the scan-out buffers themselves: upright, or turned by the display */
@@ -2668,8 +2213,6 @@ lv_draw_buf_t *mbx_gpu_turn_buf(const lv_draw_buf_t *src, int deg)
 		lv_draw_buf_destroy(b);
 		return NULL;
 	}
-	gpu_wait(last_seq);
-	last_seq = 0;
 	return b;
 }
 

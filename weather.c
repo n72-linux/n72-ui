@@ -229,18 +229,6 @@ static lv_draw_buf_t *wx_icon(int which, int kind)
 	return wx.icon[which][kind];
 }
 
-/* (a theme change: the card's cloud colour changes) */
-static void wx_icons_free(void)
-{
-	for (int w = 0; w < 2; w++)
-		for (int k = 0; k < WXI_N; k++)
-			if (wx.icon[w][k]) {
-				lv_image_cache_drop(wx.icon[w][k]);
-				lv_draw_buf_destroy(wx.icon[w][k]);
-				wx.icon[w][k] = NULL;
-			}
-}
-
 /* --------------------------------------------------------- the showing */
 
 static void wx_show(void)

@@ -97,7 +97,6 @@ static inline int32_t ios_anim_value(const lv_anim_t *a, int c)
 }
 
 /* lv_anim path callbacks */
-static int32_t ios_path_default(const lv_anim_t *a) { return ios_anim_value(a, IOS_DEFAULT); }
 static int32_t ios_path_ease_in_out(const lv_anim_t *a) { return ios_anim_value(a, IOS_EASE_IN_OUT); }
 static int32_t ios_path_ease_in(const lv_anim_t *a) { return ios_anim_value(a, IOS_EASE_IN); }
 static int32_t ios_path_ease_out(const lv_anim_t *a) { return ios_anim_value(a, IOS_EASE_OUT); }
@@ -163,34 +162,6 @@ static bool ios_pager_step(struct ios_pager *p, int n)
 	}
 	p->x = nx;
 	return false;
-}
-
-/* --------------------------------------------------- list deceleration */
-
-/*
- * UIScrollView's list glide: v(t) = v0 * F^t (F = 0.998 per ms), position the
- * integral; stops below 0.01 px/ms; releases under 0.25 px/ms do not glide.
- * Past an end the overshoot decays by 0.99 per ms (no reflection).
- */
-#define IOS_DECEL		0.998
-#define IOS_DECEL_LN		-0.0020020026706730793	/* ln 0.998 */
-#define IOS_BOUNCE_LN		-0.01005033585350145	/* ln 0.99 */
-#define IOS_GLIDE_MIN		0.25	/* px/ms */
-#define IOS_GLIDE_STOP		0.01	/* px/ms */
-#define IOS_RUBBER		0.5	/* drag past an end */
-
-/* distance covered after @t ms from @v0 px/ms */
-static inline double ios_glide_dist(double v0, double t)
-{
-	return v0 * (exp(IOS_DECEL_LN * t) - 1.0) / IOS_DECEL_LN;
-}
-
-/* the glide's length in ms (until |v| < IOS_GLIDE_STOP) */
-static inline double ios_glide_ms(double v0)
-{
-	double a = fabs(v0);
-
-	return a <= IOS_GLIDE_STOP ? 0 : log(IOS_GLIDE_STOP / a) / IOS_DECEL_LN;
 }
 
 #endif

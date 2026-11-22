@@ -673,7 +673,6 @@ static lv_obj_t *m3_button(lv_obj_t *parent, const char *text, bool filled,
 
 /* ------------------------------------------------------------ navigation */
 
-static bool in_demo;		/* (no demos any more; kept for main.c) */
 
 static void back_cb(lv_event_t *e);
 
@@ -9958,13 +9957,6 @@ static void rot_init(void)
 		rot_seen = rot_read();
 	if (rot_seen > 0)
 		rot_side = rot_seen;
-}
-
-/* Upright now, for something that only works upright (an application). */
-static void ui_upright(void)
-{
-	if (ui_rot)
-		ui_turn(0);
 }
 
 /* ---------------------------------------------------- video controls */

@@ -16,7 +16,6 @@
 
 #define DOCK_MAX	4
 #define DOCK_ICON	60
-#define DOCK_FLY_MS	300	/* iOS's 0.3 s */
 #define DOCK_DEFAULT	"Settings|Files|YouTube|Browser"
 
 static lv_obj_t *dock_order[128];	/* every tile, in the grid's order */

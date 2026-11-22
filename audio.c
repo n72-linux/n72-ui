@@ -98,18 +98,6 @@ static bool snd_ctl_set(const char *name, long v)
 	return ioctl(snd_fd, SNDRV_CTL_IOCTL_ELEM_WRITE, &val) == 0;
 }
 
-static long snd_ctl_get(const char *name, long def)
-{
-	struct snd_ctl_elem_value val;
-
-	memset(&val, 0, sizeof(val));
-	if (!snd_ctl_id(name, &val.id))
-		return def;
-	if (ioctl(snd_fd, SNDRV_CTL_IOCTL_ELEM_READ, &val) < 0)
-		return def;
-	return val.value.integer.value[0];
-}
-
 /* 0..100 % -> mute at 0, else -60..0 dB in 1 dB steps */
 static void snd_apply_volume(int pct)
 {

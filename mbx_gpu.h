@@ -52,7 +52,6 @@ void mbx_gpu_handoff(void);
 bool mbx_gpu_on_shell_layer(void);
 /* turn the screen (LVGL's rotation 0, 90, 270); false if it cannot */
 bool mbx_gpu_set_rotation(int deg);
-int mbx_gpu_rotation(void);
 /* true: no turned copy after drawing (upright, or the display turns the layer) */
 bool mbx_gpu_draws_direct(void);
 /* a picture turned a quarter (90 or 270, as the screen), by the GPU */
