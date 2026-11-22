@@ -1032,8 +1032,8 @@ static uint32_t lstride;
 /*
  * The display turns the layer itself (kms_can_turn): the scan-out buffers
  * hold the upright picture (lw x lh, stride lstride) and LVGL draws
- * straight into them, as when not turned; else (N72_GPUTURN=1, or a
- * kernel without the plane's rotation) the GPU's turned copy from lbuf.
+ * straight into them, as when not turned; else (no KMS, or a kernel
+ * without the plane's rotation) the GPU's turned copy from lbuf.
  */
 static bool hw_turn;
 static int buf_rot[NSCAN];		/* the turn each buffer's frame was drawn for */
@@ -1335,8 +1335,11 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 	if (lv_display_flush_is_last(disp)) {
 		long n = frame_no + 1;
 		int k = n % HIST;
+		static int alphacheck = -1;	/* (debug) N72_ALPHACHECK, read once */
 
-		if (!transparent && getenv("N72_ALPHACHECK")) {
+		if (alphacheck < 0)
+			alphacheck = getenv("N72_ALPHACHECK") != NULL;
+		if (!transparent && alphacheck) {
 			/* (debug) an opaque frame must be alpha 255 everywhere */
 			uint32_t x, y, bad = 0, fx = 0, fy = 0;
 
@@ -1426,7 +1429,7 @@ static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
  * the MBX driver as dma-bufs, imported as DRM framebuffers, and flipped
  * with DRM_IOCTL_MODE_PAGE_FLIP; the flip's event comes at the vblank that
  * shows it. When n72-ui exits, DRM gives the screen back to the console.
- * Without KMS (or N72_MBXFLIP=1) the MBX driver's own flip is used.
+ * Without KMS the MBX driver's own flip is used.
  */
 static uint32_t kms_fb[NSCAN], kms_crtc;
 static uint32_t kms_handle[NSCAN];	/* the scan buffers' GEM handles on kms_fd */
@@ -1731,7 +1734,7 @@ static bool kms_setup(void)
 
 	if (!handed)
 		fd = kms_open();
-	if (fd < 0 || getenv("N72_MBXFLIP"))
+	if (fd < 0)
 		goto fail;
 	ioctl(fd, DRM_IOCTL_SET_MASTER, 0);
 	res.crtc_id_ptr = (uintptr_t)crtcs;
@@ -1777,7 +1780,7 @@ static bool kms_setup(void)
 	}
 	kms_crtc = crtcs[0];
 	/* the same buffers as landscape pictures, for the display to turn */
-	if (!getenv("N72_GPUTURN") && kms_find_plane(fd)) {
+	if (kms_find_plane(fd)) {
 		uint32_t ls = buf_width_to_stride(fb.height, LV_COLOR_FORMAT_XRGB8888);
 
 		kms_can_turn = ls * fb.width <= fb.stride * fb.height;
