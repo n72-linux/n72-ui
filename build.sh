@@ -20,6 +20,10 @@ CC=${CROSS}$N72_CC
 # what $CC really is (a "...-gcc" given through CROSS may be a clang wrapper)
 case "$($CC --version 2>/dev/null)" in *clang*) KIND=clang ;; *) KIND=gcc ;; esac
 [ "$KIND" = clang ] && [ "$N72_CC" = clang ] && OUT="$OUT-clang"
+# n72-gles' static library of the same compiler (its Makefile: build/ for
+# gcc, build-clang/ for N72_CC=clang)
+GLESLIB=$GLES/build/libGLESv1_CM.a
+[ "$N72_CC" = clang ] && [ -f "$GLES/build-clang/libGLESv1_CM.a" ] && GLESLIB=$GLES/build-clang/libGLESv1_CM.a
 KHDR=${KHDR:-$ROOT/linux-build-mac/usr/include}
 [ -f "$KHDR/linux/types.h" ] || KHDR=$ROOT/linux-build-alpine/usr/include
 PG=
@@ -79,7 +83,7 @@ $CC $CFLAGS -c "$UI/main.c" -o "$OUT/obj/main.o"
 $CC $CFLAGS -c "$UI/mbx_gpu.c" -o "$OUT/obj/mbx_gpu.o"
 # (with LTO the instrumentation and the profile go in at compile time; the
 # link only adds the runtime, or the layout by the profile)
-$CC $PG $LTO $OPT -static -Wl,--gc-sections $PGOL -o "$OUT/n72-ui" "$OUT/obj/main.o" "$OUT/obj/mbx_gpu.o" $OBJS $GLES/build/libGLESv1_CM.a -lm -lpthread
+$CC $PG $LTO $OPT -static -Wl,--gc-sections $PGOL -o "$OUT/n72-ui" "$OUT/obj/main.o" "$OUT/obj/mbx_gpu.o" $OBJS $GLESLIB -lm -lpthread
 cp "$OUT/n72-ui" "$OUT/n72-ui.debug"	# unstripped, for crash reports (addr2line)
 [ -n "$PG" ] || ${CROSS}strip "$OUT/n72-ui"
 ls -l "$OUT/n72-ui"
