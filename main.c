@@ -2429,9 +2429,15 @@ static void on_signal(int sig)
 	restore_tty();
 #ifdef N72_PGO_GEN
 	{	/* (instrumented build: the counters, as it is stopped) */
+#ifdef __clang__
 		extern int __llvm_profile_write_file(void);
 
 		__llvm_profile_write_file();
+#else
+		extern void __gcov_dump(void);	/* libgcov: into PGO_DIR's .gcda files */
+
+		__gcov_dump();
+#endif
 	}
 #endif
 	signal(sig, SIG_DFL);

@@ -85,9 +85,11 @@ at 4.5 MHz, ~0.2 ms per frame) touch reports arrive at ~60 Hz instead of ~42.
 ## Build
 
 LVGL goes in `../lvgl-src/lvgl` (`git clone -b v9.2.2 https://github.com/lvgl/lvgl`).
-From the workspace root, in the `n72-build` container:
+From the workspace root, on the Mac (the cross gcc of
+`n72-alpine/toolchain`, see its README; `N72_CC=clang` for clang, the build
+`pgo/n72ui.profdata` applies to, into `../n72-ui-build-clang/`):
 
-    docker run --rm -v "$PWD":/work -w /work n72-build sh n72-ui/build.sh
+    sh n72-ui/build.sh
 
 The static binary lands in `../n72-ui-build/n72-ui`;
 `linux-s5l87xx/freemyipod/build-initramfs-n72.sh` installs it and starts it at

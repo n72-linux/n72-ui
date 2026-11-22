@@ -1,8 +1,11 @@
 #!/bin/sh
 # Cross-build n72-ui statically for the iPod touch 2G (ARM1176; Alpine armhf:
-# VFP, hard float, musl). Run in the n72-alpine container:
-#   sh n72-ui/build.sh  (from the workspace root)
-# Kernel uapi headers: linux-build-alpine/usr/include (`make O=../linux-build-alpine ARCH=arm headers`).
+# VFP, hard float, musl) on the Mac:
+#   sh n72-ui/build.sh                 the cross gcc (n72-alpine/toolchain) -> n72-ui-build/
+#   N72_CC=clang sh n72-ui/build.sh    Homebrew clang + lld -> n72-ui-build-clang/ (the build
+#                                      pgo/n72ui.profdata, a clang profile, applies to)
+# Kernel uapi headers: KHDR, linux-build-mac/usr/include (`sh n72-alpine/toolchain/kernel.sh headers`)
+# or the last container build's linux-build-alpine/usr/include.
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 UI=$(cd "$(dirname "$0")" && pwd)
@@ -11,31 +14,52 @@ GLES=${GLES:-$ROOT/n72-gles}
 LVGL="$ROOT/lvgl-src/lvgl"
 OUT="$ROOT/$(basename "$UI")-build"
 CROSS=${CROSS:-armv6-alpine-linux-musleabihf-}
-CC=${CROSS}gcc
+command -v "${CROSS}gcc" >/dev/null || . "$ROOT/n72-alpine/toolchain/env.sh"
+N72_CC=${N72_CC:-gcc}
+CC=${CROSS}$N72_CC
+# what $CC really is (a "...-gcc" given through CROSS may be a clang wrapper)
+case "$($CC --version 2>/dev/null)" in *clang*) KIND=clang ;; *) KIND=gcc ;; esac
+[ "$KIND" = clang ] && [ "$N72_CC" = clang ] && OUT="$OUT-clang"
+KHDR=${KHDR:-$ROOT/linux-build-mac/usr/include}
+[ -f "$KHDR/linux/types.h" ] || KHDR=$ROOT/linux-build-alpine/usr/include
 PG=
 # PROFILE=1: gprof build (n72-ui-build-prof/, not stripped; gmon.out on a clean exit, e.g. --bench)
-[ "$PROFILE" = 1 ] && { OUT="$ROOT/$(basename "$UI")-build-prof"; PG=-pg; }
+[ "$PROFILE" = 1 ] && { OUT="$OUT-prof"; PG=-pg; }
 # link-time optimisation: LVGL's drawing inlined across files (text 11-19% faster on the device)
 LTO=-flto=auto
 # OPT: the optimisation level (-O2; -O3 to compare)
 OPT=${OPT:--O2}
 # Profile-guided build (pgo/README):
-#   PGO_GEN=1 [PGO_RT=libclang_rt.profile-armhf.a]  instrumented (n72-ui-build-pgogen/)
-#   otherwise pgo/n72ui.profdata is used when it is there (NOPGO=1: not)
+#   PGO_GEN=1 [PGO_RT=libclang_rt.profile-armhf.a]  instrumented (n72-ui-build*-pgogen/)
+#   otherwise the profile is used when it is there (NOPGO=1: not):
+#     clang  pgo/n72ui.profdata
+#     gcc    pgo/gcc/*.gcda, the files the instrumented build wrote on the device
+#            under PGO_DIR (/tmp/n72ui-pgo). New 2026-11-22: no gcc profile has
+#            been trained yet, so the gcc build is not profile-guided.
 PGOC= PGOL=
+PGO_DIR=${PGO_DIR:-/tmp/n72ui-pgo}
 if [ "$PGO_GEN" = 1 ]; then
-	OUT="$ROOT/$(basename "$UI")-build-pgogen"
-	PGO_RT=${PGO_RT:-$ROOT/n72-gles/pgo-rt/libclang_rt.profile-armhf.a}
-	PGOC="-fprofile-generate -DN72_PGO_GEN"
-	PGOL="-Wl,-u,__llvm_profile_runtime $PGO_RT"
-elif [ -f "$UI/pgo/n72ui.profdata" ] && [ "$NOPGO" != 1 ]; then
+	OUT="$OUT-pgogen"
+	if [ "$KIND" = clang ]; then
+		PGO_RT=${PGO_RT:-$ROOT/n72-gles/pgo-rt/libclang_rt.profile-armhf.a}
+		PGOC="-fprofile-generate -DN72_PGO_GEN"
+		PGOL="-Wl,-u,__llvm_profile_runtime $PGO_RT"
+	else
+		PGOC="-fprofile-generate=$PGO_DIR -fprofile-update=prefer-atomic -DN72_PGO_GEN"
+		PGOL="-fprofile-generate=$PGO_DIR"
+	fi
+elif [ "$NOPGO" = 1 ]; then
+	:
+elif [ "$KIND" = clang ] && [ -f "$UI/pgo/n72ui.profdata" ]; then
 	PGOC="-fprofile-use=$UI/pgo/n72ui.profdata -mllvm -hot-cold-split=true -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin"
 	PGOL="-Wl,-mllvm,-hot-cold-split=true -Wl,-z,keep-text-section-prefix"
+elif [ "$KIND" = gcc ] && ls "$UI"/pgo/gcc/*.gcda >/dev/null 2>&1; then
+	PGOC="-fprofile-use=$UI/pgo/gcc -fprofile-correction -Wno-missing-profile"
 fi
 # (comparison builds beside the usual one: n72-ui-build-O3, -nopgo)
 [ "$OPT" != -O2 ] && OUT="$OUT-${OPT#-}"
 [ "$NOPGO" = 1 ] && OUT="$OUT-nopgo"
-CFLAGS="$PG $LTO $OPT $PGOC -g -idirafter $ROOT/linux-build-alpine/usr/include -idirafter $ROOT/linux-s5l87xx/include/uapi -mcpu=arm1176jzf-s -mfpu=vfpv2 -mfloat-abi=hard -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src -I$GLES/include"
+CFLAGS="$PG $LTO $OPT $PGOC -g -idirafter $KHDR -idirafter $ROOT/linux-s5l87xx/include/uapi -mcpu=arm1176jzf-s -mfpu=vfpv2 -mfloat-abi=hard -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src -I$GLES/include"
 mkdir -p "$OUT/obj"
 # objects from another compiler or other flags (the old armel build) are not reused
 if [ "$(cat "$OUT/obj/.flags" 2>/dev/null)" != "$CC $CFLAGS" ]; then
@@ -50,7 +74,7 @@ for f in $SRCS; do
 	if [ ! -f "$o" ] || [ "$f" -nt "$o" ] || [ "$UI/lv_conf.h" -nt "$o" ] || [ "$UI/n72_blend.h" -nt "$o" ]; then
 		echo "$CC -c $f -o $o $CFLAGS"
 	fi
-done | xargs -P "$(nproc)" -I{} sh -c '{}'
+done | tr '\n' '\0' | xargs -0 -n 1 -P "$(nproc 2>/dev/null || sysctl -n hw.ncpu)" sh -c	# (not -I{}: BSD xargs caps that at 255 bytes)
 $CC $CFLAGS -c "$UI/main.c" -o "$OUT/obj/main.o"
 $CC $CFLAGS -c "$UI/mbx_gpu.c" -o "$OUT/obj/mbx_gpu.o"
 # (with LTO the instrumentation and the profile go in at compile time; the

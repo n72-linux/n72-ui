@@ -20,8 +20,8 @@ binary, so -O2 stays.
 A function changed since the profile is built as without one (clang checks
 a hash per function); make a new one after larger changes:
 
-  1. docker run ... -e PGO_GEN=1 n72-alpine sh /work/n72-ui/build.sh
-     (n72-ui-build-pgogen/; the runtime is n72-gles/pgo-rt/libclang_rt.profile-armhf.a)
+  1. N72_CC=clang PGO_GEN=1 sh n72-ui/build.sh
+     (n72-ui-build-clang-pgogen/; the runtime is n72-gles/pgo-rt/libclang_rt.profile-armhf.a)
   2. On the device: that binary as /root/n72-ui-pgogen, the training script
      (pgo/train.sh: harness runs with
      LLVM_PROFILE_FILE=/root/pgo/ui-%p.profraw; the counters are written
