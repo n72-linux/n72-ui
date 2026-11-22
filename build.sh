@@ -42,12 +42,17 @@ OPT=${OPT:--O2}
 #            been trained yet, so the gcc build is not profile-guided.
 PGOC= PGOL=
 PGO_DIR=${PGO_DIR:-/tmp/n72ui-pgo}
+# clang names a static function in a profile by its source file; by the file's
+# base name here, so that a profile holds wherever the tree is checked out
+# (with the full path, the default, a profile taken from a build under /work
+# gave the static functions nothing in a build under another path: silently)
+PGOSF="-mllvm -static-func-full-module-prefix=false"
 if [ "$PGO_GEN" = 1 ]; then
 	OUT="$OUT-pgogen"
 	if [ "$KIND" = clang ]; then
 		PGO_RT=${PGO_RT:-$ROOT/n72-gles/pgo-rt/libclang_rt.profile-armhf.a}
-		PGOC="-fprofile-generate -DN72_PGO_GEN"
-		PGOL="-Wl,-u,__llvm_profile_runtime $PGO_RT"
+		PGOC="-fprofile-generate $PGOSF -DN72_PGO_GEN"
+		PGOL="-Wl,-u,__llvm_profile_runtime -Wl,-mllvm,-static-func-full-module-prefix=false $PGO_RT"
 	else
 		PGOC="-fprofile-generate=$PGO_DIR -fprofile-update=prefer-atomic -DN72_PGO_GEN"
 		PGOL="-fprofile-generate=$PGO_DIR"
@@ -55,8 +60,8 @@ if [ "$PGO_GEN" = 1 ]; then
 elif [ "$NOPGO" = 1 ]; then
 	:
 elif [ "$KIND" = clang ] && [ -f "$UI/pgo/n72ui.profdata" ]; then
-	PGOC="-fprofile-use=$UI/pgo/n72ui.profdata -mllvm -hot-cold-split=true -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin"
-	PGOL="-Wl,-mllvm,-hot-cold-split=true -Wl,-z,keep-text-section-prefix"
+	PGOC="-fprofile-use=$UI/pgo/n72ui.profdata $PGOSF -mllvm -hot-cold-split=true -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin"
+	PGOL="-Wl,-mllvm,-hot-cold-split=true -Wl,-mllvm,-static-func-full-module-prefix=false -Wl,-z,keep-text-section-prefix"
 elif [ "$KIND" = gcc ] && ls "$UI"/pgo/gcc/*.gcda >/dev/null 2>&1; then
 	PGOC="-fprofile-use=$UI/pgo/gcc -fprofile-correction -Wno-missing-profile"
 fi

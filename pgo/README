@@ -28,3 +28,14 @@ a hash per function); make a new one after larger changes:
      when n72-ui is stopped with SIGTERM, or at the end of --bench).
   3. llvm-profdata merge -o pgo/n72ui.profdata raw/*.profraw
   4. Build as usual.
+
+Static functions are named in the profile by their file's base name
+(build.sh: -static-func-full-module-prefix=false), not by the full path
+clang uses by default: the profile was taken from a build under /work, and
+the builds on the Mac, under another path, silently found nothing for the
+884 static functions in it (60 % of its counts, the blend loops and the
+style lookups among them). 2026-11-23: the names in n72ui.profdata were
+rewritten to base names (llvm-profdata merge --text, the directory part of
+each "path;function" name removed, merged back; the counts are untouched).
+To see what a build finds: compile a file with -Wbackend-plugin -mllvm
+-pgo-warn-missing-function=true in place of build.sh's -Wno- flags.
