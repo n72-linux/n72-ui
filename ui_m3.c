@@ -3058,6 +3058,8 @@ static void qs_style(lv_obj_t *tile, bool on)
 static int wifi_want = -1, bt_want = -1;	/* -1: no switch in progress */
 static lv_obj_t *wifi_switch, *bt_switch, *bt_state_lbl;
 static lv_obj_t *status_wifi, *status_bt, *app_bar_wifi, *app_bar_bt;
+/* the lock screen's bar (lock_build): its icons follow home's */
+static lv_obj_t *lock_bar_time, *lock_bar_wifi, *lock_bar_bt, *lock_bar_batt, *lock_bar_np;
 
 static bool wifi_shown_on(void)
 {
@@ -3140,6 +3142,8 @@ static void net_ui_sync(void)
 	icon_show(status_bt, b && bt_want < 0);
 	icon_show(app_bar_wifi, w && wifi_up && wifi_want < 0);
 	icon_show(app_bar_bt, b && bt_want < 0);
+	icon_show(lock_bar_wifi, w && wifi_up && wifi_want < 0);
+	icon_show(lock_bar_bt, b && bt_want < 0);
 	if (home_net)
 		label_set_if_changed(home_net, wifi_up ? wifi_ssid : "Wi-Fi off");
 	app_bar_update();
@@ -4677,6 +4681,8 @@ static void lock_update(void)
 	label_set_if_changed(lock_date, buf);
 	battery_text(buf, sizeof(buf));
 	label_set_if_changed(lock_batt, strstr(buf, LV_SYMBOL_CHARGE) ? buf : "");
+	if (lock_bar_batt && batt_lbl)
+		label_set_if_changed(lock_bar_batt, lv_label_get_text(batt_lbl));
 	np_lock_sync();
 }
 
@@ -4693,6 +4699,25 @@ static void lock_build(void)
 	lv_obj_set_style_bg_grad_color(lock_scr, lv_color_black(), 0);
 	lv_obj_set_style_bg_grad_dir(lock_scr, LV_GRAD_DIR_VER, 0);
 	wp_put(lock_scr, WP_LOCK);	/* (a picture, if one is set, over the gradient) */
+
+	/* the status bar, as home's: its time hidden (the clock below shows it) */
+	o = lv_obj_create(lock_scr);
+	plain(o);
+	lv_obj_set_size(o, W, 40);
+	lv_obj_set_style_bg_opa(o, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_radius(o, 0, 0);
+	lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	status_row(o, &lock_bar_time, &lock_bar_wifi, &lock_bar_bt, &lock_bar_batt);
+	lv_obj_add_flag(lock_bar_time, LV_OBJ_FLAG_HIDDEN);
+	lock_bar_np = m3_label(o, LV_SYMBOL_AUDIO, &lv_font_montserrat_14, M.on_surface_v);
+	lv_obj_move_to_index(lock_bar_np, (int32_t)lv_obj_get_index(lock_bar_wifi));
+	lv_obj_add_flag(lock_bar_np, LV_OBJ_FLAG_HIDDEN);
+	{
+		lv_obj_t *const l[] = { lock_bar_np, lock_bar_wifi, lock_bar_bt, lock_bar_batt };
+
+		for (unsigned i = 0; i < sizeof(l) / sizeof(l[0]); i++)
+			lv_obj_set_style_text_color(l[i], lv_color_hex(0xe8e0f0), 0);
+	}
 
 	lock_date = m3_label(lock_scr, "", &lv_font_montserrat_20, lv_color_hex(0xe8e0f0));
 	lv_obj_align(lock_date, LV_ALIGN_TOP_MID, 0, 64);
@@ -4713,6 +4738,8 @@ static void lock_build(void)
 	lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
 	lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
 	lv_obj_align(o, LV_ALIGN_BOTTOM_MID, 0, -12);
+	net_ui_sync();		/* (the bar's icons as they are now) */
+	np_sync();
 }
 
 static void ul_free(void)
@@ -9442,8 +9469,14 @@ static void ui_rebuild_overlays_free(void)
 		vol_hud = NULL;
 	}
 	if (lock_scr && !locked) {
+		lv_obj_t **lk[] = {
+			&lock_scr, &lock_bar_time, &lock_bar_wifi, &lock_bar_bt, &lock_bar_batt, &lock_bar_np,
+			&npl.card, &npl.title, &npl.sub, &npl.play_sym,
+		};
+
 		lv_obj_delete(lock_scr);
-		lock_scr = NULL;
+		for (i = 0; i < (int)(sizeof(lk) / sizeof(lk[0])); i++)
+			*lk[i] = NULL;
 	}
 	{
 		lv_obj_t **gone[] = {
@@ -10883,11 +10916,15 @@ static void np_sync(void)
 	char b[64], p[24], d[24];
 
 	np_lock_sync();
-	if (status_np && lv_obj_has_flag(status_np, LV_OBJ_FLAG_HIDDEN) == on) {
-		if (on)
-			lv_obj_remove_flag(status_np, LV_OBJ_FLAG_HIDDEN);
-		else
-			lv_obj_add_flag(status_np, LV_OBJ_FLAG_HIDDEN);
+	for (int i = 0; i < 2; i++) {
+		lv_obj_t *l = i ? lock_bar_np : status_np;
+
+		if (l && lv_obj_has_flag(l, LV_OBJ_FLAG_HIDDEN) == on) {
+			if (on)
+				lv_obj_remove_flag(l, LV_OBJ_FLAG_HIDDEN);
+			else
+				lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+		}
 	}
 	if (!np.card)
 		return;
