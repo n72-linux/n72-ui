@@ -6838,7 +6838,10 @@ static void wifi_join(const char *ssid, const char *psk)
 		 "wpa_cli -i wlan0 set_network $n ssid %s && "
 		 "%s%s%s"
 		 "wpa_cli -i wlan0 enable_network $n && wpa_cli -i wlan0 select_network $n && "
-		 "wpa_cli -i wlan0 save_config; sleep 6",
+		 /* select_network disables every other network: all of them back
+		  * on (it stays on this one), so each saved one joins by itself
+		  * when it is in range, as iOS's do */
+		 "sleep 5; wpa_cli -i wlan0 enable_network all; wpa_cli -i wlan0 save_config; sleep 1",
 		 q_ssid,
 		 psk ? "wpa_cli -i wlan0 set_network $n psk " : "wpa_cli -i wlan0 set_network $n key_mgmt NONE",
 		 psk ? q_psk : "", " && ");
@@ -6893,10 +6896,12 @@ static int n_nets;
 static void wifi_net_cb(lv_event_t *e)
 {
 	struct wifi_net *n = lv_event_get_user_data(e);
-	char cmd[96];
+	char cmd[160];
 
 	if (n->saved && n->id >= 0) {
-		snprintf(cmd, sizeof(cmd), "wpa_cli -i wlan0 select_network %d; sleep 5", n->id);
+		/* (then every saved network on again: see wifi_join) */
+		snprintf(cmd, sizeof(cmd), "wpa_cli -i wlan0 select_network %d; sleep 5; "
+			 "wpa_cli -i wlan0 enable_network all; wpa_cli -i wlan0 save_config", n->id);
 		label_set_if_changed(wifi_state_lbl, "Connecting...");
 		job_run(cmd, wifi_page, wifi_cmd_done, NULL);
 	} else if (n->secure) {
