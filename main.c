@@ -104,8 +104,10 @@ static bool lat_input_frame;
 static void render_now(void)
 {
 	uint64_t t0 = mono_us(), d;
-	struct mbx_gpu_stats g0 = mbx_gpu_stats;
+	static struct mbx_gpu_stats g0;	/* (only the N72_LATENCY log reads it) */
 
+	if (lat_on)
+		g0 = mbx_gpu_stats;
 	lat_input_frame = true;
 	n72_trace("touch-render", 0);
 	lv_refr_now(NULL);
