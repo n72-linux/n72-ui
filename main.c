@@ -15,7 +15,7 @@
  *                  max to flip an axis (default: the device's own range)
  *   N72_TOUCH_SWAP set to 1 to swap the touch axes
  *   N72_GPU        set to 0 to draw with the CPU only (default: MBX GPU
- *                  through /dev/mbx when present)
+ *                  through its DRM render node when present)
  *   N72_SLEEP      set to 0 for Power to only blank the screen instead of
  *                  suspending the system
  *   N72_IDLE_SLEEP seconds without input before sleeping (default 120, 0

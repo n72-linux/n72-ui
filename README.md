@@ -57,7 +57,8 @@ A touch launcher for Linux on the iPod touch 2G (N72AP), built on
 
 ## GPU
 
-When `/dev/mbx` exists (the PowerVR MBX Lite driver in the n72 kernel), n72-ui
+When the MBX render node exists (`/dev/dri/renderD*`, the PowerVR MBX Lite driver
+`apple-mbx` in the n72 kernel), n72-ui
 draws through the GPU's 2D engine (`mbx_gpu.c`):
 
 - every LVGL draw buffer comes from one GPU-mapped, CPU-cached pool;
@@ -113,7 +114,7 @@ line to skip it.
 | `N72_TOUCH` / `N72_KEYS` | Event devices (default: found by name) |
 | `N72_TOUCH_CAL` | `min_x min_y max_x max_y` raw touch range; swap a pair to flip an axis |
 | `N72_TOUCH_SWAP` | `1` swaps the touch axes |
-| `N72_GPU` | `0` draws with the CPU only (default: GPU when `/dev/mbx` exists) |
+| `N72_GPU` | `0` draws with the CPU only (default: GPU when the MBX render node exists) |
 | `N72_LATENCY` | `1` logs touch-to-screen latency every 2 s (stderr) |
 | `N72_FPS` | `1` logs frame bursts and animation phases (see above) |
 | `N72_TRACE` | With `N72_FPS=1`: logs what the main loop did before each late frame (see above) |

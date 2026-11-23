@@ -1,10 +1,12 @@
 #define _GNU_SOURCE	/* pipe2 */
 // SPDX-License-Identifier: MIT
 /*
- * LVGL on the iPod touch 2G's PowerVR MBX Lite (2D engine, /dev/mbx).
+ * LVGL on the iPod touch 2G's PowerVR MBX Lite (2D engine; the apple-mbx
+ * DRM render node).
  *
  * - All LVGL draw buffers come from one GPU-mapped, CPU-cached pool, so the
- *   GPU can target any of them; cache maintenance goes through MBX_IOC_SYNC.
+ *   GPU can target any of them; cache maintenance goes through GEM_SYNC
+ *   (mbx_clean/mbx_flush).
  * - A draw unit takes plain fills (no radius, no gradient): opaque ones on
  *   the 2D engine, translucent ones blended by the 3D core; and layer
  *   composites (opacity layers) as 3D textured copies, blended per pixel.
@@ -22,7 +24,7 @@
 #include <unistd.h>
 
 #include <linux/apple-mbx.h>
-#include "../n72-gles/src/mbxmem.h"	/* the MBX device: render node or /dev/mbx */
+#include "../n72-gles/src/mbxmem.h"	/* the MBX device: the render node */
 
 #include "lvgl/lvgl.h"
 #include "lvgl/src/lvgl_private.h"
@@ -167,7 +169,7 @@ static void sync_range(const void *p, uint32_t size, uint32_t op)
 }
 
 /*
- * Jobs run synchronously (the kernel's default, no MBX_IOC_SET_ASYNC); a
+ * Jobs run synchronously (the kernel's default, no mbx_set_async); a
  * job's ioctl may return its sequence number, which is success.
  */
 static int gpu_ret(int ret)
@@ -1004,7 +1006,7 @@ static int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer)
 
 /*
  * Two ways to the screen:
- *  - page flipping (kernel MBX_IOC_FLIP): LVGL draws straight into two
+ *  - page flipping (through KMS, n72-clcd): LVGL draws straight into the
  *    scan-out buffers in turn; each frame is shown by switching the display
  *    controller to it at the next vertical blank. No copy, no tearing, and
  *    frames are paced by the display's 60 Hz.
@@ -1096,7 +1098,7 @@ static void clean_rows(uint8_t *buf, const lv_area_t *a)
  * changed since the buffer was last drawn (minus what this frame redraws
  * anyway). The flip thread runs at real-time priority: it writes a ready
  * frame's address at once and then waits for the blank in which the
- * controller takes it (kernel MBX_IOC_FLIP); only then is the old front
+ * controller takes it (the KMS flip's event); only then is the old front
  * buffer free.
  */
 static pthread_t flip_thread;
@@ -1157,7 +1159,6 @@ static void *flip_main(void *arg)
 	pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
 	pthread_mutex_lock(&flip_mx);
 	for (;;) {
-		struct mbx_flip f = { 0 }, w = { .handle = MBX_FLIP_NONE, .flags = MBX_FLIP_VSYNC };
 		double t0;
 		int r;
 
@@ -1174,15 +1175,9 @@ static void *flip_main(void *arg)
 				;
 		}
 		t0 = gpu_now_us();
-		bool shown = true;
+		/* flipping implies KMS (flip_setup): waits for the flip's own event */
+		bool shown = kms_flip(r);
 
-		if (kms_fd >= 0) {
-			shown = kms_flip(r);	/* waits for the flip's own event */
-		} else {
-			f.handle = scan_handle[r];
-			mbx_flip(mbx, &f);	/* address now ... */
-			mbx_flip(mbx, &w);	/* ... taken at this blank */
-		}
 		pthread_mutex_lock(&flip_mx);
 		mbx_gpu_stats.flip_us += gpu_now_us() - t0;
 		if (shown)		/* (a flip refused: the old front is still on screen) */
@@ -1423,13 +1418,13 @@ static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
 	return b.cpu;
 }
 
-/* Page flipping: two contiguous scan-out buffers, if the kernel can flip. */
+/* Page flipping: contiguous scan-out buffers, if the display has KMS. */
 /*
  * KMS (kms_open() below): the scan-out buffers are exported from
  * the MBX driver as dma-bufs, imported as DRM framebuffers, and flipped
  * with DRM_IOCTL_MODE_PAGE_FLIP; the flip's event comes at the vblank that
  * shows it. When n72-ui exits, DRM gives the screen back to the console.
- * Without KMS the MBX driver's own flip is used.
+ * Without KMS there is no flipping: copy to the framebuffer.
  */
 static uint32_t kms_fb[NSCAN], kms_crtc;
 static uint32_t kms_handle[NSCAN];	/* the scan buffers' GEM handles on kms_fd */
@@ -1823,12 +1818,10 @@ fail:
 
 static bool flip_setup(uint32_t size)
 {
-	struct mbx_flip f = { .handle = MBX_FLIP_NONE };
-	bool kms;
 	int i;
 
-	/* the render node flips through KMS only; /dev/mbx can also flip itself */
-	if (getenv("N72_NOFLIP") || (!mbx_is_drm(mbx) && mbx_flip(mbx, &f)))
+	/* the render node flips through KMS only (kms_setup below) */
+	if (getenv("N72_NOFLIP"))
 		return false;
 	for (i = 0; i < NSCAN; i++) {
 		scan[i] = region_add(size, MBX_ALLOC_CACHED | MBX_ALLOC_CONTIG, &scan_handle[i]);
@@ -1870,15 +1863,9 @@ static bool flip_setup(uint32_t size)
 			submit(w, put_copy(w, gpu_addr(scan[0]), fb.stride, fb.gpu_addr, fb.stride,
 					   0, 0, 0, 0, fb.width, fb.height));
 	}
-	kms = kms_setup();
-	if (!kms && mbx_is_drm(mbx)) {
+	if (!kms_setup()) {
 		fprintf(stderr, "n72-ui: no KMS for the render node: copying to the framebuffer\n");
 		return false;
-	}
-	if (!kms) {
-		f.handle = scan_handle[0];
-		f.flags = MBX_FLIP_VSYNC;
-		mbx_flip(mbx, &f);
 	}
 	st_front = st_latest = 0;		/* frame 0: what was on the screen */
 	buf_frame[0] = 0;
@@ -1893,7 +1880,7 @@ lv_display_t *mbx_gpu_display_create(void)
 	lv_display_t *disp;
 	uint32_t size;
 
-	mbx = mbx_open();		/* the render node, else /dev/mbx */
+	mbx = mbx_open();		/* the render node */
 	if (mbx < 0)
 		return NULL;
 	if (mbx_fb_info(mbx, &fb) || mbx_alloc(mbx, POOL_SIZE, MBX_ALLOC_CACHED, &a))
@@ -1936,7 +1923,7 @@ lv_display_t *mbx_gpu_display_create(void)
 	lv_display_add_event_cb(disp, refr_start_cb, LV_EVENT_REFR_START, NULL);
 	fprintf(stderr, "n72-ui: %s; MBX GPU (%s):", kms_fd < 0 ? "no KMS" :
 		kms_shell ? "KMS (n72-clcd-shell, layer 1)" : "KMS (n72-clcd)",
-		mbx_is_drm(mbx) ? "DRM render node" : "/dev/mbx");
+		"DRM render node");
 	fprintf(stderr, "  framebuffer at GPU %08x, %u KiB draw pool at %08x, sync jobs, %s\n",
 	       fb.gpu_addr, POOL_SIZE / 1024, pool_gpu,
 	       flipping ? "page flipping at vblank" : "copy to the framebuffer");
