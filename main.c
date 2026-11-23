@@ -2573,10 +2573,10 @@ int main(int argc, char **argv)
 		lat_on = getenv("N72_LATENCY") && *getenv("N72_LATENCY") == '1';
 		fps_on = getenv("N72_FPS") && *getenv("N72_FPS") == '1';
 		n72_trace_on = fps_on && getenv("N72_TRACE") != NULL;
-		/* the logs that print the GPU's timings (N72_FPS in any spelling:
-		 * mbx_gpu.c's own two lines ask only whether it is set) */
-		mbx_gpu_timing = lat_on || getenv("N72_FPS") != NULL;
 	}
+	/* the logs that print the GPU's timings (N72_FPS in any spelling:
+	 * mbx_gpu.c's own two lines ask only whether it is set, touch or not) */
+	mbx_gpu_timing = lat_on || getenv("N72_FPS") != NULL;
 
 	if (!keys)
 		keys = find_input("gpio-keys");

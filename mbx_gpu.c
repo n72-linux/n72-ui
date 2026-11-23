@@ -161,8 +161,9 @@ static inline double stat_t0(void)
 	return mbx_gpu_timing ? gpu_now_us() : 0;
 }
 
+/* (t0 is 0 when the flag came on between the two readings: nothing to add) */
 #define STAT_US(field, t0) \
-	do { if (mbx_gpu_timing) mbx_gpu_stats.field += gpu_now_us() - (t0); } while (0)
+	do { if (mbx_gpu_timing && (t0) != 0) mbx_gpu_stats.field += gpu_now_us() - (t0); } while (0)
 
 static void sync_range(const void *p, uint32_t size, uint32_t op)
 {

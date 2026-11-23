@@ -11,6 +11,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 UI=$(cd "$(dirname "$0")" && pwd)
 # GLES=dir: another n72-gles checkout (its build/libGLESv1_CM.a and include/)
 GLES=${GLES:-$ROOT/n72-gles}
+GLES=$(cd "$GLES" && pwd)	# (the build changes directory further down: no relative paths)
 LVGL="$ROOT/lvgl-src/lvgl"
 OUT="$ROOT/$(basename "$UI")-build"
 CROSS=${CROSS:-armv6-alpine-linux-musleabihf-}
@@ -26,6 +27,8 @@ GLESLIB=$GLES/build/libGLESv1_CM.a
 [ "$N72_CC" = clang ] && [ -f "$GLES/build-clang/libGLESv1_CM.a" ] && GLESLIB=$GLES/build-clang/libGLESv1_CM.a
 KHDR=${KHDR:-$ROOT/linux-build-mac/usr/include}
 [ -f "$KHDR/linux/types.h" ] || KHDR=$ROOT/linux-build-alpine/usr/include
+KHDR=$(cd "$KHDR" && pwd)
+[ -z "$PGO_RT" ] || case $PGO_RT in /*) ;; *) PGO_RT=$PWD/$PGO_RT ;; esac
 PG=
 # PROFILE=1: gprof build (n72-ui-build-prof/, not stripped; gmon.out on a clean exit, e.g. --bench)
 [ "$PROFILE" = 1 ] && { OUT="$OUT-prof"; PG=-pg; }
