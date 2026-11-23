@@ -94,8 +94,9 @@ for f in $SRCS; do
 		echo "$CC -c $f -o $o $CFLAGS"
 	fi
 done | tr '\n' '\0' | xargs -0 -n 1 -P "$(nproc 2>/dev/null || sysctl -n hw.ncpu)" sh -c	# (not -I{}: BSD xargs caps that at 255 bytes)
-$CC $CFLAGS -c "$UI/main.c" -o obj/main.o
-$CC $CFLAGS -c "$UI/mbx_gpu.c" -o obj/mbx_gpu.o
+# (the launcher's own sources warning-free under -Wall; LVGL's are not checked)
+$CC $CFLAGS -Wall -Wunused -c "$UI/main.c" -o obj/main.o
+$CC $CFLAGS -Wall -Wunused -c "$UI/mbx_gpu.c" -o obj/mbx_gpu.o
 # (with LTO the instrumentation and the profile go in at compile time; the
 # link only adds the runtime, or the layout by the profile)
 $CC $PG $LTO $OPT -static -Wl,--gc-sections $PGOL -o "$OUT/n72-ui" obj/main.o obj/mbx_gpu.o $OBJS $GLESLIB -lm -lpthread
