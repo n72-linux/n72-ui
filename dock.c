@@ -168,6 +168,7 @@ static void dock_apply(void)
 				break;
 			}
 		}
+#ifdef N72_DEBUG
 	if (getenv("N72_FPS")) {
 		fprintf(stderr, "dock: \"%s\" (%s), %d tiles:", conf.dock_set ? conf.dock : DOCK_DEFAULT,
 			conf.dock_set ? "ui.conf" : "default", dock_norder);
@@ -175,6 +176,7 @@ static void dock_apply(void)
 			fprintf(stderr, " [%s]", tile_name(dock_order[i]));
 		fprintf(stderr, "; docked %u\n", lv_obj_get_child_count(home_dock));
 	}
+#endif
 	dock_layout();
 	pg_layout();
 }
@@ -194,7 +196,7 @@ static void dock_save(void)
 }
 
 /* The dock and its icons, on a home being built (after its tiles). */
-static void dock_build(void)
+void dock_build(void)
 {
 	lv_obj_t *d = home_dock = lv_obj_create(home_scr);
 	int side = dock_side();
@@ -686,7 +688,7 @@ static bool dock_carry_touch(int phase, int x, int y)
 }
 
 /* (home rebuilt, the screen off, an application: put it down where it is) */
-static void dock_carry_stop(void)
+void dock_carry_stop(void)
 {
 	if (carry.on)
 		carry_end(true);

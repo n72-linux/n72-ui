@@ -27,7 +27,7 @@ A touch launcher for Linux on the iPod touch 2G (N72AP), built on
 | Lock screen swipe up (home or over an application) | the lock screen's picture follows the finger, a scrim fades | ~63 |
 
 - The card moves like a spring, not along a timed curve (`za_path_spring`,
-  `za_path_glide` in `ui_m3.c`). Opening: critically damped, 380 ms, from
+  `za_path_glide` in `ui_home.c`). Opening: critically damped, 380 ms, from
   rest, fastest after ~55 ms, 90 % of the way by ~210 ms, then a soft
   landing; the symbol dissolves on the way, the corners (20 px at the icon,
   26 px half way) square off towards the screen's, and the card clears in
@@ -69,7 +69,7 @@ draw unit, `mbx_kms.c` the display and KMS):
 - the display renders into a full-screen pool buffer and the GPU copies the
   refreshed areas to the framebuffer.
 
-`n72-ui --bench` times full-screen redraws; `N72_GPU=0` forces the CPU path.
+`N72_DEBUG=1` builds include `--bench` and GPU/frame timing stats (`N72_GPU=0` forces the CPU path under debug builds).
 
 Translucent plain fills are blended by the GPU's 3D core, and opacity layers
 (`opa_layered`) are composited by it as textured copies (exact two-pass
@@ -93,12 +93,13 @@ at 4.5 MHz, ~0.2 ms per frame) touch reports arrive at ~60 Hz instead of ~42.
 
 LVGL goes in `../lvgl-src/lvgl`: v9.2.2 with our patches on top (the working
 tree's is v9.2.2 plus seven commits marked `(n72)`). The GPU part links
-`../n72-gles` (`build/libGLESv1_CM.a`; `build-clang/` for clang). From the workspace root, on the Mac (the cross gcc of
+`../n72-gles` (`build/libn72mbxmem.a`; `build-clang/` for clang). From the workspace root, on the Mac (the cross gcc of
 `n72-alpine/toolchain`, GCC 16.2, see its README, into `../n72-ui-build/`;
 `N72_CC=clang` for clang, the build `pgo/n72ui.profdata` applies to, into
 `../n72-ui-build-clang/`):
 
     sh n72-ui/build.sh
+    N72_DEBUG=1 sh n72-ui/build.sh   # with --bench and timing diagnostics
 
 The static binary is `n72-ui` in that folder (`n72-ui.debug` beside it is the
 unstripped copy). `n72-alpine/build.sh` packs it as the `n72-ui` package
@@ -115,10 +116,10 @@ line to skip it.
 | `N72_TOUCH` / `N72_KEYS` | Event devices (default: found by name) |
 | `N72_TOUCH_CAL` | `min_x min_y max_x max_y` raw touch range; swap a pair to flip an axis |
 | `N72_TOUCH_SWAP` | `1` swaps the touch axes |
-| `N72_GPU` | `0` draws with the CPU only (default: GPU when the MBX render node exists) |
-| `N72_LATENCY` | `1` logs touch-to-screen latency every 2 s (stderr) |
-| `N72_FPS` | `1` logs frame bursts and animation phases (see above) |
-| `N72_TRACE` | With `N72_FPS=1`: logs what the main loop did before each late frame (see above) |
+| `N72_GPU` | With `N72_DEBUG=1`: `0` draws with the CPU only (default: GPU when MBX render node exists) |
+| `N72_LATENCY` | With `N72_DEBUG=1`: `1` logs touch-to-screen latency every 2 s (stderr) |
+| `N72_FPS` | With `N72_DEBUG=1`: logs frame bursts and animation phases |
+| `N72_TRACE` | With `N72_DEBUG=1` + `N72_FPS=1`: logs main-loop marks before late frames |
 | `N72_FADE` | `0`: no backlight fades |
 | `N72_IDLE_SLEEP` | Seconds without input before the screen goes off or the system sleeps (`0`: never); overrides the setting |
 | `N72_APPS_DIR` | Folder of tile manifests (default `/usr/share/n72-ui/apps`; test hook) |
@@ -129,15 +130,14 @@ line to skip it.
 | `N72_SLEEP` | `freeze`: never deep sleep; `0`: no system sleep (the screen only blanks) |
 | `N72_TOUCH_RAW` | Touch frames as the panel gives them (no holding of a lifting finger) (debug) |
 | `N72_ROT` | `90` or `270`: start turned (test hook) |
-| `N72_DRAGS` | `wait:x0,y0,x1,y1,ms ...` replays drags through a virtual pointer (test hook) |
-| `N72_BENCH_SHOT` | With `--bench`: leaves the last frame up 2 s for a screenshot (test hook) |
-| `N72_FRAMES` | Logs every frame: time, interval, render time (debug) |
+| `N72_DRAGS` | With `N72_DEBUG=1`: `wait:x0,y0,x1,y1,ms ...` replays drags through a virtual pointer |
+| `N72_BENCH_SHOT` | With `N72_DEBUG=1` + `--bench`: leaves the last frame up 2 s for a screenshot |
+| `N72_FRAMES` | With `N72_DEBUG=1`: logs every frame (time, interval, render time) |
 | `N72_WAKE_LOG` | Logs the wake sources after each deep sleep (debug) |
-| `N72_LAYER0` | Draws on the display's layer 0 (n72-clcd), not the shell layer; n72-browser sets it |
-| `N72_NOFLIP` | No page flipping: one draw buffer copied to the framebuffer (debug) |
-| `N72_NO_TRIM` | Large background fills are not held back and trimmed (debug) |
-| `N72_GPU_ADBG` | Logs every task the GPU draws (debug) |
-| `N72_ALPHACHECK` | Reports non-opaque pixels in opaque frames (debug) |
+| `N72_NOFLIP` | With `N72_DEBUG=1`: single draw buffer copied to the framebuffer |
+| `N72_NO_TRIM` | With `N72_DEBUG=1`: disables look-ahead background fill trimming |
+| `N72_GPU_ADBG` | With `N72_DEBUG=1`: logs every task the GPU draws |
+| `N72_ALPHACHECK` | With `N72_DEBUG=1`: reports non-opaque pixels in opaque frames |
 | `N72_KMS_HANDOFF` | Internal: set by n72-ui for the n72-ui it execs (theme change) to take over the display |
 | `TZ` | Clock time zone (the OpenRC service sets it from `/etc/TZ`) |
 

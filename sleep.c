@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 /* The launcher's system sleep: s2idle, deep sleep, the idle timer, wake-up bookkeeping. */
-#include "main_priv.h"
+#include "ui_m3_priv.h"
 
 /* ---------------------------------------------------------------- sleep */
 
@@ -118,9 +118,8 @@ static void wake_marks(struct wake_marks *m)
 	}
 	/*
 	 * An alarm whose time has passed still reads as set. Taken for
-	 * somebody else's, it kept the system out of deep sleep for good (no
-	 * alarm of our own is set while another is: 2026-11-20, one left by a
-	 * test). It will not ring again: none.
+	 * somebody else's, a stale test alarm would keep the system out of
+	 * deep sleep for good. A past alarm will not ring again: clear it.
 	 */
 	if (m->alarm && m->alarm < time(NULL))
 		m->alarm = 0;
@@ -198,13 +197,12 @@ static bool woke_for_screen(const struct wake_marks *before)
 /*
  * After a suspend to RAM the SoC was off: Power or Home wakes the PMU in
  * hardware, the boot loader brings Linux back, and the SoC's own button
- * interrupts never see that press (2026-11-20: the screen stayed dark until
- * a second press, inside the dark linger). The PMU leaves no event for it
+ * interrupts never see that press. The PMU leaves no event for it
  * either. What else can end a deep sleep is known: the PMU's unmasked
- * events (the cable in or out, the headphone jack; read on the device:
- * masks f7 bf bb), and an alarm (ours is cleared before a deep sleep). So
- * a deep wake with the cable and the jack as they were and no alarm due
- * was a button. (Wi-Fi is off in deep sleep; its host wake is masked.)
+ * events (the cable in or out, the headphone jack; live masks f7 bf bb),
+ * and an alarm (ours is cleared before a deep sleep). So a deep wake with
+ * the cable and the jack as they were and no alarm due was a button.
+ * (Wi-Fi is off in deep sleep; its host wake is masked.)
  */
 static bool deep_woke_by_button(const struct wake_marks *before)
 {
@@ -374,8 +372,8 @@ static bool deep_allowed(void)
  * attempt costs seconds of the CPU and the radio each time) is not tried
  * again at once: the next one waits 3 min, then twice as long after each
  * further refusal, up to 30 min, meanwhile suspend to idle. A deep sleep
- * that works starts over. (Before, a refusing kernel was asked again
- * every ~9 s all night: #57 on 2026-11-16, hci's resume timing out.)
+ * that works starts over (avoiding repeated ~9 s wake loops when a driver
+ * like hci resume times out).
  */
 
 /* One suspend to RAM: "mem" as deep for this sleep, s2idle again after. */
@@ -452,9 +450,8 @@ bool system_sleep(void)
 			 * Given up at once because a wakeup event came while the
 			 * tasks were being frozen (EBUSY: "Freezing user space
 			 * processes aborted"): not a refusal, the sleep is wanted
-			 * still. Before, n72-ui stayed up with the screen dark for
-			 * good (2026-11-20). Served in the dark like any other
-			 * wake, and tried again; a run of them ends it.
+			 * still. Service the wake in the dark like any other wake,
+			 * then try again; a run of EBUSY results ends it.
 			 */
 			if (!ok && sleep_errno == EBUSY && ++busy_tries <= 10) {
 				woke_us = mono_us();
@@ -504,12 +501,11 @@ bool system_sleep(void)
  * Is the Bluetooth output playing? bluealsa has no kernel sound card, so
  * the cards' status says nothing about it: while n72-audio-route names a
  * Bluetooth output (/run/n72-audio: pcm=), bluealsa is asked whether that
- * PCM is running (bluealsa-cli info: "Running: true"). Without this a
- * screen turned off during music into earbuds on battery put the system
- * to sleep, and the kernel's Bluetooth suspend dropped the earbuds' link
- * (2026-11-20, found by the Hardware gaps session from the logs). Only
- * asked while such a route exists: a few times at a screen-off and every
- * 2 s while the screen is off for sound (playback_check).
+ * PCM is running (bluealsa-cli info: "Running: true"). Without this, a
+ * screen turned off during music into earbuds on battery puts the system
+ * to sleep and Bluetooth suspend drops the link. Only queried while such
+ * a route exists: a few times at a screen-off and every 2 s while the
+ * screen is off for sound (playback_check).
  */
 static bool bt_audio_playing(void)
 {

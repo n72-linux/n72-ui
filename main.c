@@ -25,19 +25,20 @@
  */
 #include "main_priv.h"
 #include "lvgl/src/misc/lv_anim_private.h"	/* (ios_motion.h reads act_time) */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
 #include "ios_motion.h"
+#pragma GCC diagnostic pop
 
 /* the screen as the UI lays it out: 320 x 480, or 480 x 320 turned */
-static int32_t ui_w = 320, ui_h = 480;
-#define W ui_w
-#define H ui_h
+int32_t ui_w = 320, ui_h = 480;
 
-static char *self_argv[4];
-static lv_obj_t *home_scr;
+char *self_argv[4];
+lv_obj_t *home_scr;
 int keys_fd = -1;
 static int touch_wait_fd = -1;
 static lv_timer_t *refr_timer;		/* LVGL's display refresh */		/* own handle on the touch device, for poll() */
-static lv_indev_t *touch_indev;
+lv_indev_t *touch_indev;
 
 /* Touch-to-screen latency (N72_LATENCY=1): newest touch event -> flush end. */
 static bool lat_on;
@@ -47,7 +48,6 @@ static unsigned int lat_n;
 static uint32_t lat_report_ms;
 
 static uint32_t tick_ms(void);
-void n72_trace(const char *what, long v);
 
 uint64_t mono_us(void)
 {
@@ -327,7 +327,7 @@ void n72_frame_shown(void)
 		lat_report_ms = tick_ms();
 	}
 }
-static int tty_fd = -1;
+int tty_fd = -1;
 static int notify_fd = -1;		/* flip thread: a frame went to the display */
 static bool render_pending;
 
@@ -441,7 +441,7 @@ static void backlight_raw(int raw)
 	write_int(p, LV_CLAMP(1, raw, bl_max));
 }
 
-static int backlight_get(void)
+int backlight_get(void)
 {
 	char p[160];
 
@@ -459,7 +459,7 @@ static int bl_user_raw(void)
 	return (backlight_get() * bl_max + 50) / 100;
 }
 
-static void backlight_set(int pct)
+void backlight_set(int pct)
 {
 	if (!bl_dir[0])
 		return;
@@ -540,14 +540,14 @@ static void backlight_power(bool on)
 #define PANEL_POWER	"/sys/devices/platform/soc/38900000.lcd/panel_power"
 
 void drain(int fd);
-static void home_wake(void);
+void home_wake(void);
 void screen_off_or_sleep(void);
 /* the touch device's "inhibited" (sysfs): the driver stops the controller */
 static char touch_inhibit[96];
-static char rt_node[64];	/* the touch router's virtual device, for applications */
+char rt_node[64];	/* the touch router's virtual device, for applications */
 static void rt_reset(void);
 
-static void ui_lock(void);
+void ui_lock(void);
 
 /*
  * Timers that only matter while the screen is lit (the clock, the shade's
@@ -558,7 +558,7 @@ static void ui_lock(void);
 static lv_timer_t *awake_t[NAWAKE];
 static int nawake;
 
-static lv_timer_t *awake_timer(lv_timer_cb_t cb, uint32_t ms, void *ud)
+lv_timer_t *awake_timer(lv_timer_cb_t cb, uint32_t ms, void *ud)
 {
 	lv_timer_t *t = lv_timer_create(cb, ms, ud);
 
@@ -575,7 +575,7 @@ static lv_timer_t *awake_timer(lv_timer_cb_t cb, uint32_t ms, void *ud)
  * memory (the home screen's timers, after every turn or theme change),
  * while the list filled up and later timers ran in the dark.
  */
-static void awake_timer_delete(lv_timer_t *t)
+void awake_timer_delete(lv_timer_t *t)
 {
 	for (int i = 0; i < nawake; i++)
 		if (awake_t[i] == t) {
@@ -597,8 +597,8 @@ static void awake_set(bool on)
 	}
 }
 
-static void rot_motion_off(void);
-static void wp_apply_kick(void);
+void rot_motion_off(void);
+void wp_apply_kick(void);
 
 void screen_set(bool on)
 {
@@ -646,12 +646,11 @@ void screen_set(bool on)
  * timers that look (the headphone jack, a file in /run changing, BlueZ's
  * D-Bus signals). Each has a callback, run when it is readable.
  */
-#define NWATCH 32	/* (background commands take two each: ui_m3.c job_watch) */
 static struct { int fd; short events; void (*cb)(int fd); } watch[NWATCH];
-static int nwatch;
+int nwatch;
 
 /* (events: POLLIN, or POLLPRI for a sysfs attribute the kernel notifies) */
-static void ui_watch_ev(int fd, void (*cb)(int fd), short events)
+void ui_watch_ev(int fd, void (*cb)(int fd), short events)
 {
 	int i;
 
@@ -676,9 +675,9 @@ void ui_watch(int fd, void (*cb)(int fd))
 
 lv_timer_t *idle_timer;
 void idle_kick(void);
-static void rot_kick(void);
+void rot_kick(void);
 
-static void ui_unwatch(int fd)
+void ui_unwatch(int fd)
 {
 	int i;
 
@@ -689,7 +688,7 @@ static void ui_unwatch(int fd)
 		}
 }
 
-#include "ui_m3.c"
+#include "ui_m3_priv.h"
 
 /*
  * The touch router. With an application running, the touch screen serves
@@ -947,7 +946,7 @@ static lv_point_t rt_map(int x, int y)
 }
 
 /* A panel point where LVGL sees it (its rotation, as lv_indev turns it). */
-static lv_point_t rt_logical(lv_point_t p)
+lv_point_t rt_logical(lv_point_t p)
 {
 	lv_display_t *d = lv_display_get_default();
 	lv_point_t l = p;

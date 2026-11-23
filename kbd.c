@@ -109,34 +109,8 @@ static const struct kbd_key kbd_tb_ui[] = {
 };
 static const struct kbd_key kbd_tb_hide = { LV_SYMBOL_DOWN, NULL, KK_HIDE, 0, 0, 0 };
 
-#define KBD_NKEYS	48
 
-static struct {
-	lv_obj_t *obj;
-	bool shown;		/* up, or on its way up */
-	lv_obj_t *ta;		/* the launcher's field it types into, or NULL: the application */
-	void (*vis_cb)(bool shown, int32_t h);	/* the field's page: it came or went */
-	int page;
-	int shift;		/* 0 off, 1 the next letter, 2 locked */
-	uint32_t shift_t;	/* when Shift went on (a second tap soon locks) */
-	bool ctrl;		/* the next key with Ctrl */
-
-	/* geometry, relative to the object (rebuilt by kbd_layout) */
-	int32_t w, h, gap, key_h, tb_h, pad;
-	int nkeys;
-	struct { lv_area_t a; const struct kbd_key *k; } keys[KBD_NKEYS];
-
-	/* the touch */
-	int down;		/* the key under the finger, or -1 */
-	bool held;		/* held long: its hint (digit) */
-	bool cursor;		/* dragging the space bar: the cursor moves */
-	int32_t px, last_x;
-	lv_timer_t *rep, *hold;
-
-	/* applications */
-	int ui_fd;		/* the uinput keyboard */
-	int fifo_fd, fifo_wr;	/* /run/n72-kbd (and our own writer: no EOF) */
-} kbd = { .down = -1, .ui_fd = -1, .fifo_fd = -1, .fifo_wr = -1 };
+struct kbd kbd = { .down = -1, .ui_fd = -1, .fifo_fd = -1, .fifo_wr = -1 };
 
 
 /* ------------------------------------------------------------ output */
@@ -651,7 +625,7 @@ static void kbd_set_page(int page)
 	lv_obj_invalidate(kbd.obj);
 }
 
-static void kbd_hide(void);
+void kbd_hide(void);
 
 /* A key's work when the finger lifts on it. */
 static void kbd_commit(int i)
@@ -841,7 +815,7 @@ static void kbd_build(void)
  * Up (iOS: 300 ms, ease-in-out, as a picture: psl_start), for a field (@vis_cb: its
  * page, told) or for the application (@ta NULL).
  */
-static void kbd_show_for(lv_obj_t *ta, void (*vis_cb)(bool shown, int32_t h))
+void kbd_show_for(lv_obj_t *ta, void (*vis_cb)(bool shown, int32_t h))
 {
 	lv_anim_t a;
 
@@ -887,7 +861,7 @@ static void kbd_show_for(lv_obj_t *ta, void (*vis_cb)(bool shown, int32_t h))
 }
 
 /* Down (the same slide), and hidden. @anim false: at once. */
-static void kbd_hide_now(bool anim)
+void kbd_hide_now(bool anim)
 {
 	lv_anim_t a;
 	lv_obj_t *ta = kbd.ta;
@@ -925,7 +899,7 @@ static void kbd_hide_now(bool anim)
 	kbd_state_write();
 }
 
-static void kbd_hide(void)
+void kbd_hide(void)
 {
 	kbd_hide_now(true);
 }
@@ -958,7 +932,7 @@ static void kbd_ta_clicked(lv_event_t *e)
  * comes and goes, with its height, so the page can make room. Enter is
  * the field's LV_EVENT_READY; the keyboard's Hide, LV_EVENT_CANCEL.
  */
-static void kbd_attach(lv_obj_t *ta, void (*vis_cb)(bool shown, int32_t h), bool show)
+void kbd_attach(lv_obj_t *ta, void (*vis_cb)(bool shown, int32_t h), bool show)
 {
 	lv_obj_add_event_cb(ta, kbd_ta_clicked, LV_EVENT_CLICKED, (void *)vis_cb);
 	lv_obj_add_event_cb(ta, kbd_ta_deleted, LV_EVENT_DELETE, NULL);
@@ -975,7 +949,7 @@ static void kbd_show_app(void)
 }
 
 /* The app bar's keyboard button. */
-static void kbd_toggle_app(void)
+void kbd_toggle_app(void)
 {
 	if (kbd.shown && !kbd.ta)
 		kbd_hide();
@@ -1006,7 +980,7 @@ static void kbd_fifo_ev(int fd)
 	}
 }
 
-static void kbd_init(void)
+void kbd_init(void)
 {
 	unlink(KBD_FIFO);
 	if (mkfifo(KBD_FIFO, 0666) == 0)
@@ -1037,14 +1011,14 @@ static void kbd_init(void)
 }
 
 /* The application is gone, the screen locked: no keyboard for it. */
-static void kbd_app_gone(void)
+void kbd_app_gone(void)
 {
 	if (kbd.shown && !kbd.ta)
 		kbd_hide_now(false);
 }
 
 /* The screen turned: the keyboard at the new size, up if it was. */
-static void kbd_turned(void)
+void kbd_turned(void)
 {
 	lv_obj_t *ta = kbd.ta;
 	void (*cb)(bool, int32_t) = kbd.vis_cb;

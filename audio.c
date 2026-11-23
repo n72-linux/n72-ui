@@ -22,8 +22,8 @@
 
 static int snd_fd = -1;
 int jack_fd = -1;
-static bool jack_in;		/* earphones plugged */
-static bool snd_present;
+bool jack_in;		/* earphones plugged */
+bool snd_present;
 
 static bool snd_open(void)
 {
@@ -99,7 +99,7 @@ static bool snd_ctl_set(const char *name, long v)
 }
 
 /* 0..100 % -> mute at 0, else -60..0 dB in 1 dB steps */
-static void snd_apply_volume(int pct)
+void snd_apply_volume(int pct)
 {
 	if (!snd_present)
 		return;
@@ -111,7 +111,7 @@ static void snd_apply_volume(int pct)
 	snd_ctl_set(MUTE_CTL, 1);
 }
 
-static void snd_apply_output(bool speaker_when_unplugged)
+void snd_apply_output(bool speaker_when_unplugged)
 {
 	if (!snd_present)
 		return;
@@ -128,7 +128,7 @@ static bool jack_read_state(void)
 }
 
 /* true when the plug state changed */
-static bool jack_poll(void)
+bool jack_poll(void)
 {
 	struct input_event ev;
 	bool was = jack_in;
@@ -143,7 +143,7 @@ static bool jack_poll(void)
 
 static const char *find_input(const char *name);
 
-static void snd_init(int vol_pct, bool speaker_when_unplugged)
+void snd_init(int vol_pct, bool speaker_when_unplugged)
 {
 	const char *jack = find_input("Headphones");
 

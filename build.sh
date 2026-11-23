@@ -103,15 +103,15 @@ done | tr '\n' '\0' | xargs -0 -n 1 -P "$(nproc 2>/dev/null || sysctl -n hw.ncpu
 # (the launcher's own sources warning-free under -Wall; LVGL's are not checked.
 # snprintf cutting a long name short is meant: gcc reports it only without LTO)
 WARN="-Wall -Wunused"; [ "$KIND" = gcc ] && WARN="$WARN -Wno-format-truncation"
-$CC $CFLAGS $WARN -c "$UI/main.c" -o obj/main.o
-$CC $CFLAGS $WARN -c "$UI/mbx_gpu.c" -o obj/mbx_gpu.o
-$CC $CFLAGS $WARN -c "$UI/mbx_draw.c" -o obj/mbx_draw.o
-$CC $CFLAGS $WARN -c "$UI/mbx_kms.c" -o obj/mbx_kms.o
-$CC $CFLAGS $WARN -c "$UI/sleep.c" -o obj/sleep.o
-$CC $CFLAGS $WARN -c "$UI/bench.c" -o obj/bench.o
+# the launcher's own sources (audio.c, kbd.c, weather.c ... are #included by these)
+UISRCS="main sleep bench mbx_gpu mbx_draw mbx_kms ui_m3 ui_nav ui_sys ui_home ui_files ui_wifi ui_bt ui_settings ui_logs ui_paint ui_turn ui_video"
+for s in $UISRCS; do
+	$CC $CFLAGS $WARN -c "$UI/$s.c" -o obj/$s.o
+done
+UIOBJS=$(for s in $UISRCS; do echo obj/$s.o; done)
 # (with LTO the instrumentation and the profile go in at compile time; the
 # link only adds the runtime, or the layout by the profile)
-$CC $PG $LTO $OPT -static -Wl,--gc-sections $PGOL -o "$OUT/n72-ui" obj/main.o obj/mbx_gpu.o obj/mbx_draw.o obj/mbx_kms.o obj/sleep.o obj/bench.o $OBJS $GLESLIB -lm -lpthread
+$CC $PG $LTO $OPT -static -Wl,--gc-sections $PGOL -o "$OUT/n72-ui" $UIOBJS $OBJS $GLESLIB -lm -lpthread
 cp "$OUT/n72-ui" "$OUT/n72-ui.debug"	# unstripped, for crash reports (addr2line)
 [ -n "$PG" ] || ${CROSS}strip "$OUT/n72-ui"
 ls -l "$OUT/n72-ui"

@@ -1,7 +1,5 @@
 /*
- * Home screen pages (included by ui_m3.c), moving as iOS 4.2.1's
- * SpringBoard pages do (UIScrollView with paging; constants and rules in
- * n72-ramboot/ui/IOS-PAGING.md part 1).
+ * Home screen pages (included by ui_m3.c), using paged scroll physics.
  *
  * Layout: the tiles sit in one strip (home_apps) as wide as all the pages,
  * at y 40 under the fixed status bar; page 0 holds the card and PG_ROWS0
@@ -33,26 +31,20 @@
  * image) at the new page.
  */
 
-#define PG_MAX		8
-#define PG_TOP		40		/* the strip starts under the status bar */
 #define PG_TILE_W	76
 #define PG_TILE_H	96
 #define PG_ROW_GAP	8
-#define PG_CARD_H	100
 #define PG_GRID0	112		/* page 0's grid, from the strip's top */
 #define PG_GRIDN	8		/* the other pages' */
-#define PG_DOTS_H	24		/* the dots' row at the bottom */
 #define PG_SLOP		10		/* UIPanGestureRecognizer hysteresis */
 #define PG_FLICK	0.3		/* px/ms: on one page */
 #define PG_STILL	0.25		/* px/ms: slower is let go from rest */
-#define PG_TIME_LEVELS	16
-#define PG_PAGES_MAX	PG_MAX
 
 enum { PG_MODE_LAYER0, PG_MODE_OPAQUE, PG_MODE_BLEND };
 
 static void dock_fly_stop(void);
-static void dock_carry_stop(void);
-static lv_obj_t *home_bar, *home_dots, *home_view;	/* home_view: the pages' window */
+void dock_carry_stop(void);
+lv_obj_t *home_bar, *home_dots, *home_view;	/* home_view: the pages' window */
 
 /*
  * The dock (dock.c) holds a side of the screen: the bottom upright, and
@@ -64,17 +56,14 @@ static lv_obj_t *home_bar, *home_dots, *home_view;	/* home_view: the pages' wind
 #define DOCK_M		8		/* from the screen's edge */
 #define DOCK_SPACE	(DOCK_T + DOCK_M + 4)
 enum { DOCK_BOTTOM, DOCK_LEFT, DOCK_RIGHT };
-static int home_px, home_pw, home_pb;
-#define PX	home_px
-#define PW	home_pw
-#define PB	home_pb
+int home_px, home_pw, home_pb;
 
 static int dock_side(void)
 {
 	return ui_rot == 90 ? DOCK_LEFT : ui_rot == 270 ? DOCK_RIGHT : DOCK_BOTTOM;
 }
 
-static void home_geom(void)
+void home_geom(void)
 {
 	int side = dock_side();
 
@@ -83,43 +72,7 @@ static void home_geom(void)
 	home_pb = side == DOCK_BOTTOM ? H - DOCK_SPACE : H;
 }
 
-static struct {
-	int n, cur;			/* pages, the one at rest */
-	int cols, rows0, rowsn;
-	/* touch */
-	bool cand, on, caught;
-	bool lost;			/* this touch is nobody's (the frames failed) */
-	int x0, y0;			/* where the finger came down */
-	int start_off, tx0;		/* offset and finger at take-over */
-	int last_x;
-	uint64_t last_us;
-	double s_prev, s_cur;		/* velocity samples, px/ms (content way) */
-	bool have_prev;
-	double vel, prev_vel;		/* per move: velocityInView / 1000 */
-	int dir;			/* the settle's way: +1 on, -1 back, 0 nearest */
-	/* settle */
-	bool settling;
-	struct ios_pager sp;
-	uint64_t step_us;
-	int target;			/* page */
-	/* frames */
-	int mode;
-	int off;			/* the strip's offset now, px */
-	int time_lv;			/* the time's picture showing */
-	lv_obj_t *scr, *view, *strip_img, *strip_img2, *bar_img, *bar_r_img, *time_img, *dots_img, *wp_img;
-	int strip_k;			/* the page strip_img shows; strip_img2 the next */
-	lv_draw_buf_t *page_pic[PG_PAGES_MAX], *dock_pic, *bar_pic, *bar_l, *bar_r, *dots_pic, *time_pic[PG_TIME_LEVELS + 1];
-	lv_area_t time_area;		/* the time's place in the bar */
-	unsigned long pic_ver;		/* home_ver they show */
-	unsigned long fail_ver;		/* (no memory for them at this home_ver) */
-	uint32_t fail_ms;
-	int pic_mode, pic_w, pic_dots;
-	bool fb0_ok;			/* /dev/fb0 holds the home wallpaper */
-	int fb0_w;
-	/* the tiles' pages (pg_layout): the page of each child of the strip */
-	signed char page_of[160];
-	bool new_page;			/* an empty page after the last: an icon carried there */
-} pg = { .n = 1, .pic_ver = ~0UL, .pic_dots = -1 };
+struct pg pg = { .n = 1, .pic_ver = ~0UL, .pic_dots = -1 };
 
 /*
  * A tile with this flag starts a page of its own (an icon carried past the
@@ -136,8 +89,9 @@ static int pg_page_of(int i)
 
 #include <linux/fb.h>
 
-static lv_point_t rt_logical(lv_point_t p);	/* (main.c) */
+lv_point_t rt_logical(lv_point_t p);	/* (main.c) */
 
+#ifdef N72_DEBUG
 /* (debug, N72_FRAMES) the pages' input and steps, beside main.c's frames */
 static bool pg_trace(void)
 {
@@ -147,7 +101,10 @@ static bool pg_trace(void)
 		t = getenv("N72_FRAMES") != NULL;
 	return t;
 }
-static lv_timer_t *pg_warm_timer;
+#else
+static inline bool pg_trace(void) { return false; }
+#endif
+lv_timer_t *pg_warm_timer;
 
 /* ------------------------------------------------------------- layout */
 
@@ -547,7 +504,7 @@ static bool pg_fb0_wallpaper(void)
 }
 
 /* (layer 0 was written by someone else: an application's start) */
-static void pg_fb0_dirty(void)
+void pg_fb0_dirty(void)
 {
 	pg.fb0_ok = false;
 }
@@ -922,7 +879,7 @@ static void pg_take(int x, int off)
  * A touch on home, from ui_drag(): phase 0 down, 1 move, 2 lift. True once
  * the touch is the pages' (the router then keeps it from LVGL).
  */
-static bool pg_drag(int phase, int x, int y)
+bool pg_drag(int phase, int x, int y)
 {
 	if (pg.lost) {		/* (to the lift, then free) */
 		if (phase == 2 || phase == 0)
@@ -1000,7 +957,7 @@ static bool pg_drag(int phase, int x, int y)
  * While home is still and lit: the pictures ready before a swipe needs
  * them (taking them is a few tens of ms) and the wallpaper on layer 0.
  */
-static void pg_warm(lv_timer_t *t)
+void pg_warm(lv_timer_t *t)
 {
 	LV_UNUSED(t);
 	if (screen_off || locked || pg.scr || lv_screen_active() != home_scr ||
@@ -1019,7 +976,7 @@ static void pg_warm(lv_timer_t *t)
 }
 
 /* Home is being built again (a turn, a theme): its pictures go with it. */
-static void pg_home_gone(void)
+void pg_home_gone(void)
 {
 	dock_carry_stop();	/* (a carried icon is put down first) */
 	dock_fly_stop();	/* (its picture flies over the old home) */
@@ -1044,7 +1001,7 @@ static void pg_home_gone(void)
 }
 
 /* A swipe cut short (Home, the screen off): home at the nearer page. */
-static void pg_abort(void)
+void pg_abort(void)
 {
 	if (!pg.scr)
 		return;

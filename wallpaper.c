@@ -444,7 +444,7 @@ static void wp_meta_write(void)
 }
 
 /* `n72-ui --wallpaper SRC home|lock|both|none-home|none-lock`; 0 when done */
-static int wp_convert_main(int argc, char **argv)
+int wp_convert_main(int argc, char **argv)
 {
 	struct wp_img im = { 0 };
 	const char *src = argc > 2 ? argv[2] : "", *what = argc > 3 ? argv[3] : "both";
@@ -585,7 +585,7 @@ static void wp_image_gone(lv_event_t *e)
 }
 
 /* @img shows @b: @b stays until @img is deleted. false: not kept (show nothing). */
-static bool wp_hold(lv_obj_t *img, lv_draw_buf_t *b)
+bool wp_hold(lv_obj_t *img, lv_draw_buf_t *b)
 {
 	int i = wp_hold_find(b);
 
@@ -618,7 +618,7 @@ static void wp_drop(int kind, int turned)
 }
 
 /* (Re)read what is set: at the start, and after a conversion. Frames on demand. */
-static void wp_load(void)
+void wp_load(void)
 {
 	int k, t;
 
@@ -645,7 +645,7 @@ static void wp_load(void)
  * The other shape's goes (freed once nothing shows it): a turn back reads
  * it again, ~600 KB.
  */
-static lv_draw_buf_t *wp_upright(int kind)
+lv_draw_buf_t *wp_upright(int kind)
 {
 	if (!wp.set[kind])
 		return NULL;
@@ -661,7 +661,7 @@ static lv_draw_buf_t *wp_upright(int kind)
  * 0 then holds the upright frame as it is under a turned home too, and a
  * conversion makes no turned frame.
  */
-static lv_draw_buf_t *wp_pic(int kind)
+lv_draw_buf_t *wp_pic(int kind)
 {
 	lv_draw_buf_t *u = wp_upright(kind);
 
@@ -679,7 +679,7 @@ static lv_draw_buf_t *wp_pic(int kind)
 }
 
 /* The wallpaper under everything on @scr (its first child); false: none set. */
-static bool wp_put(lv_obj_t *scr, int kind)
+bool wp_put(lv_obj_t *scr, int kind)
 {
 	lv_draw_buf_t *b = wp_pic(kind);
 	lv_obj_t *i;
@@ -706,7 +706,7 @@ static bool wp_put(lv_obj_t *scr, int kind)
 static lv_obj_t *wp_status_lbl;
 static char *wp_choice;		/* the picture picked, waiting for where */
 
-static void open_wallpaper(lv_event_t *e);
+void open_wallpaper(lv_event_t *e);
 
 /*
  * A conversion is over: the screens are built again with the new frames,
@@ -778,7 +778,7 @@ static void wp_apply_cb(lv_timer_t *t)
  * application closed): one try, a moment later, outside the caller.
  * Nothing runs in between: no timer looks while dark or locked.
  */
-static void wp_apply_kick(void)
+void wp_apply_kick(void)
 {
 	if (!wp_apply_due || wp_apply_t)
 		return;
@@ -910,7 +910,7 @@ static void wp_accent_cb(lv_event_t *e)
 	ui_restart("wallpaper");	/* (the palette is made at start) */
 }
 
-static void open_wallpaper(lv_event_t *e)
+void open_wallpaper(lv_event_t *e)
 {
 	nav_mark(open_wallpaper, NULL);
 	lv_obj_t *scr, *body, *c;

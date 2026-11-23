@@ -267,7 +267,7 @@ static void wx_show(void)
 }
 
 /* the right side of the home card */
-static void wx_card_build(lv_obj_t *card)
+void wx_card_build(lv_obj_t *card)
 {
 	wx.c_icon = lv_image_create(card);
 	lv_obj_align(wx.c_icon, LV_ALIGN_TOP_RIGHT, -16, 12);
@@ -374,8 +374,10 @@ static void wx_done(const char *out, void *ud)
 	if (!cur || !wx_num(cur, "temperature_2m", &t) || !wx_num(cur, "weather_code", &c) ||
 	    !wx_num(cur, "is_day", &d)) {
 		wx.fail_at = time(NULL);
+#ifdef N72_DEBUG
 		if (getenv("N72_FPS"))
 			fprintf(stderr, "weather: no forecast (%.60s)\n", out);
+#endif
 		return;
 	}
 	wx.temp = t;
@@ -419,7 +421,7 @@ static void wx_tick(lv_timer_t *t)
 }
 
 /* at the start (once) */
-static void wx_init(void)
+void wx_init(void)
 {
 	if (wx.timer)
 		return;
@@ -557,7 +559,7 @@ static void wx_off_cb(lv_event_t *e)
 	go_back();
 }
 
-static void open_weather(lv_event_t *e)
+void open_weather(lv_event_t *e)
 {
 	lv_obj_t *scr, *body, *c, *r, *sw;
 	char sub[64];

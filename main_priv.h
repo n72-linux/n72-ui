@@ -44,30 +44,7 @@
 #include "lvgl/src/misc/lv_timer_private.h"
 #include "mbx_gpu.h"
 
-struct n72_conf {
-	bool dark;
-	int accent;		/* index into accents[] */
-	int idle_s;		/* screen idle timeout, 0 = never */
-	int vol;		/* sound volume, 0..100 % (0 = mute) */
-	bool spk;		/* speaker when no earphones are plugged */
-	bool wake_plug;		/* the screen comes on when the cable goes in or out */
-	int autorot;		/* Auto-rotate (quick settings): ROT_AUTO or ROT_LOCKED */
-	int rotlock;		/* with it off: the turn it was left in, 0, 90 or 270 */
-	int bright;		/* brightness %, 0 = as it is */
-	int wifi, bt;		/* left on (1) or off (0); -1 not set */
-	bool wp_accent;		/* the colours from the home wallpaper (wallpaper.c) */
-	char dock[200];		/* the dock's icons, names joined by '|' (dock.c) */
-	bool dock_set;		/* (no "dock=" line: the default) */
-	char order[1200];	/* the grid's order, names joined by '|' (dock.c) */
-	bool order_set;
-	char tz[48];		/* the time zone's name (datetime.c; its rule is /etc/TZ) */
-	bool tz_set;
-	char wx_name[96];	/* the weather's place (weather.c) */
-	double wx_lat, wx_lon;
-	bool wx_set, wx_f;	/* a place set; Fahrenheit */
-};
-
-/* main.c, with what it includes (audio.c, ui_m3.c ...) */
+/* main.c and audio.c */
 extern int keys_fd;
 uint64_t mono_us(void);
 extern bool screen_off;
@@ -75,14 +52,6 @@ void screen_set(bool on);
 extern int jack_fd;
 void ui_watch(int fd, void (*cb)(int fd));
 extern lv_timer_t *idle_timer;
-extern struct n72_conf conf;
-extern pid_t app_pid;
-extern bool locked;
-bool have_tool(const char *name);
-bool usb_powered(void);
-void status_kick(bool batt, bool net);
-bool game_playing(void);
-bool video_playing(void);
 
 /* sleep.c */
 extern uint64_t woke_us;
@@ -96,8 +65,42 @@ void uevent_init(void);
 void idle_check(lv_timer_t *t);
 void idle_kick(void);
 
+#ifdef N72_DEBUG
 /* bench.c */
 int bench_text(int n, bool label_only);
 int bench(void);
+void n72_trace(const char *what, long v);
+#else
+#define n72_trace(what, v) do { } while (0)
+#endif
+
+#define W ui_w
+
+#define H ui_h
+
+#define NWATCH 32	/* (background commands take two each: ui_m3.c job_watch) */
+
+/* main.c and audio.c, used by the user interface */
+extern int32_t ui_w;
+extern int32_t ui_h;
+extern char *self_argv[4];
+extern lv_obj_t *home_scr;
+extern lv_indev_t *touch_indev;
+extern int tty_fd;
+int backlight_get(void);
+void backlight_set(int pct);
+extern char rt_node[64];
+lv_timer_t *awake_timer(lv_timer_cb_t cb, uint32_t ms, void *ud);
+void awake_timer_delete(lv_timer_t *t);
+extern bool jack_in;
+extern bool snd_present;
+void snd_apply_volume(int pct);
+void snd_apply_output(bool speaker_when_unplugged);
+bool jack_poll(void);
+void snd_init(int vol_pct, bool speaker_when_unplugged);
+extern int nwatch;
+void ui_watch_ev(int fd, void (*cb)(int fd), short events);
+void ui_unwatch(int fd);
+lv_point_t rt_logical(lv_point_t p);
 
 #endif

@@ -288,7 +288,7 @@ static void games_art_sweep(void)
 
 /* `n72-ui --thumb SRC OUT W H`: SRC fitted into W x H, written to OUT (the
  * cache's format); 0 when done. Run by the Games page (games_art_next). */
-static int games_thumb_main(int argc, char **argv)
+int games_thumb_main(int argc, char **argv)
 {
 	char tmp[PATH_MAX + 8];
 	lv_draw_buf_t *b;
@@ -871,7 +871,7 @@ static lv_obj_t *games_row_new(lv_obj_t *card, struct gpage *g)
 	return r;
 }
 
-static void open_games(lv_event_t *e)
+void open_games(lv_event_t *e)
 {
 	struct gpage *g = calloc(1, sizeof(*g));
 	lv_obj_t *scr, *body;
@@ -973,7 +973,7 @@ static void gp_build(void);
 static void gp_close(void);
 static void gp_reply(int fd);
 
-static bool gp_up(void)
+bool gp_up(void)
 {
 	return gp.scrim != NULL;
 }
@@ -1336,7 +1336,7 @@ static void gp_close(void)
  * The Home key (main.c). A game in front: the panel opens and the game
  * pauses; with the panel up, Home ends the game. True if Home was used.
  */
-static bool gp_home(void)
+bool gp_home(void)
 {
 	if (!app_is_game() || lv_screen_active() != app_scr || locked)
 		return false;
@@ -1352,7 +1352,7 @@ static bool gp_home(void)
 }
 
 /* The game has ended (app_closed) */
-static void gp_gone(void)
+void gp_gone(void)
 {
 	gp_close();
 	if (gp.timer) {
