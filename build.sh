@@ -29,8 +29,10 @@ KHDR=${KHDR:-$ROOT/linux-build-mac/usr/include}
 PG=
 # PROFILE=1: gprof build (n72-ui-build-prof/, not stripped; gmon.out on a clean exit, e.g. --bench)
 [ "$PROFILE" = 1 ] && { OUT="$OUT-prof"; PG=-pg; }
-# link-time optimisation: LVGL's drawing inlined across files (text 11-19% faster on the device)
+# link-time optimisation: LVGL's drawing inlined across files (text 11-19% faster on the device,
+# measured with clang). NOLTO=1: without, for comparing (n72-ui-build*-nolto/).
 LTO=-flto=auto
+[ "$NOLTO" = 1 ] && LTO=
 # OPT: the optimisation level (-O2; -O3 to compare)
 OPT=${OPT:--O2}
 # Profile-guided build (pgo/README):
@@ -74,6 +76,7 @@ fi
 # (comparison builds beside the usual one: n72-ui-build-O3, -nopgo)
 [ "$OPT" != -O2 ] && OUT="$OUT-${OPT#-}"
 [ "$NOPGO" = 1 ] && OUT="$OUT-nopgo"
+[ "$NOLTO" = 1 ] && OUT="$OUT-nolto"
 # (gcc's profile flags name the output folder, which is final only here)
 [ -n "$GCCGEN" ] && PGOC="-fprofile-generate=$PGO_DIR -fprofile-prefix-path=$OUT -fprofile-update=prefer-atomic -DN72_PGO_GEN"
 [ -n "$GCCUSE" ] && PGOC="-fprofile-use=$UI/pgo/gcc -fprofile-prefix-path=$OUT -fprofile-correction -Wno-error=coverage-mismatch"
