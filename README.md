@@ -59,7 +59,8 @@ A touch launcher for Linux on the iPod touch 2G (N72AP), built on
 
 When the MBX render node exists (`/dev/dri/renderD*`, the PowerVR MBX Lite driver
 `apple-mbx` in the n72 kernel), n72-ui
-draws through the GPU's 2D engine (`mbx_gpu.c`):
+draws through the GPU's 2D engine (`mbx_gpu.c` the pool and the GPU, `mbx_draw.c` the
+draw unit, `mbx_kms.c` the display and KMS):
 
 - every LVGL draw buffer comes from one GPU-mapped, CPU-cached pool;
 - large plain fills (no radius, no gradient) run on the GPU: opaque ones on
