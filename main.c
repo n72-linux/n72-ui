@@ -25,10 +25,7 @@
  */
 #include "main_priv.h"
 #include "lvgl/src/misc/lv_anim_private.h"	/* (ios_motion.h reads act_time) */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
 #include "ios_motion.h"
-#pragma GCC diagnostic pop
 
 /* the screen as the UI lays it out: 320 x 480, or 480 x 320 turned */
 int32_t ui_w = 320, ui_h = 480;
@@ -40,13 +37,6 @@ static int touch_wait_fd = -1;
 static lv_timer_t *refr_timer;		/* LVGL's display refresh */		/* own handle on the touch device, for poll() */
 lv_indev_t *touch_indev;
 
-/* Touch-to-screen latency (N72_LATENCY=1): newest touch event -> flush end. */
-static bool lat_on;
-static uint64_t lat_event_us;		/* newest touch event not yet on screen */
-static uint64_t lat_sum_us, lat_max_us;
-static unsigned int lat_n;
-static uint32_t lat_report_ms;
-
 static uint32_t tick_ms(void);
 
 uint64_t mono_us(void)
@@ -56,6 +46,14 @@ uint64_t mono_us(void)
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
+
+#ifdef N72_DEBUG
+/* Touch-to-screen latency (N72_LATENCY=1): newest touch event -> flush end. */
+static bool lat_on;
+static uint64_t lat_event_us;		/* newest touch event not yet on screen */
+static uint64_t lat_sum_us, lat_max_us;
+static unsigned int lat_n;
+static uint32_t lat_report_ms;
 
 static uint64_t lat_render_max_us, lat_wake_sum_us, lat_read_us;
 static bool lat_input_frame;
@@ -327,6 +325,25 @@ void n72_frame_shown(void)
 		lat_report_ms = tick_ms();
 	}
 }
+#else
+static inline void render_now(void)
+{
+	lv_refr_now(NULL);
+}
+
+void n72_refr_start(void)
+{
+	lv_anim_refr_now();
+}
+
+static inline void drags_init(void)
+{
+}
+
+void n72_frame_shown(void)
+{
+}
+#endif
 int tty_fd = -1;
 static int notify_fd = -1;		/* flip thread: a frame went to the display */
 static bool render_pending;
@@ -748,9 +765,8 @@ static void rt_put(struct input_event *v, int *n, int type, int code, int value)
  * A finger that lifts takes its contact off the panel over a few frames,
  * and the panel's position for it, the middle of what still touches,
  * wanders as it goes: 2 to 4.5 pixels in the last one or two frames of a
- * tap (recorded on the device, 2026-11-18: eleven taps, the long axis
- * falling from ~125 to ~30 in two frames). An application that scrolls at
- * the first movement takes that for a drag, and the tap is lost (Spore's
+ * tap (measured over eleven taps, with the long axis falling from ~125 to
+ * ~30 in two frames). An application that scrolls at the first movement takes that for a drag, and the tap is lost (Spore's
  * buttons). So the application is not told where a lifting finger wanders
  * to: from a frame in which the contact's long axis has fallen to under
  * 85 % of the frame before, and for as long as it goes on falling, the
@@ -1074,9 +1090,11 @@ static void rt_feed(int fd, lv_indev_t *indev)
 				}
 				if (rt_down)	/* (long presses need reads between frames) */
 					lv_timer_resume(lv_indev_get_read_timer(indev));
+#ifdef N72_DEBUG
 				if (!lat_event_us && rt_owner != RT_APP)
 					lat_event_us = (uint64_t)e->input_event_sec * 1000000 +
 						       e->input_event_usec;
+#endif
 			}
 		}
 	}
@@ -1236,12 +1254,12 @@ static void crash_handlers(void)
 /*
  * The screen as the launcher believes it, against the panel and the
  * backlight as they are. Another program may have switched one off under
- * a launcher that holds the screen lit (a test script putting back "what
- * it found", 2026-11-18: the backlight off under a freshly started
- * launcher, then the panel too): the launcher drew and took touches
- * unseen, Home went home unseen, and Power put the dark screen "to sleep".
- * Looked at when Home or Power is pressed, the keys one reaches for then:
- * a dark screen that should be lit is lit, and that press does no more.
+ * a launcher that holds the screen lit (leaving the backlight or panel
+ * disabled under a freshly started launcher): the launcher drew and took
+ * touches unseen, Home went home unseen, and Power put the dark screen "to
+ * sleep". Looked at when Home or Power is pressed, the keys one reaches
+ * for then: a dark screen that should be lit is lit, and that press does
+ * no more.
  */
 static bool screen_lit_check(void)
 {
@@ -1523,8 +1541,10 @@ int main(int argc, char **argv)
 	backlight_power(true);
 
 	disp = NULL;
+#ifdef N72_DEBUG
 	if (!getenv("N72_GPU") || strcmp(getenv("N72_GPU"), "0"))
-		disp = mbx_gpu_display_create();
+#endif
+		disp = mbx_gpu_display_create(true);
 	if (!disp) {
 		disp = lv_linux_fbdev_create();
 		lv_linux_fbdev_set_file(disp, fb ? fb : "/dev/fb0");
@@ -1579,13 +1599,17 @@ int main(int argc, char **argv)
 				}
 			}
 		}
+#ifdef N72_DEBUG
 		lat_on = getenv("N72_LATENCY") && *getenv("N72_LATENCY") == '1';
 		fps_on = getenv("N72_FPS") && *getenv("N72_FPS") == '1';
 		n72_trace_on = fps_on && getenv("N72_TRACE") != NULL;
+#endif
 	}
+#ifdef N72_DEBUG
 	/* the logs that print the GPU's timings (N72_FPS in any spelling:
 	 * mbx_gpu.c's own two lines ask only whether it is set, touch or not) */
 	mbx_gpu_timing = lat_on || getenv("N72_FPS") != NULL;
+#endif
 
 	if (!keys)
 		keys = find_input("gpio-keys");
@@ -1608,6 +1632,7 @@ int main(int argc, char **argv)
 	signal(SIGUSR1, on_usr1);
 	signal(SIGUSR2, on_usr2);
 	/* (screenshots: the signal breaks the main loop's poll; shot_poll there) */
+#ifdef N72_DEBUG
 	if (argc > 1 && !strcmp(argv[1], "--bench"))
 		mbx_gpu_timing = true;	/* the bench prints the totals */
 	if (argc > 2 && !strcmp(argv[1], "--bench") && !strcmp(argv[2], "text"))
@@ -1616,6 +1641,7 @@ int main(int argc, char **argv)
 		return bench_text(argc > 3 ? atoi(argv[3]) : 30, true);
 	if (argc > 1 && !strcmp(argv[1], "--bench"))
 		return bench();
+#endif
 
 	/*
 	 * Sleep until the next LVGL timer or until the touch screen or a button
@@ -1631,7 +1657,9 @@ int main(int argc, char **argv)
 			{ .fd = notify_fd, .events = POLLIN },
 		};
 		int nw, w;
+#ifdef N72_DEBUG
 		uint64_t th0;
+#endif
 		uint32_t idle;
 
 		/*
@@ -1661,13 +1689,17 @@ int main(int argc, char **argv)
 				held = false;
 			}
 		}
+#ifdef N72_DEBUG
 		th0 = mono_us();
+#endif
 		idle = lv_timer_handler();
 
+#ifdef N72_DEBUG
 		if (fps_on && mono_us() - th0 > 30000)
 			fprintf(stderr, "timers: %.1f ms\n", (mono_us() - th0) / 1000.0);
 		if (n72_trace_on && mono_us() - th0 > 1500)
 			n72_trace("timers-us", (long)(mono_us() - th0));
+#endif
 
 		nw = nwatch;	/* (after the timers, which may have changed it) */
 		for (w = 0; w < nw; w++) {
@@ -1682,7 +1714,9 @@ int main(int argc, char **argv)
 				    w < nwatch && watch[w].fd == pf[3 + w].fd)
 					watch[w].cb(pf[3 + w].fd);
 			if ((pf[0].revents & POLLIN) && rt_uinput >= 0) {
+#ifdef N72_DEBUG
 				lat_read_us = mono_us();
+#endif
 				rt_feed(touch_wait_fd, touch_indev);	/* reads LVGL's side */
 				n72_trace("indev<", 0);
 				if (mbx_gpu_frame_waiting())
@@ -1694,14 +1728,20 @@ int main(int argc, char **argv)
 				ssize_t r;
 
 				while ((r = read(touch_wait_fd, ev, sizeof(ev))) > 0) {
+#ifdef N72_DEBUG
 					const struct input_event *e = &ev[r / sizeof(ev[0]) - 1];
 
 					/* time the newest event still waiting for a frame */
 					if (!lat_event_us)
 						lat_event_us = (uint64_t)e->input_event_sec * 1000000 +
 							       e->input_event_usec;
+#else
+					(void)r;
+#endif
 				}
+#ifdef N72_DEBUG
 				lat_read_us = mono_us();
+#endif
 				lv_indev_read(touch_indev);
 				/*
 				 * Draw the result now, unless a finished frame is

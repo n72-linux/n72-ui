@@ -104,7 +104,7 @@ done | tr '\n' '\0' | xargs -0 -n 1 -P "$(nproc 2>/dev/null || sysctl -n hw.ncpu
 # snprintf cutting a long name short is meant: gcc reports it only without LTO)
 WARN="-Wall -Wunused"; [ "$KIND" = gcc ] && WARN="$WARN -Wno-format-truncation"
 # the launcher's own sources (audio.c, kbd.c, weather.c ... are #included by these)
-UISRCS="main sleep bench mbx_gpu mbx_draw mbx_kms ui_m3 ui_nav ui_sys ui_home ui_files ui_wifi ui_bt ui_settings ui_logs ui_paint ui_turn ui_video"
+UISRCS="main sleep bench ios_motion mbx_gpu mbx_draw mbx_kms ui_m3 ui_nav ui_sys ui_home ui_files ui_wifi ui_bt ui_settings ui_logs ui_paint ui_turn ui_video"
 for s in $UISRCS; do
 	$CC $CFLAGS $WARN -c "$UI/$s.c" -o obj/$s.o
 done

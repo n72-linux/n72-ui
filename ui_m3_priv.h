@@ -24,10 +24,7 @@
 #include <sys/statvfs.h>
 #include <sys/inotify.h>
 #include <ctype.h>
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
 #include "ios_motion.h"
-#pragma GCC diagnostic pop
 extern char **environ;
 
 struct n72_conf {
