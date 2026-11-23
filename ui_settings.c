@@ -365,7 +365,10 @@ static void open_storage(lv_event_t *e)
 		lv_obj_set_style_bg_color(seg, i == 0 ? M.primary : i == 1 ? M.tertiary_c :
 					  M.secondary_c, 0);
 		lv_obj_set_style_bg_opa(seg, LV_OPA_COVER, 0);
-		lv_obj_remove_flag(seg, LV_OBJ_FLAG_CLICKABLE);
+		/* the theme's padding is more than the bar is high: with it the
+		 * segment counted as overflowing and drew a scrollbar */
+		lv_obj_set_style_pad_all(seg, 0, 0);
+		lv_obj_remove_flag(seg, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 	}
 
 	/* the parts */

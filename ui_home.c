@@ -1002,7 +1002,9 @@ void build_shade(void)
 	lv_obj_set_style_radius(h, 2, 0);
 	lv_obj_set_style_bg_color(h, M.outline, 0);
 	lv_obj_align(h, LV_ALIGN_BOTTOM_MID, 0, -14);
-	lv_obj_remove_flag(h, LV_OBJ_FLAG_CLICKABLE);
+	/* (padding taller than the handle would make it scroll, with a scrollbar) */
+	lv_obj_set_style_pad_all(h, 0, 0);
+	lv_obj_remove_flag(h, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
 	np_build(shade, shade_card_y);	/* (hidden while nothing plays: np_sync) */
 }
@@ -1761,7 +1763,8 @@ static void lock_build(void)
 	lv_obj_set_style_radius(o, 3, 0);
 	lv_obj_set_style_bg_color(o, lv_color_white(), 0);
 	lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
-	lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_style_pad_all(o, 0, 0);
+	lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_align(o, LV_ALIGN_BOTTOM_MID, 0, -12);
 	net_ui_sync();		/* (the bar's icons as they are now) */
 	np_sync();
@@ -2308,8 +2311,10 @@ static void za_home_fresh(void)
 /* One phase ends: the next begins. */
 static void za_next(void)
 {
+#ifdef N72_DEBUG
 	if (getenv("N72_FPS"))
 		fprintf(stderr, "za: phase %d ends at %u ms\n", za.phase, (unsigned)lv_tick_get());
+#endif
 	if (za.page) {
 		switch (za.phase) {
 		case 1:		/* grown: the card fades off the page's picture */
@@ -2898,9 +2903,11 @@ static void za_spawn_cb(lv_timer_t *t)
 	posix_spawnattr_setpgroup(&at, 0);	/* Home ends everything it starts */
 	if (posix_spawn(&pid, "/bin/sh", NULL, &at, argv, envp))
 		pid = 0;
+#ifdef N72_DEBUG
 	if (getenv("N72_FPS"))
 		fprintf(stderr, "spawn: pid %d at %u ms, phase %d\n", (int)pid,
 			(unsigned)lv_tick_get(), za.phase);
+#endif
 	posix_spawnattr_destroy(&at);
 	free(envp);
 	app_pid = pid;
