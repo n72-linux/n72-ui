@@ -153,9 +153,20 @@ static double gpu_now_us(void)
 	return t.tv_sec * 1e6 + t.tv_nsec / 1e3;
 }
 
+/* the statistics' timings: only when somebody reads them (mbx_gpu_timing) */
+bool mbx_gpu_timing;
+
+static inline double stat_t0(void)
+{
+	return mbx_gpu_timing ? gpu_now_us() : 0;
+}
+
+#define STAT_US(field, t0) \
+	do { if (mbx_gpu_timing) mbx_gpu_stats.field += gpu_now_us() - (t0); } while (0)
+
 static void sync_range(const void *p, uint32_t size, uint32_t op)
 {
-	double t0 = gpu_now_us();
+	double t0 = stat_t0();
 	const struct region *r = region_of(p);
 	struct mbx_buf b = { .cpu = r->cpu, .handle = r->handle, .size = r->size, .cached = 1 };
 	uint32_t off = (const uint8_t *)p - r->cpu;
@@ -164,7 +175,7 @@ static void sync_range(const void *p, uint32_t size, uint32_t op)
 		mbx_flush(mbx, &b, off, size);
 	else
 		mbx_clean(mbx, &b, off, size);
-	mbx_gpu_stats.sync_us += gpu_now_us() - t0;
+	STAT_US(sync_us, t0);
 	mbx_gpu_stats.sync_bytes += size;
 }
 
@@ -179,12 +190,12 @@ static int gpu_ret(int ret)
 
 static int submit(const uint32_t *w, int n)
 {
-	double t0 = gpu_now_us();
+	double t0 = stat_t0();
 	int ret;
 
 	mbx_gpu_stats.submits++;
 	ret = gpu_ret(mbx_submit_2d(mbx, w, n, 0));
-	mbx_gpu_stats.submit_us += gpu_now_us() - t0;
+	STAT_US(submit_us, t0);
 	return ret;
 }
 
@@ -238,13 +249,13 @@ static int blit3d(int type, uint32_t dst, uint32_t src, const uint32_t *w, int n
 {
 	struct mbx_blit3d b = { .type = type, .dst_gpu = dst, .src_gpu = src, .count = n };
 
-	double t0 = gpu_now_us();
+	double t0 = stat_t0();
 	int ret;
 
 	memcpy(b.words, w, n * 4);
 	mbx_gpu_stats.submits++;
 	ret = gpu_ret(mbx_blit_3d(mbx, &b));
-	mbx_gpu_stats.blit3d_us += gpu_now_us() - t0;
+	STAT_US(blit3d_us, t0);
 	return ret;
 }
 
@@ -1174,12 +1185,12 @@ static void *flip_main(void *arg)
 			if (write(notify_pipe[1], &c, 1) < 0)
 				;
 		}
-		t0 = gpu_now_us();
+		t0 = stat_t0();
 		/* flipping implies KMS (flip_setup): waits for the flip's own event */
 		bool shown = kms_flip(r);
 
 		pthread_mutex_lock(&flip_mx);
-		mbx_gpu_stats.flip_us += gpu_now_us() - t0;
+		STAT_US(flip_us, t0);
 		if (shown)		/* (a flip refused: the old front is still on screen) */
 			st_front = r;
 		st_latching = -1;
@@ -1259,7 +1270,7 @@ static void render_start_cb(lv_event_t *e)
 	pthread_mutex_unlock(&flip_mx);
 
 	/* bring the buffer up to date: frames buf_frame[dr]+1 .. frame_no */
-	double dbg_t0 = gpu_now_us();
+	double dbg_t0 = stat_t0();
 	have = buf_frame[dr];
 	if (src >= 0 && src != dr && have < frame_no) {
 		if (have < 0 || frame_no - have > HIST - 1) {
@@ -1288,7 +1299,7 @@ static void render_start_cb(lv_event_t *e)
 	cur_all = false;
 	pm_skip_n = 0;
 	n72_trace("draw", 0);
-	if (gpu_now_us() - dbg_t0 > 8000 && getenv("N72_FPS"))
+	if (mbx_gpu_timing && gpu_now_us() - dbg_t0 > 8000 && getenv("N72_FPS"))
 		fprintf(stderr, "render start: catch-up %.1f ms\n", (gpu_now_us() - dbg_t0) / 1000.0);
 }
 
@@ -1297,15 +1308,15 @@ static void premultiply(uint8_t *px_map, const lv_area_t *a);
 
 static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-	double dbg_t0 = gpu_now_us(), dbg_t1;
+	double dbg_t0 = stat_t0(), dbg_t1;
 
 	n72_trace("flush", lv_area_get_height(area));
 	if (transparent)
 		premultiply(px_map, area);
-	dbg_t1 = gpu_now_us();
+	dbg_t1 = stat_t0();
 	/* what the CPU drew in this area goes out to memory for the display */
 	clean_rows(px_map, area);
-	if (gpu_now_us() - dbg_t0 > 8000 && getenv("N72_FPS"))
+	if (mbx_gpu_timing && gpu_now_us() - dbg_t0 > 8000 && getenv("N72_FPS"))
 		fprintf(stderr, "flush: premultiply %.1f ms, clean %.1f ms (%d rows)\n",
 			(dbg_t1 - dbg_t0) / 1000.0, (gpu_now_us() - dbg_t1) / 1000.0,
 			(int)lv_area_get_height(area));

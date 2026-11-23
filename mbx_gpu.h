@@ -4,6 +4,7 @@
 
 #include "lvgl/lvgl.h"
 
+#ifdef N72_DEBUG
 struct mbx_gpu_stats {
 	unsigned long submits, fills, blends, layers, images, flushes, pool_misses;
 	unsigned long fill_radius, fill_grad, fill_small;	/* fills left to the CPU */
@@ -16,13 +17,22 @@ struct mbx_gpu_stats {
 	unsigned long long trim_px;	/* fill pixels skipped: covered by later tasks */
 };
 extern struct mbx_gpu_stats mbx_gpu_stats;
+/*
+ * Set by whoever reads the *_us totals above (N72_LATENCY, N72_FPS, --bench):
+ * every cache sync, submit and flip is then timed. Off, those cost no
+ * clock_gettime (a system call on this CPU, twice a job).
+ */
+extern bool mbx_gpu_timing;
+#endif
 
 /*
- * Create the display on the MBX GPU (its DRM render node): GPU-mapped draw buffers, a
- * GPU fill unit and GPU flushes. Returns NULL if the GPU is not available;
- * call it after lv_init() and before creating any other display.
+ * Create the display on the MBX GPU (its DRM render node): GPU-mapped draw
+ * buffers, a GPU fill unit and GPU flushes. @shell_layer=true opens the
+ * launcher's layer 1 (n72-clcd-shell, falling back to n72-clcd); false opens
+ * layer 0 (n72-clcd) and clears it to black. Returns NULL if the GPU is not
+ * available; call after lv_init() and before creating any other display.
  */
-lv_display_t *mbx_gpu_display_create(void);
+lv_display_t *mbx_gpu_display_create(bool shell_layer);
 
 /* A GPU copy of the screen as shown now, or NULL. */
 lv_draw_buf_t *mbx_gpu_grab_screen(void);

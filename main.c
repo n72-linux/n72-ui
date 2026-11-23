@@ -2573,6 +2573,9 @@ int main(int argc, char **argv)
 		lat_on = getenv("N72_LATENCY") && *getenv("N72_LATENCY") == '1';
 		fps_on = getenv("N72_FPS") && *getenv("N72_FPS") == '1';
 		n72_trace_on = fps_on && getenv("N72_TRACE") != NULL;
+		/* the logs that print the GPU's timings (N72_FPS in any spelling:
+		 * mbx_gpu.c's own two lines ask only whether it is set) */
+		mbx_gpu_timing = lat_on || getenv("N72_FPS") != NULL;
 	}
 
 	if (!keys)
@@ -2596,6 +2599,8 @@ int main(int argc, char **argv)
 	signal(SIGUSR1, on_usr1);
 	signal(SIGUSR2, on_usr2);
 	/* (screenshots: the signal breaks the main loop's poll; shot_poll there) */
+	if (argc > 1 && !strcmp(argv[1], "--bench"))
+		mbx_gpu_timing = true;	/* the bench prints the totals */
 	if (argc > 2 && !strcmp(argv[1], "--bench") && !strcmp(argv[2], "text"))
 		return bench_text(argc > 3 ? atoi(argv[3]) : 30, false);
 	if (argc > 2 && !strcmp(argv[1], "--bench") && !strcmp(argv[2], "label"))
