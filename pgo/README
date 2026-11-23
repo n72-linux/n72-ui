@@ -39,3 +39,12 @@ rewritten to base names (llvm-profdata merge --text, the directory part of
 each "path;function" name removed, merged back; the counts are untouched).
 To see what a build finds: compile a file with -Wbackend-plugin -mllvm
 -pgo-warn-missing-function=true in place of build.sh's -Wno- flags.
+
+gcc (the compiler the rule asks for; no gcc profile exists yet): the same
+steps with the default compiler. PGO_GEN=1 sh n72-ui/build.sh gives
+n72-ui-build-pgogen/; on the device it writes /tmp/n72ui-pgo/obj#NAME.gcda
+at exit (PGO_DIR); those files go in pgo/gcc/. The names are relative to
+the output folder (build.sh), so the profiled build finds them from any
+folder: checked 2026-11-23, the 131 names in the instrumented binary are
+the 131 a profiled -O3 build in another folder looks up. A missing file
+or a function changed since the profile shows as a warning in the build.

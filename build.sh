@@ -40,6 +40,12 @@ OPT=${OPT:--O2}
 #     gcc    pgo/gcc/*.gcda, the files the instrumented build wrote on the device
 #            under PGO_DIR (/tmp/n72ui-pgo). New 2026-11-22: no gcc profile has
 #            been trained yet, so the gcc build is not profile-guided.
+#            gcc names a .gcda after the object's path. The objects are
+#            compiled from inside the output folder under relative names, with
+#            -fprofile-prefix-path, so that the name is obj#NAME.gcda whichever
+#            folder the build is in (the instrumented build's is another one
+#            than the profiled build's). A missing file and a function changed
+#            since the profile are warnings in the build's output: read them.
 PGOC= PGOL=
 PGO_DIR=${PGO_DIR:-/tmp/n72ui-pgo}
 # clang names a static function in a profile by its source file; by the file's
@@ -54,7 +60,7 @@ if [ "$PGO_GEN" = 1 ]; then
 		PGOC="-fprofile-generate $PGOSF -DN72_PGO_GEN"
 		PGOL="-Wl,-u,__llvm_profile_runtime -Wl,-mllvm,-static-func-full-module-prefix=false $PGO_RT"
 	else
-		PGOC="-fprofile-generate=$PGO_DIR -fprofile-update=prefer-atomic -DN72_PGO_GEN"
+		GCCGEN=1
 		PGOL="-fprofile-generate=$PGO_DIR"
 	fi
 elif [ "$NOPGO" = 1 ]; then
@@ -63,11 +69,14 @@ elif [ "$KIND" = clang ] && [ -f "$UI/pgo/n72ui.profdata" ]; then
 	PGOC="-fprofile-use=$UI/pgo/n72ui.profdata $PGOSF -mllvm -hot-cold-split=true -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin"
 	PGOL="-Wl,-mllvm,-hot-cold-split=true -Wl,-mllvm,-static-func-full-module-prefix=false -Wl,-z,keep-text-section-prefix"
 elif [ "$KIND" = gcc ] && ls "$UI"/pgo/gcc/*.gcda >/dev/null 2>&1; then
-	PGOC="-fprofile-use=$UI/pgo/gcc -fprofile-correction -Wno-missing-profile"
+	GCCUSE=1
 fi
 # (comparison builds beside the usual one: n72-ui-build-O3, -nopgo)
 [ "$OPT" != -O2 ] && OUT="$OUT-${OPT#-}"
 [ "$NOPGO" = 1 ] && OUT="$OUT-nopgo"
+# (gcc's profile flags name the output folder, which is final only here)
+[ -n "$GCCGEN" ] && PGOC="-fprofile-generate=$PGO_DIR -fprofile-prefix-path=$OUT -fprofile-update=prefer-atomic -DN72_PGO_GEN"
+[ -n "$GCCUSE" ] && PGOC="-fprofile-use=$UI/pgo/gcc -fprofile-prefix-path=$OUT -fprofile-correction -Wno-error=coverage-mismatch"
 CFLAGS="$PG $LTO $OPT $PGOC -g -idirafter $KHDR -idirafter $ROOT/linux-s5l87xx/include/uapi -mcpu=arm1176jzf-s -mfpu=vfpv2 -mfloat-abi=hard -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src -I$GLES/include"
 mkdir -p "$OUT/obj"
 # objects from another compiler or other flags (the old armel build) are not reused
@@ -76,7 +85,8 @@ if [ "$(cat "$OUT/obj/.flags" 2>/dev/null)" != "$CC $CFLAGS" ]; then
 	echo "$CC $CFLAGS" > "$OUT/obj/.flags"
 fi
 SRCS=$(find "$LVGL/src" -name '*.c')
-obj() { echo "$OUT/obj/$(echo "${1#$LVGL/}" | tr '/' '_' | sed 's/\.c$/.o/')"; }
+cd "$OUT"	# objects by relative names (the gcc profile's file names, above)
+obj() { echo "obj/$(echo "${1#$LVGL/}" | tr '/' '_' | sed 's/\.c$/.o/')"; }
 OBJS=$(for f in $SRCS; do obj "$f"; done)
 for f in $SRCS; do
 	o=$(obj "$f")
@@ -84,11 +94,11 @@ for f in $SRCS; do
 		echo "$CC -c $f -o $o $CFLAGS"
 	fi
 done | tr '\n' '\0' | xargs -0 -n 1 -P "$(nproc 2>/dev/null || sysctl -n hw.ncpu)" sh -c	# (not -I{}: BSD xargs caps that at 255 bytes)
-$CC $CFLAGS -c "$UI/main.c" -o "$OUT/obj/main.o"
-$CC $CFLAGS -c "$UI/mbx_gpu.c" -o "$OUT/obj/mbx_gpu.o"
+$CC $CFLAGS -c "$UI/main.c" -o obj/main.o
+$CC $CFLAGS -c "$UI/mbx_gpu.c" -o obj/mbx_gpu.o
 # (with LTO the instrumentation and the profile go in at compile time; the
 # link only adds the runtime, or the layout by the profile)
-$CC $PG $LTO $OPT -static -Wl,--gc-sections $PGOL -o "$OUT/n72-ui" "$OUT/obj/main.o" "$OUT/obj/mbx_gpu.o" $OBJS $GLESLIB -lm -lpthread
+$CC $PG $LTO $OPT -static -Wl,--gc-sections $PGOL -o "$OUT/n72-ui" obj/main.o obj/mbx_gpu.o $OBJS $GLESLIB -lm -lpthread
 cp "$OUT/n72-ui" "$OUT/n72-ui.debug"	# unstripped, for crash reports (addr2line)
 [ -n "$PG" ] || ${CROSS}strip "$OUT/n72-ui"
 ls -l "$OUT/n72-ui"
