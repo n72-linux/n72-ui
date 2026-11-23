@@ -9,7 +9,7 @@
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 UI=$(cd "$(dirname "$0")" && pwd)
-# GLES=dir: another n72-gles checkout (its build/libGLESv1_CM.a and include/)
+# GLES=dir: another n72-gles checkout (its build/libn72mbxmem.a and include/)
 GLES=${GLES:-$ROOT/n72-gles}
 GLES=$(cd "$GLES" && pwd)	# (the build changes directory further down: no relative paths)
 LVGL="$ROOT/lvgl-src/lvgl"
@@ -21,17 +21,20 @@ CC=${CROSS}$N72_CC
 # what $CC really is (a "...-gcc" given through CROSS may be a clang wrapper)
 case "$($CC --version 2>/dev/null)" in *clang*) KIND=clang ;; *) KIND=gcc ;; esac
 [ "$KIND" = clang ] && [ "$N72_CC" = clang ] && OUT="$OUT-clang"
-# n72-gles' static library of the same compiler (its Makefile: build/ for
-# gcc, build-clang/ for N72_CC=clang)
-GLESLIB=$GLES/build/libGLESv1_CM.a
-[ "$N72_CC" = clang ] && [ -f "$GLES/build-clang/libGLESv1_CM.a" ] && GLESLIB=$GLES/build-clang/libGLESv1_CM.a
+# n72-gles' MBX memory helper static library of the same compiler (build/
+# for gcc, build-clang/ for N72_CC=clang)
+GLESLIB=$GLES/build/libn72mbxmem.a
+[ "$N72_CC" = clang ] && [ -f "$GLES/build-clang/libn72mbxmem.a" ] && GLESLIB=$GLES/build-clang/libn72mbxmem.a
 KHDR=${KHDR:-$ROOT/linux-build-mac/usr/include}
 [ -f "$KHDR/linux/types.h" ] || KHDR=$ROOT/linux-build-alpine/usr/include
 KHDR=$(cd "$KHDR" && pwd)
 [ -z "$PGO_RT" ] || case $PGO_RT in /*) ;; *) PGO_RT=$PWD/$PGO_RT ;; esac
 PG=
-# PROFILE=1: gprof build (n72-ui-build-prof/, not stripped; gmon.out on a clean exit, e.g. --bench)
+# PROFILE=1: gprof build (n72-ui-build-prof/, not stripped; gmon.out on a clean exit)
 [ "$PROFILE" = 1 ] && { OUT="$OUT-prof"; PG=-pg; }
+DBG=
+# N72_DEBUG=1: enable --bench, frame timing/trace logs, and GPU stat counters
+[ "$N72_DEBUG" = 1 ] && { OUT="$OUT-debug"; DBG=-DN72_DEBUG; }
 # link-time optimisation: LVGL's drawing inlined across files (text 11-19% faster on the device,
 # measured with clang). NOLTO=1: without, for comparing (n72-ui-build*-nolto/).
 LTO=-flto=auto
@@ -43,8 +46,8 @@ OPT=${OPT:--O2}
 #   otherwise the profile is used when it is there (NOPGO=1: not):
 #     clang  pgo/n72ui.profdata
 #     gcc    pgo/gcc/*.gcda, the files the instrumented build wrote on the device
-#            under PGO_DIR (/tmp/n72ui-pgo). New 2026-11-22: no gcc profile has
-#            been trained yet, so the gcc build is not profile-guided.
+#            under PGO_DIR (/tmp/n72ui-pgo). When no gcc profile exists yet,
+#            the gcc build skips profile guidance.
 #            gcc names a .gcda after the object's path. The objects are
 #            compiled from inside the output folder under relative names, with
 #            -fprofile-prefix-path, so that the name is obj#NAME.gcda whichever
@@ -83,7 +86,7 @@ fi
 # (gcc's profile flags name the output folder, which is final only here)
 [ -n "$GCCGEN" ] && PGOC="-fprofile-generate=$PGO_DIR -fprofile-prefix-path=$OUT -fprofile-update=prefer-atomic -DN72_PGO_GEN"
 [ -n "$GCCUSE" ] && PGOC="-fprofile-use=$UI/pgo/gcc -fprofile-prefix-path=$OUT -fprofile-correction -Wno-error=coverage-mismatch"
-CFLAGS="$PG $LTO $OPT $PGOC -g -idirafter $KHDR -idirafter $ROOT/linux-s5l87xx/include/uapi -mcpu=arm1176jzf-s -mfpu=vfpv2 -mfloat-abi=hard -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src -I$GLES/include"
+CFLAGS="$PG $LTO $OPT $PGOC $DBG -g -idirafter $KHDR -mcpu=arm1176jzf-s -mfpu=vfpv2 -mfloat-abi=hard -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src -I$GLES/include"
 mkdir -p "$OUT/obj"
 # objects from another compiler or other flags (the old armel build) are not reused
 if [ "$(cat "$OUT/obj/.flags" 2>/dev/null)" != "$CC $CFLAGS" ]; then
@@ -103,8 +106,11 @@ done | tr '\n' '\0' | xargs -0 -n 1 -P "$(nproc 2>/dev/null || sysctl -n hw.ncpu
 # (the launcher's own sources warning-free under -Wall; LVGL's are not checked.
 # snprintf cutting a long name short is meant: gcc reports it only without LTO)
 WARN="-Wall -Wunused"; [ "$KIND" = gcc ] && WARN="$WARN -Wno-format-truncation"
-# the launcher's own sources (audio.c, kbd.c, weather.c ... are #included by these)
-UISRCS="main sleep bench ios_motion mbx_gpu mbx_draw mbx_kms ui_m3 ui_nav ui_sys ui_home ui_files ui_wifi ui_bt ui_settings ui_logs ui_paint ui_turn ui_video"
+# the launcher's own sources (audio.c, kbd.c, weather.c ... are #included by these).
+# The link order matters on ARM1176 (16 KiB I-cache); verify text timings
+# if reordering sources.
+UISRCS="mbx_gpu mbx_draw mbx_kms main sleep ios_motion ui_video ui_turn ui_paint ui_logs ui_settings ui_bt ui_wifi ui_files ui_home ui_sys ui_nav ui_m3"
+[ "$N72_DEBUG" = 1 ] && UISRCS="$UISRCS bench"
 for s in $UISRCS; do
 	$CC $CFLAGS $WARN -c "$UI/$s.c" -o obj/$s.o
 done
