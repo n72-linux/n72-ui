@@ -34,7 +34,7 @@
 
 extern char **environ;
 
-static bool system_sleep(void);
+bool system_sleep(void);
 static void kbd_toggle_app(void);	/* the system keyboard (kbd.c) */
 static void kbd_app_gone(void);
 static void kbd_hide_now(bool anim);
@@ -90,28 +90,7 @@ static void np_lock_sync(void);
 #define STATUS_PAD	16
 #define STATUS_GAP	10	/* between the status bar's icons */
 
-static struct {
-	bool dark;
-	int accent;		/* index into accents[] */
-	int idle_s;		/* screen idle timeout, 0 = never */
-	int vol;		/* sound volume, 0..100 % (0 = mute) */
-	bool spk;		/* speaker when no earphones are plugged */
-	bool wake_plug;		/* the screen comes on when the cable goes in or out */
-	int autorot;		/* Auto-rotate (quick settings): ROT_AUTO or ROT_LOCKED */
-	int rotlock;		/* with it off: the turn it was left in, 0, 90 or 270 */
-	int bright;		/* brightness %, 0 = as it is */
-	int wifi, bt;		/* left on (1) or off (0); -1 not set */
-	bool wp_accent;		/* the colours from the home wallpaper (wallpaper.c) */
-	char dock[200];		/* the dock's icons, names joined by '|' (dock.c) */
-	bool dock_set;		/* (no "dock=" line: the default) */
-	char order[1200];	/* the grid's order, names joined by '|' (dock.c) */
-	bool order_set;
-	char tz[48];		/* the time zone's name (datetime.c; its rule is /etc/TZ) */
-	bool tz_set;
-	char wx_name[96];	/* the weather's place (weather.c) */
-	double wx_lat, wx_lon;
-	bool wx_set, wx_f;	/* a place set; Fahrenheit */
-} conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1, false, "", false, "", false, "", false, "", 0, 0, false, false };
+struct n72_conf conf = { true, 0, 120, 60, true, true, 0, 0, 0, -1, -1, false, "", false, "", false, "", false, "", 0, 0, false, false };
 
 /*
  * Auto-rotate on: the screen turns with the iPod. Off: it stays as it was
@@ -1206,7 +1185,7 @@ static bool tr_start(lv_draw_buf_t *bg, lv_draw_buf_t *fg, int kind, lv_obj_t *t
 
 /* Slide to @to: left for forward, right for back; @del_from: delete the old screen. */
 static void app_bar_set(bool show);
-static pid_t app_pid;
+pid_t app_pid;
 
 static void slide(lv_obj_t *to, bool left, bool del_from)
 {
@@ -1263,7 +1242,7 @@ static int nav_n;
  * the picture behind its card, and the screen it ends on */
 static lv_obj_t *launch_from;
 static void app_bar_set(bool show);
-static bool locked;
+bool locked;
 
 /* A page (Settings and the pages under it, Paint) is on the screen. */
 static bool on_page(void)
@@ -1275,10 +1254,10 @@ static void shade_set(bool open, bool anim);
 
 static bool app_end(void);
 static lv_obj_t *app_scr;	/* the empty screen over a running application */
-static bool locked;		/* the lock screen is up */
+bool locked;		/* the lock screen is up */
 static void lock_wake(void);
 static void za_finish(void);
-static pid_t app_pid;
+pid_t app_pid;
 static void app_shade_slide(bool open);
 static void app_bar_update(void);
 static lv_obj_t *vol_hud;
@@ -2804,7 +2783,7 @@ static void shq(const char *s, char *out, size_t len)
 
 /* A program is installed: a path as given, a bare name looked up on PATH
  * (the distribution decides between /sbin, /usr/sbin, /usr/bin, ...). */
-static bool have_tool(const char *name)
+bool have_tool(const char *name)
 {
 	const char *path, *p;
 	char buf[256];
@@ -2845,7 +2824,7 @@ static int read_sysfs_int(const char *path, int def)
 	return v;
 }
 
-static bool usb_powered(void)
+bool usb_powered(void)
 {
 	return read_sysfs_int("/sys/class/power_supply/usb/online", 0) == 1;
 }
@@ -3192,7 +3171,7 @@ static void status_ev_run(lv_timer_t *t)
 	}
 }
 
-static void status_kick(bool batt, bool net)
+void status_kick(bool batt, bool net)
 {
 	status_batt_dirty |= batt;
 	status_net_dirty |= net;
@@ -10024,13 +10003,13 @@ static bool app_is_game(void)
 }
 
 /* A game in front: the screen stays on (main.c, idle_check). */
-static bool game_playing(void)
+bool game_playing(void)
 {
 	return app_is_game() && lv_screen_active() == app_scr && !gp_up();	/* (paused: not) */
 }
 
 /* A video playing in front: the screen stays on (main.c, idle_check). */
-static bool video_playing(void)
+bool video_playing(void)
 {
 	return app_is_video() && vc.up && vc.playing && lv_screen_active() == app_scr;
 }

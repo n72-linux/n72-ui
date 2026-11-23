@@ -105,9 +105,11 @@ done | tr '\n' '\0' | xargs -0 -n 1 -P "$(nproc 2>/dev/null || sysctl -n hw.ncpu
 WARN="-Wall -Wunused"; [ "$KIND" = gcc ] && WARN="$WARN -Wno-format-truncation"
 $CC $CFLAGS $WARN -c "$UI/main.c" -o obj/main.o
 $CC $CFLAGS $WARN -c "$UI/mbx_gpu.c" -o obj/mbx_gpu.o
+$CC $CFLAGS $WARN -c "$UI/sleep.c" -o obj/sleep.o
+$CC $CFLAGS $WARN -c "$UI/bench.c" -o obj/bench.o
 # (with LTO the instrumentation and the profile go in at compile time; the
 # link only adds the runtime, or the layout by the profile)
-$CC $PG $LTO $OPT -static -Wl,--gc-sections $PGOL -o "$OUT/n72-ui" obj/main.o obj/mbx_gpu.o $OBJS $GLESLIB -lm -lpthread
+$CC $PG $LTO $OPT -static -Wl,--gc-sections $PGOL -o "$OUT/n72-ui" obj/main.o obj/mbx_gpu.o obj/sleep.o obj/bench.o $OBJS $GLESLIB -lm -lpthread
 cp "$OUT/n72-ui" "$OUT/n72-ui.debug"	# unstripped, for crash reports (addr2line)
 [ -n "$PG" ] || ${CROSS}strip "$OUT/n72-ui"
 ls -l "$OUT/n72-ui"

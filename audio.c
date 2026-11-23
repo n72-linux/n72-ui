@@ -21,7 +21,7 @@
 #define AMP_GAIN	22			/* LM48821 gain code for the speaker */
 
 static int snd_fd = -1;
-static int jack_fd = -1;
+int jack_fd = -1;
 static bool jack_in;		/* earphones plugged */
 static bool snd_present;
 
