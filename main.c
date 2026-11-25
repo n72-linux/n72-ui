@@ -984,8 +984,8 @@ static void rt_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 	data->state = rt_ui_down ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
-/* A frame is complete (SYN_REPORT): route it. True if LVGL has news. */
-static bool rt_frame_done(void)
+/* A frame is complete (SYN_REPORT): route it. Set *@ui_touch if it went to the UI. */
+static bool rt_frame_done(bool *ui_touch)
 {
 	lv_point_t p = rt_map(rt_raw_x, rt_raw_y), l = rt_logical(p);
 	bool news = false;
@@ -997,15 +997,18 @@ static bool rt_frame_done(void)
 		if (rt_owner == RT_APP && rt_mt_b) {
 			rt_app_begin();		/* (this frame's news included) */
 			rt_n = 0;
+			*ui_touch = false;
 			return false;
 		}
 	}
 	if (rt_owner == RT_APP) {
+		*ui_touch = false;
 		if (rt_mt_b)
 			rt_app_frame();
 		else if (write(rt_uinput, rt_frame, rt_n * sizeof(rt_frame[0])) < 0)
 			;
 	} else {
+		*ui_touch = true;
 		if (rt_down || rt_ui_touch) {
 			int ph = !rt_down ? 2 : rt_ui_touch ? 1 : 0;
 
@@ -1032,10 +1035,11 @@ static bool rt_frame_done(void)
 	return news;
 }
 
-/* Read what the touch screen has; hand LVGL each frame of its touches. */
-static void rt_feed(int fd, lv_indev_t *indev)
+/* Read what the touch screen has; hand LVGL each frame of its touches. True if UI received news. */
+static bool rt_feed(int fd, lv_indev_t *indev)
 {
 	struct input_event ev[32];
+	bool ui_news = false;
 	ssize_t r;
 	int i;
 
@@ -1082,13 +1086,18 @@ static void rt_feed(int fd, lv_indev_t *indev)
 			if (rt_n < (int)(sizeof(rt_frame) / sizeof(rt_frame[0])))
 				rt_frame[rt_n++] = *e;
 			if (e->type == EV_SYN && e->code == SYN_REPORT) {
+				bool ui_touch = false;
+
 				/* every frame: a move and the lift in one read
 				 * would lose the move (and the gesture) */
-				if (rt_frame_done()) {
+				if (rt_frame_done(&ui_touch)) {
 					rt_frame_us = mono_us();
 					lv_indev_read(indev);
+					ui_news = true;
+				} else if (ui_touch) {
+					ui_news = true;
 				}
-				if (rt_down)	/* (long presses need reads between frames) */
+				if (rt_ui_down)	/* (long presses need reads between frames) */
 					lv_timer_resume(lv_indev_get_read_timer(indev));
 #ifdef N72_DEBUG
 				if (!lat_event_us && rt_owner != RT_APP)
@@ -1098,6 +1107,7 @@ static void rt_feed(int fd, lv_indev_t *indev)
 			}
 		}
 	}
+	return ui_news;
 }
 
 /*
@@ -1650,128 +1660,142 @@ int main(int argc, char **argv)
 	 */
 	notify_fd = mbx_gpu_notify_fd();
 	refr_timer = lv_display_get_refr_timer(lv_display_get_default());
-	for (;;) {
-		struct pollfd pf[3 + NWATCH] = {
-			{ .fd = touch_wait_fd, .events = POLLIN },
-			{ .fd = keys_fd, .events = POLLIN },
-			{ .fd = notify_fd, .events = POLLIN },
-		};
-		int nw, w;
-#ifdef N72_DEBUG
-		uint64_t th0;
-#endif
-		uint32_t idle;
+	{
+		uint32_t next_timer_ms = 0;
+		bool skip_timers = false;
 
-		/*
-		 * Animation frames start when the display takes the last one,
-		 * not on LVGL's 16 ms timer, which drifts against the 16.7 ms
-		 * refresh: a frame drawn while one is still waiting replaces it
-		 * (drawn for nothing), and the one shown then stays two
-		 * refreshes. While a frame waits, the refresh timer rests;
-		 * the hand-over (notify_fd) wakes it.
-		 */
-		/*
-		 * (Only what was paused here is resumed: LVGL pauses the timer
-		 * itself when there is nothing to draw and resumes it on an
-		 * invalidation; resuming it every turn woke this loop 60 times
-		 * a second for nothing, screen on or off.)
-		 */
-		if (refr_timer && notify_fd >= 0) {
-			static bool held;
-
-			if (mbx_gpu_frame_waiting()) {
-				if (!refr_timer->paused) {
-					lv_timer_pause(refr_timer);
-					held = true;
-				}
-			} else if (held) {
-				lv_timer_resume(refr_timer);
-				held = false;
-			}
-		}
+		for (;;) {
+			struct pollfd pf[3 + NWATCH] = {
+				{ .fd = touch_wait_fd, .events = POLLIN },
+				{ .fd = keys_fd, .events = POLLIN },
+				{ .fd = notify_fd, .events = POLLIN },
+			};
+			int nw, w, wait_ms;
 #ifdef N72_DEBUG
-		th0 = mono_us();
+			uint64_t th0;
 #endif
-		idle = lv_timer_handler();
+			uint32_t idle;
 
-#ifdef N72_DEBUG
-		if (fps_on && mono_us() - th0 > 30000)
-			fprintf(stderr, "timers: %.1f ms\n", (mono_us() - th0) / 1000.0);
-		if (n72_trace_on && mono_us() - th0 > 1500)
-			n72_trace("timers-us", (long)(mono_us() - th0));
-#endif
-
-		nw = nwatch;	/* (after the timers, which may have changed it) */
-		for (w = 0; w < nw; w++) {
-			pf[3 + w].fd = watch[w].fd;
-			pf[3 + w].events = watch[w].events;
-		}
-		/* until LVGL's next timer, or an event: no fixed tick */
-		if (poll(pf, 3 + nw, idle == LV_NO_TIMER_READY ? -1 : (int)LV_MIN(idle, 60000)) > 0) {
-			n72_trace("poll", (pf[0].revents & POLLIN ? 1 : 0) | (pf[2].revents & POLLIN ? 4 : 0) | 8);
-			for (w = 0; w < nw; w++)
-				if ((pf[3 + w].revents & (POLLIN | POLLPRI | POLLHUP | POLLERR)) &&
-				    w < nwatch && watch[w].fd == pf[3 + w].fd)
-					watch[w].cb(pf[3 + w].fd);
-			if ((pf[0].revents & POLLIN) && rt_uinput >= 0) {
-#ifdef N72_DEBUG
-				lat_read_us = mono_us();
-#endif
-				rt_feed(touch_wait_fd, touch_indev);	/* reads LVGL's side */
-				n72_trace("indev<", 0);
-				if (mbx_gpu_frame_waiting())
-					render_pending = true;
-				else
-					render_now();
-			} else if (pf[0].revents & POLLIN) {
-				struct input_event ev[16];
-				ssize_t r;
-
-				while ((r = read(touch_wait_fd, ev, sizeof(ev))) > 0) {
-#ifdef N72_DEBUG
-					const struct input_event *e = &ev[r / sizeof(ev[0]) - 1];
-
-					/* time the newest event still waiting for a frame */
-					if (!lat_event_us)
-						lat_event_us = (uint64_t)e->input_event_sec * 1000000 +
-							       e->input_event_usec;
-#else
-					(void)r;
-#endif
-				}
-#ifdef N72_DEBUG
-				lat_read_us = mono_us();
-#endif
-				lv_indev_read(touch_indev);
+			if (!skip_timers) {
 				/*
-				 * Draw the result now, unless a finished frame is
-				 * still waiting for the display: then drawing again
-				 * would only be replaced. Draw when the flip thread
-				 * hands that frame over (notify_fd), with the
-				 * newest input by then.
+				 * Animation frames start when the display takes the last one,
+				 * not on LVGL's 16 ms timer, which drifts against the 16.7 ms
+				 * refresh: a frame drawn while one is still waiting replaces it
+				 * (drawn for nothing), and the one shown then stays two
+				 * refreshes. While a frame waits, the refresh timer rests;
+				 * the hand-over (notify_fd) wakes it.
 				 */
-				if (mbx_gpu_frame_waiting())
-					render_pending = true;
-				else
-					render_now();
-			}
-			if (pf[2].revents & POLLIN) {
-				mbx_gpu_notify_fd();	/* drain */
-				if (render_pending) {
-					render_pending = false;
-					render_now();
-				} else if (refr_timer && lv_anim_count_running()) {
-					/* an animation: its next frame now */
-					lv_timer_resume(refr_timer);
-					lv_timer_ready(refr_timer);
+				if (refr_timer && notify_fd >= 0) {
+					static bool held;
+
+					if (mbx_gpu_frame_waiting()) {
+						if (!refr_timer->paused) {
+							lv_timer_pause(refr_timer);
+							held = true;
+						}
+					} else if (held) {
+						lv_timer_resume(refr_timer);
+						held = false;
+					}
 				}
+#ifdef N72_DEBUG
+				th0 = mono_us();
+#endif
+				idle = lv_timer_handler();
+				next_timer_ms = idle == LV_NO_TIMER_READY ? UINT32_MAX : tick_ms() + idle;
+
+#ifdef N72_DEBUG
+				if (fps_on && mono_us() - th0 > 30000)
+					fprintf(stderr, "timers: %.1f ms\n", (mono_us() - th0) / 1000.0);
+				if (n72_trace_on && mono_us() - th0 > 1500)
+					n72_trace("timers-us", (long)(mono_us() - th0));
+#endif
 			}
-			if (pf[1].revents & POLLIN)
-				keys_poll(NULL);
-		}
-		if (shot_wanted || scans_wanted)
-			shot_poll(NULL);	/* (asked by SIGUSR1/2) */
-		{
+			skip_timers = false;
+
+			nw = nwatch;	/* (after the timers, which may have changed it) */
+			for (w = 0; w < nw; w++) {
+				pf[3 + w].fd = watch[w].fd;
+				pf[3 + w].events = watch[w].events;
+			}
+			if (next_timer_ms == UINT32_MAX) {
+				wait_ms = -1;
+			} else {
+				int32_t rem = (int32_t)(next_timer_ms - tick_ms());
+
+				wait_ms = rem <= 0 ? 0 : (int)LV_MIN((uint32_t)rem, 60000u);
+			}
+			/* until LVGL's next timer, or an event: no fixed tick */
+			if (poll(pf, 3 + nw, wait_ms) > 0) {
+				bool other_ev = (pf[1].revents & POLLIN) || (pf[2].revents & POLLIN);
+				bool touch_ui = false;
+
+				n72_trace("poll", (pf[0].revents & POLLIN ? 1 : 0) | (pf[2].revents & POLLIN ? 4 : 0) | 8);
+				for (w = 0; w < nw; w++) {
+					if ((pf[3 + w].revents & (POLLIN | POLLPRI | POLLHUP | POLLERR)) &&
+					    w < nwatch && watch[w].fd == pf[3 + w].fd) {
+						other_ev = true;
+						watch[w].cb(pf[3 + w].fd);
+					}
+				}
+				if ((pf[0].revents & POLLIN) && rt_uinput >= 0) {
+#ifdef N72_DEBUG
+					lat_read_us = mono_us();
+#endif
+					touch_ui = rt_feed(touch_wait_fd, touch_indev);	/* reads LVGL's side */
+					if (touch_ui) {
+						n72_trace("indev<", 0);
+						if (mbx_gpu_frame_waiting())
+							render_pending = true;
+						else
+							render_now();
+					}
+				} else if (pf[0].revents & POLLIN) {
+					struct input_event ev[16];
+					ssize_t r;
+
+					touch_ui = true;
+					while ((r = read(touch_wait_fd, ev, sizeof(ev))) > 0) {
+#ifdef N72_DEBUG
+						const struct input_event *e = &ev[r / sizeof(ev[0]) - 1];
+
+						/* time the newest event still waiting for a frame */
+						if (!lat_event_us)
+							lat_event_us = (uint64_t)e->input_event_sec * 1000000 +
+								       e->input_event_usec;
+#else
+						(void)r;
+#endif
+					}
+#ifdef N72_DEBUG
+					lat_read_us = mono_us();
+#endif
+					lv_indev_read(touch_indev);
+					if (mbx_gpu_frame_waiting())
+						render_pending = true;
+					else
+						render_now();
+				}
+				if (pf[2].revents & POLLIN) {
+					mbx_gpu_notify_fd();	/* drain */
+					if (render_pending) {
+						render_pending = false;
+						render_now();
+					} else if (refr_timer && lv_anim_count_running()) {
+						/* an animation: its next frame now */
+						lv_timer_resume(refr_timer);
+						lv_timer_ready(refr_timer);
+					}
+				}
+				if (pf[1].revents & POLLIN)
+					keys_poll(NULL);
+				if (app_dormant && !other_ev && !touch_ui && !render_pending &&
+				    !shot_wanted && !scans_wanted &&
+				    (next_timer_ms == UINT32_MAX || (int32_t)(next_timer_ms - tick_ms()) > 0))
+					skip_timers = true;
+			}
+			if (shot_wanted || scans_wanted)
+				shot_poll(NULL);	/* (asked by SIGUSR1/2) */
 		}
 	}
 	return 0;

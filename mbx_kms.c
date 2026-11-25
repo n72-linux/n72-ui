@@ -17,8 +17,10 @@
 static uint8_t *disp_buf;		/* copy mode: the draw buffer */
 #define NSCAN 3
 static uint8_t *scan[NSCAN];		/* flip mode: the scan-out buffers */
+static struct mbx_buf scan_buf[NSCAN];
 static uint32_t scan_handle[NSCAN];
 static uint32_t scan_ta_seq[NSCAN];	/* pending async TA frame on scan[i] */
+static int scan_count = NSCAN;
 static uint32_t flush_words[16 * 64];
 static int flush_n;
 static bool flipping;
@@ -228,8 +230,10 @@ static void sync_flush(int dst, int src)
 	uint32_t ss = scan_stride();
 	int i;
 
-	if (!sync_qn)
+	if (!sync_qn || !scan[dst] || !scan[src]) {
+		sync_qn = 0;
 		return;
+	}
 	sync_range(scan[dst] + sync_y1 * ss, (sync_y2 - sync_y1 + 1) * ss, MBX_SYNC_FLUSH);
 	if (sync_qn == 1 && !transparent &&
 	    lv_area_get_size(&sync_q[0]) >= 320 * 120 && !(ss & 31)) {
@@ -302,6 +306,10 @@ void mbx_kms_note_async_ta(uint32_t seq)
 	ta_active_seq = seq;
 }
 
+static bool kms_layer_on = true;
+static bool kms_layer_want = true;
+static bool gpu_suspended;
+
 static void render_start_cb(lv_event_t *e)
 {
 	lv_display_t *d = lv_event_get_target(e);
@@ -309,20 +317,27 @@ static void render_start_cb(lv_event_t *e)
 	int i, k, dr = -1, src;
 	long have, f;
 
+	if (scan_count == 1)
+		flip_wait();	/* single-buffered on scan[0] while GPU-suspended */
+
 	pthread_mutex_lock(&flip_mx);
-	for (i = 0; i < NSCAN; i++)
-		if (i != st_front && i != st_latching && i != st_ready)
-			break;
-	if (i < NSCAN) {
-		dr = i;
+	if (scan_count == 1) {
+		dr = 0;
 	} else {
-		/*
-		 * Drawing faster than 60 Hz: the finished frame still waiting
-		 * has not been handed to the display; draw the newer one over
-		 * it (it holds the newest content, so nothing to bring over).
-		 */
-		dr = st_ready;
-		st_ready = -1;
+		for (i = 0; i < scan_count; i++)
+			if (i != st_front && i != st_latching && i != st_ready)
+				break;
+		if (i < scan_count) {
+			dr = i;
+		} else {
+			/*
+			 * Drawing faster than 60 Hz: the finished frame still waiting
+			 * has not been handed to the display; draw the newer one over
+			 * it (it holds the newest content, so nothing to bring over).
+			 */
+			dr = st_ready;
+			st_ready = -1;
+		}
 	}
 	st_drawing = dr;
 	src = st_latest;
@@ -337,7 +352,7 @@ static void render_start_cb(lv_event_t *e)
 	double dbg_t0 = stat_t0();
 	have = buf_frame[dr];
 	sync_qn = 0;
-	if (src >= 0 && src != dr && have < frame_no) {
+	if (scan_count > 1 && src >= 0 && src != dr && scan[src] && have < frame_no) {
 		if (have < 0 || frame_no - have > HIST - 1) {
 			if (!covered(&all, d))
 				sync_rect(dr, src, &all);
@@ -456,6 +471,15 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 #endif
 
 		n72_trace("cleaned", 0);
+		if (kms_shell && !kms_layer_want) {
+			/* Layer 1 intentionally disabled (dormant): drop flip so we don't re-enable CRTC. */
+			pthread_mutex_lock(&flip_mx);
+			st_drawing = -1;
+			pthread_mutex_unlock(&flip_mx);
+			MBX_STAT_INC(flushes);
+			lv_display_flush_ready(disp);
+			return;
+		}
 		memcpy(hist[k].a, cur_areas, sizeof(cur_areas));
 		hist[k].n = cur_n;
 		hist[k].all = cur_all;
@@ -517,7 +541,7 @@ static void refr_start_cb(lv_event_t *e)
 }
 
 /* Map one more buffer object as a region. */
-static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
+static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle, struct mbx_buf *out)
 {
 	struct mbx_buf b;
 
@@ -526,6 +550,8 @@ static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
 	regions[nregions++] = (struct region){ b.cpu, size, b.gpu, b.handle };
 	if (handle)
 		*handle = b.handle;
+	if (out)
+		*out = b;
 	return b.cpu;
 }
 
@@ -537,7 +563,8 @@ static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
  * shows it. When n72-ui exits, DRM gives the screen back to the console.
  * Without KMS there is no flipping: copy to the framebuffer.
  */
-static uint32_t kms_fb[NSCAN], kms_crtc;
+static uint32_t kms_fb[NSCAN], kms_crtc, kms_conn;
+static struct drm_mode_modeinfo kms_mode;
 static uint32_t kms_handle[NSCAN];	/* the scan buffers' GEM handles on kms_fd */
 bool kms_shell;				/* on the display's layer 1, over the applications */
 
@@ -651,7 +678,8 @@ void mbx_gpu_handoff(void)
 	fcntl(kms_fd, F_SETFD, 0);	/* kept across exec */
 	n = snprintf(buf, sizeof(buf), "%d", kms_fd);
 	for (i = 0; i < NSCAN && n < (int)sizeof(buf) - 24; i++)
-		n += snprintf(buf + n, sizeof(buf) - n, " %u %u", kms_fb[i], kms_handle[i]);
+		if (kms_fb[i] && kms_handle[i])
+			n += snprintf(buf + n, sizeof(buf) - n, " %u %u", kms_fb[i], kms_handle[i]);
 	setenv(HANDOFF_ENV, buf, 1);
 }
 
@@ -780,6 +808,27 @@ static bool kms_flip(int r)
 	};
 	int tries;
 
+	if (!kms_layer_on) {
+		struct drm_mode_crtc set = {
+			.crtc_id = kms_crtc,
+			.fb_id = pf.fb_id,
+			.mode = kms_mode,
+			.mode_valid = 1,
+			.set_connectors_ptr = (uintptr_t)&kms_conn,
+			.count_connectors = 1,
+		};
+
+		if (kms_can_turn && want != kms_rot_cur)
+			kms_set_rot(kms_fd, want);
+		if (ioctl(kms_fd, DRM_IOCTL_MODE_SETCRTC, &set)) {
+			fprintf(stderr, "n72-ui: re-enabling layer 1: %s\n", strerror(errno));
+			return false;
+		}
+		kms_layer_on = true;
+		if (handoff_n)
+			kms_drop_handoff();
+		return true;
+	}
 	if (kms_can_turn && want != kms_rot_cur) {
 		/* the turn changes: the buffer, its size and the rotation in one
 		 * commit (the source rectangle must fit the new buffer) */
@@ -827,6 +876,81 @@ wait:
 	return true;
 }
 
+static bool kms_import_scan(int fd, int i)
+{
+	struct drm_prime_handle ph = { 0 };
+	struct drm_mode_fb_cmd2 f = { 0 };
+	int dfd = mbx_export(mbx, scan_handle[i], 1);	/* PRIME from the render node */
+
+	if (dfd < 0)
+		return false;
+	ph.fd = dfd;
+	if (ioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph)) {
+		close(dfd);
+		return false;
+	}
+	close(dfd);
+	f.width = fb.width;
+	f.height = fb.height;
+	f.pixel_format = kms_shell ? 0x34325241 : 0x34325258;	/* AR24 : XR24 */
+	f.handles[0] = ph.handle;
+	f.pitches[0] = fb.stride;
+	if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &f)) {
+		struct drm_gem_close gc = { .handle = ph.handle };
+
+		ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc);
+		return false;
+	}
+	kms_fb[i] = f.fb_id;
+	kms_handle[i] = ph.handle;
+	if (kms_can_turn) {
+		uint32_t ls = buf_width_to_stride(fb.height, LV_COLOR_FORMAT_XRGB8888);
+		struct drm_mode_fb_cmd2 fl = { 0 };
+
+		fl.width = fb.height;
+		fl.height = fb.width;
+		fl.pixel_format = kms_shell ? 0x34325241 : 0x34325258;
+		fl.handles[0] = kms_handle[i];
+		fl.pitches[0] = ls;
+		if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &fl))
+			kms_can_turn = false;
+		else
+			kms_fb_l[i] = fl.fb_id;
+	}
+	return true;
+}
+
+static void kms_release_scan(int i)
+{
+	if (i <= 0 || i >= NSCAN)
+		return;
+	if (kms_fd >= 0) {
+		if (kms_fb_l[i]) {
+			ioctl(kms_fd, DRM_IOCTL_MODE_RMFB, &kms_fb_l[i]);
+			kms_fb_l[i] = 0;
+		}
+		if (kms_fb[i]) {
+			ioctl(kms_fd, DRM_IOCTL_MODE_RMFB, &kms_fb[i]);
+			kms_fb[i] = 0;
+		}
+		if (kms_handle[i]) {
+			struct drm_gem_close gc = { .handle = kms_handle[i] };
+
+			ioctl(kms_fd, DRM_IOCTL_GEM_CLOSE, &gc);
+			kms_handle[i] = 0;
+		}
+	}
+	if (scan[i]) {
+		region_remove(scan[i]);
+		mbx_free(mbx, &scan_buf[i]);
+		memset(&scan_buf[i], 0, sizeof(scan_buf[i]));
+		scan[i] = NULL;
+	}
+	scan_handle[i] = 0;
+	scan_ta_seq[i] = 0;
+	buf_frame[i] = -1;
+}
+
 static bool kms_setup(bool shell_layer)
 {
 	struct drm_mode_card_res res = { 0 };
@@ -860,70 +984,68 @@ static bool kms_setup(bool shell_layer)
 	conn.count_modes = 4;
 	if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) || !conn.count_modes)
 		goto fail;
-	for (i = 0; i < NSCAN; i++) {
-		struct drm_prime_handle ph = { 0 };
-		struct drm_mode_fb_cmd2 f = { 0 };
-		int dfd = mbx_export(mbx, scan_handle[i], 1);	/* PRIME from the render node */
-
-		if (dfd < 0)
-			goto fail;
-		ph.fd = dfd;
-		if (ioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph)) {
-			close(dfd);
-			goto fail;
-		}
-		close(dfd);
-		f.width = fb.width;
-		f.height = fb.height;
-		f.pixel_format = kms_shell ? 0x34325241 : 0x34325258;	/* AR24 : XR24 */
-		f.handles[0] = ph.handle;
-		f.pitches[0] = fb.stride;
-		if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &f))
-			goto fail;
-		kms_fb[i] = f.fb_id;
-		kms_handle[i] = ph.handle;
-	}
 	kms_crtc = crtcs[0];
-	/* the same buffers as landscape pictures, for the display to turn */
+	kms_conn = conns[0];
+	kms_mode = modes[0];
+	/* probe plane & rotation before importing framebuffers so kms_import_scan creates kms_fb_l[] */
 	if (kms_find_plane(fd)) {
 		uint32_t ls = buf_width_to_stride(fb.height, LV_COLOR_FORMAT_XRGB8888);
 
 		kms_can_turn = ls * fb.width <= fb.stride * fb.height;
-		for (i = 0; i < NSCAN && kms_can_turn; i++) {
-			struct drm_mode_fb_cmd2 f = { 0 };
-
-			f.width = fb.height;
-			f.height = fb.width;
-			f.pixel_format = kms_shell ? 0x34325241 : 0x34325258;
-			f.handles[0] = kms_handle[i];
-			f.pitches[0] = ls;
-			if (ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &f))
-				kms_can_turn = false;
-			kms_fb_l[i] = f.fb_id;
-		}
 		/* a start after a turned run: upright first (the layer is off) */
 		if (kms_can_turn && !handed && kms_rot_cur != ROT_BITS(0))
 			kms_set_rot(fd, ROT_BITS(0));
 	}
+	for (i = 0; i < NSCAN; i++) {
+		if (!kms_import_scan(fd, i))
+			goto fail;
+	}
 	if (handed) {
 		/* the layer stays on the old picture until the first flip */
 		kms_fd = fd;
+		kms_layer_on = true;
 		return true;
 	}
 	set.crtc_id = kms_crtc;
 	set.fb_id = kms_fb[0];
-	set.mode = modes[0];
+	set.mode = kms_mode;
 	set.mode_valid = 1;
-	set.set_connectors_ptr = (uintptr_t)conns;
+	set.set_connectors_ptr = (uintptr_t)&kms_conn;
 	set.count_connectors = 1;
 	if (ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &set))
 		goto fail;
 	kms_fd = fd;
+	kms_layer_on = true;
 	return true;
 fail:
 	if (fd >= 0)
 		close(fd);
 	return false;
+}
+
+static uint8_t *alloc_scan_buf(uint32_t size, int i)
+{
+	uint8_t *p = region_add(size, MBX_ALLOC_CACHED | MBX_ALLOC_CONTIG,
+				&scan_handle[i], &scan_buf[i]);
+	if (!p) {
+		/*
+		 * Contiguous memory can run out by fragmentation after a
+		 * long uptime: have the kernel compact memory, once, and
+		 * try again (without flipping the screen is wrong).
+		 */
+		int fd = open("/proc/sys/vm/compact_memory", O_WRONLY | O_CLOEXEC);
+
+		if (fd >= 0) {
+			if (write(fd, "1", 1) < 0)
+				;
+			close(fd);
+		}
+		p = region_add(size, MBX_ALLOC_CACHED | MBX_ALLOC_CONTIG,
+			       &scan_handle[i], &scan_buf[i]);
+		if (p)
+			fprintf(stderr, "n72-ui: contiguous memory after compaction\n");
+	}
+	return p;
 }
 
 static bool flip_setup(uint32_t size, bool shell_layer)
@@ -936,25 +1058,7 @@ static bool flip_setup(uint32_t size, bool shell_layer)
 		return false;
 #endif
 	for (i = 0; i < NSCAN; i++) {
-		scan[i] = region_add(size, MBX_ALLOC_CACHED | MBX_ALLOC_CONTIG, &scan_handle[i]);
-		if (!scan[i]) {
-			/*
-			 * Contiguous memory can run out by fragmentation after a
-			 * long uptime: have the kernel compact memory, once, and
-			 * try again (without flipping the screen is wrong).
-			 */
-			int fd = open("/proc/sys/vm/compact_memory", O_WRONLY | O_CLOEXEC);
-
-			if (fd >= 0) {
-				if (write(fd, "1", 1) < 0)
-					;
-				close(fd);
-			}
-			scan[i] = region_add(size, MBX_ALLOC_CACHED | MBX_ALLOC_CONTIG,
-					     &scan_handle[i]);
-			if (scan[i])
-				fprintf(stderr, "n72-ui: contiguous memory after compaction\n");
-		}
+		scan[i] = alloc_scan_buf(size, i);
 		if (!scan[i])
 			return false;	/* (the regions stay mapped; unused) */
 	}
@@ -985,7 +1089,6 @@ static bool flip_setup(uint32_t size, bool shell_layer)
 
 lv_display_t *mbx_gpu_display_create(bool shell_layer)
 {
-	struct mbx_buf a;
 	lv_draw_buf_handlers_t *h;
 	lv_draw_unit_t *u;
 	lv_display_t *disp;
@@ -994,11 +1097,11 @@ lv_display_t *mbx_gpu_display_create(bool shell_layer)
 	mbx = mbx_open();		/* the render node */
 	if (mbx < 0)
 		return NULL;
-	if (mbx_fb_info(mbx, &fb) || mbx_alloc(mbx, POOL_SIZE, MBX_ALLOC_CACHED, &a))
+	if (mbx_fb_info(mbx, &fb) || mbx_alloc(mbx, POOL_SIZE, MBX_ALLOC_CACHED, &pool_buf))
 		goto fail;
-	pool = a.cpu;
-	pool_gpu = a.gpu;
-	regions[nregions++] = (struct region){ pool, POOL_SIZE, a.gpu, a.handle };
+	pool = pool_buf.cpu;
+	pool_gpu = pool_buf.gpu;
+	regions[nregions++] = (struct region){ pool, POOL_SIZE, pool_buf.gpu, pool_buf.handle };
 	blocks[0].off = 0;
 	blocks[0].size = POOL_SIZE;
 	nblocks = 1;
@@ -1227,13 +1330,13 @@ const uint8_t *mbx_gpu_front(uint32_t *stride)
 	ta_wait_active();
 	if (flipping)
 		flip_wait();
-	return flipping ? scan[st_latest] : disp_buf;
+	return flipping ? scan[st_latest >= 0 && scan[st_latest] ? st_latest : 0] : disp_buf;
 }
 
 /* Debugging the flip buffers: both scan-out buffers (NULL if not flipping). */
 const uint8_t *mbx_gpu_scan(int i, int *is_front)
 {
-	if (!flipping || i < 0 || i >= NSCAN)
+	if (!flipping || i < 0 || i >= NSCAN || !scan[i])
 		return NULL;
 	ta_wait_active();
 	flip_wait();
@@ -1256,8 +1359,9 @@ bool mbx_gpu_set_rotation(int deg)
 		return true;
 	if (!flipping || mbx < 0 || (deg != 0 && deg != 90 && deg != 270))
 		return false;
-	if (deg && !lbuf) {
+	if (deg)
 		lstride = buf_width_to_stride(fb.height, LV_COLOR_FORMAT_XRGB8888);
+	if (deg && !kms_can_turn && !lbuf) {
 		lbuf = pool_alloc(lstride * fb.width);
 		if (!lbuf)
 			return false;
@@ -1269,14 +1373,16 @@ bool mbx_gpu_set_rotation(int deg)
 	/* the GPU writes the scan-out buffers now (or the CPU again): no
 	 * cache lines of the other way may be written back over them */
 	for (i = 0; i < NSCAN; i++)
-		sync_range(scan[i], size, MBX_SYNC_FLUSH);
+		if (scan[i])
+			sync_range(scan[i], size, MBX_SYNC_FLUSH);
 	if (lbuf)
 		sync_range(lbuf, lstride * fb.width, MBX_SYNC_FLUSH);
 	hw_turn = kms_can_turn;		/* the display turns it, else the GPU */
 	rot_deg = deg;
 	lv_display_set_rotation(d, deg == 90 ? LV_DISPLAY_ROTATION_90 :
 			        deg == 270 ? LV_DISPLAY_ROTATION_270 : LV_DISPLAY_ROTATION_0);
-	lv_display_set_buffers(d, deg && !hw_turn ? lbuf : scan[st_latest >= 0 ? st_latest : 0], NULL,
+	lv_display_set_buffers(d, deg && !hw_turn ? lbuf :
+			       scan[st_latest >= 0 && scan[st_latest] ? st_latest : 0], NULL,
 			       deg ? lstride * fb.width : size, LV_DISPLAY_RENDER_MODE_DIRECT);
 	pthread_mutex_lock(&flip_mx);
 	for (i = 0; i < NSCAN; i++)
@@ -1284,6 +1390,98 @@ bool mbx_gpu_set_rotation(int deg)
 	pthread_mutex_unlock(&flip_mx);
 	lv_obj_invalidate(lv_screen_active());
 	return true;
+}
+
+void mbx_gpu_set_layer_enabled(bool on)
+{
+	if (!flipping || !kms_shell || kms_fd < 0)
+		return;
+	if (on) {
+		kms_layer_want = true;
+		return;
+	}
+	kms_layer_want = false;
+	ta_wait_active();
+	flip_wait();
+	if (kms_layer_on) {
+		struct drm_mode_crtc set = { .crtc_id = kms_crtc };
+
+		if (!ioctl(kms_fd, DRM_IOCTL_MODE_SETCRTC, &set))
+			kms_layer_on = false;
+	}
+}
+
+void mbx_gpu_suspend(void)
+{
+	lv_display_t *d;
+	int i;
+
+	if (mbx < 0 || !flipping || !kms_shell || gpu_suspended)
+		return;
+	mbx_gpu_set_layer_enabled(false);
+	ta_ring_free();
+	for (i = 1; i < NSCAN; i++)
+		kms_release_scan(i);
+	pthread_mutex_lock(&flip_mx);
+	scan_count = 1;
+	st_front = -1;
+	st_latest = 0;
+	buf_frame[0] = -1;
+	pthread_mutex_unlock(&flip_mx);
+	if (lbuf && (!rot_deg || hw_turn)) {
+		pool_free(lbuf);
+		lbuf = NULL;
+	}
+	if (pool_is_empty())
+		pool_release();
+	d = lv_display_get_default();
+	if (d && d->buf_1)
+		d->buf_1->data = (rot_deg && !hw_turn && lbuf) ? lbuf : scan[0];
+	gpu_suspended = true;
+}
+
+void mbx_gpu_resume(void)
+{
+	uint32_t size = fb.stride * fb.height;
+	bool ok = true;
+	int i;
+
+	if (!gpu_suspended) {
+		mbx_gpu_set_layer_enabled(true);
+		return;
+	}
+	ta_wait_active();
+	flip_wait();
+	if (!pool_reacquire())
+		fprintf(stderr, "n72-ui: pool reacquire failed; continuing with CPU fallback\n");
+	for (i = 1; i < NSCAN; i++) {
+		scan[i] = alloc_scan_buf(size, i);
+		if (!scan[i] || !kms_import_scan(kms_fd, i)) {
+			ok = false;
+			break;
+		}
+	}
+	if (!ok) {
+		for (i = 1; i < NSCAN; i++)
+			kms_release_scan(i);
+		scan_count = 1;
+		fprintf(stderr, "n72-ui: scan[1..2] reacquire failed; single-buffered\n");
+	} else {
+		pthread_mutex_lock(&flip_mx);
+		scan_count = NSCAN;
+		pthread_mutex_unlock(&flip_mx);
+	}
+	pthread_mutex_lock(&flip_mx);
+	for (i = 0; i < NSCAN; i++)
+		buf_frame[i] = -1;
+	pthread_mutex_unlock(&flip_mx);
+	gpu_suspended = false;
+	mbx_gpu_set_layer_enabled(true);
+}
+
+bool mbx_gpu_is_suspended(void)
+{
+	return gpu_suspended;
 }
 
 /* LVGL draws into the scan-out buffers themselves: upright, or turned by the display */

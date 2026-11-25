@@ -777,6 +777,13 @@ static void kbd_y(void *obj, int32_t v)
 static void kbd_gone(lv_anim_t *a)
 {
 	lv_obj_add_flag(a->var, LV_OBJ_FLAG_HIDDEN);
+	app_dormant_sync();
+}
+
+bool kbd_is_open(void)
+{
+	return kbd.shown || (kbd.obj && !lv_obj_has_flag(kbd.obj, LV_OBJ_FLAG_HIDDEN)) ||
+	       psl_sliding(kbd.obj);
 }
 
 static void kbd_build(void)
@@ -821,6 +828,8 @@ void kbd_show_for(lv_obj_t *ta, void (*vis_cb)(bool shown, int32_t h))
 
 	if (kbd.shown && kbd.ta == ta)
 		return;
+	if (!ta && app_dormant)
+		app_dormant_wake(false);
 	if (kbd.ta && kbd.ta != ta) {
 		lv_obj_remove_state(kbd.ta, LV_STATE_FOCUSED);
 		if (kbd.vis_cb)
@@ -897,6 +906,8 @@ void kbd_hide_now(bool anim)
 		lv_obj_add_flag(kbd.obj, LV_OBJ_FLAG_HIDDEN);
 	}
 	kbd_state_write();
+	if (!anim)
+		app_dormant_sync();
 }
 
 void kbd_hide(void)

@@ -263,7 +263,12 @@ static void psl_finish(struct psl *s)
 
 static void psl_done(lv_anim_t *a)
 {
-	psl_finish(a->var);
+	struct psl *s = a->var;
+	bool hid = s && s->hide;
+
+	psl_finish(s);
+	if (hid)
+		app_dormant_sync();
 }
 
 static struct psl *psl_of(lv_obj_t *live)
@@ -460,6 +465,33 @@ void psl_stop(lv_obj_t *live)
 	}
 	tr_free(&s->pic);
 	memset(s, 0, sizeof(*s));
+}
+
+bool psl_sliding(lv_obj_t *live)
+{
+	struct psl *s = psl_of(live);
+
+	return s && s->img && !s->resting;
+}
+
+static void sc_restore(bool delete_pics);
+static void pf_clear(void);
+
+void nav_caches_clear(void)
+{
+	int i;
+
+	for (i = 0; i < BP_MAX; i++)
+		bp_drop(i);
+	for (i = 0; i < PSL_MAX; i++) {
+		if (psl[i].live && !psl[i].img) {
+			tr_free(&psl[i].pic);
+			psl[i].pic_sig[0] = 0;
+		}
+	}
+	if (sc.owner && !sc.timer)
+		sc_restore(false);
+	pf_clear();
 }
 
 /* The screen on display: copied from the display buffer when it is current. */
@@ -1611,7 +1643,7 @@ static void pf_tick(lv_timer_t *t)
 	lv_draw_buf_t *b;
 	int k;
 
-	if (screen_off) {
+	if (screen_off || app_dormant || (app_pid > 0 && !page_over_app)) {
 		lv_timer_pause(t);
 		return;
 	}
@@ -1680,7 +1712,8 @@ static void pf_invalidated(lv_event_t *e)
 	lv_indev_t *in;
 
 	pf_moved_ms = lv_tick_get();
-	if (pf_timer && pf_timer->paused && !screen_off)
+	if (pf_timer && pf_timer->paused && !screen_off && !app_dormant &&
+	    !(app_pid > 0 && !page_over_app))
 		lv_timer_resume(pf_timer);
 	if (!pf.n || !a)
 		return;
@@ -1697,6 +1730,16 @@ static void pf_invalidated(lv_event_t *e)
 		if (_lv_area_intersect(&x, &cc, a))
 			pf_drop(i);
 	}
+}
+
+void pf_timer_sync(void)
+{
+	if (!pf_timer)
+		return;
+	if (screen_off || app_dormant || (app_pid > 0 && !page_over_app))
+		lv_timer_pause(pf_timer);
+	else
+		lv_timer_resume(pf_timer);
 }
 
 void pf_init(void)

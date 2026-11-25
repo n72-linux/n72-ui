@@ -594,9 +594,15 @@ static void vol_hud_opa(void *obj, int32_t v)
 	lv_obj_set_style_opa(obj, v, 0);
 }
 
+bool vol_hud_visible(void)
+{
+	return vol_hud && !lv_obj_has_flag(vol_hud, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void vol_hud_gone(lv_anim_t *a)
 {
 	lv_obj_add_flag(a->var, LV_OBJ_FLAG_HIDDEN);
+	app_dormant_sync();
 }
 
 /* Material motion: fade in 150 ms, out 150 ms. */
@@ -667,6 +673,8 @@ static void vol_hud_slider_cb(lv_event_t *e)
  */
 void vol_hud_show(void)
 {
+	if (app_dormant)
+		app_dormant_wake(false);
 	if (!vol_hud) {
 		vol_hud = lv_obj_create(lv_layer_top());
 		plain(vol_hud);

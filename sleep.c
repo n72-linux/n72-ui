@@ -711,6 +711,10 @@ void idle_check(lv_timer_t *t)
 		return;
 	if (video_playing() || game_playing()) {	/* a video watched, a game played */
 		lv_display_trigger_activity(NULL);
+		if (app_dormant) {
+			lv_timer_pause(t);
+			return;
+		}
 		lv_timer_set_period(t, LV_MIN(next, 5000));
 		return;
 	}
@@ -736,4 +740,17 @@ void idle_kick(void)
 {
 	if (idle_timer && !screen_off)
 		lv_timer_ready(idle_timer);
+}
+
+void idle_timer_sync(void)
+{
+	if (!idle_timer || screen_off)
+		return;
+	if (app_dormant && (video_playing() || game_playing())) {
+		lv_display_trigger_activity(NULL);
+		lv_timer_pause(idle_timer);
+	} else {
+		lv_timer_resume(idle_timer);
+		lv_timer_ready(idle_timer);
+	}
 }

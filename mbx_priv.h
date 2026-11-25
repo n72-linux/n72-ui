@@ -75,13 +75,19 @@ struct region {
 /* mbx_gpu.c */
 extern int mbx;
 extern struct mbx_fb_info fb;
+extern struct mbx_buf pool_buf;
 extern uint32_t pool_gpu;
 extern uint8_t *pool;
 extern struct pool_block blocks[POOL_BLOCKS];
 extern int nblocks;
 void *pool_alloc(size_t size);
+void pool_free(void *p);
+bool pool_is_empty(void);
+void pool_release(void);
+bool pool_reacquire(void);
 extern struct region regions[4];
 extern int nregions;
+void region_remove(const void *cpu);
 bool in_pool(const void *p);
 uint32_t gpu_addr(const void *p);
 double gpu_now_us(void);
@@ -106,6 +112,7 @@ extern lv_area_t pm_skip[PM_SKIP_MAX];
 extern int pm_skip_n;
 int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer);
 void ta_wait_active(void);
+void ta_ring_free(void);
 
 /* mbx_kms.c */
 extern bool kms_shell;

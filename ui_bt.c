@@ -329,6 +329,7 @@ void open_bt(lv_event_t *e)
 	lv_obj_t *body, *c, *b;
 
 	LV_UNUSED(e);
+	bz_ensure();
 	body = m3_page("Bluetooth", &bt_page);
 	obj_track(&bt_page);
 	if (!have_tool("bluetoothctl")) {
@@ -631,8 +632,8 @@ void bt_auto_tick(lv_timer_t *t)
 		lv_timer_set_period(t, bt_auto_gap);
 	if (!bt_powered)
 		memset(bt_user_off, 0, sizeof(bt_user_off));	/* (off and on: a fresh start) */
-	if (bt_auto_busy || screen_off || locked || !bt_powered || bt_want >= 0 ||
-	    !access("/run/n72-audio", F_OK) || !access(BT_MANUAL_RUN, F_OK) ||
+	if (app_pid > 0 || app_dormant || bt_auto_busy || screen_off || locked || !bt_powered ||
+	    bt_want >= 0 || !access("/run/n72-audio", F_OK) || !access(BT_MANUAL_RUN, F_OK) ||
 	    !have_tool("bluetoothctl"))
 		return;
 	bt_auto_busy = true;

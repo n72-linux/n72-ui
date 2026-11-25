@@ -41,6 +41,8 @@ static void battery_text(char *buf, size_t len)
 }
 
 lv_timer_t *home_timer;
+bool app_dormant;
+static bool dormant_status_dirty;
 
 /*
  * A status bar's contents, the same on home and in the bar that comes down
@@ -219,7 +221,7 @@ static void status_ev_run(lv_timer_t *t)
 	if (getenv("N72_STATUS_LOG"))
 		fprintf(stderr, "n72-ui: status event: battery %d, Wi-Fi %d%s\n", status_batt_dirty,
 			status_net_dirty, screen_off ? " (dark: on wake)" : "");
-	if (screen_off)
+	if (screen_off || app_dormant)
 		return;
 	if (status_batt_dirty) {
 		status_batt_dirty = false;
@@ -235,7 +237,7 @@ void status_kick(bool batt, bool net)
 {
 	status_batt_dirty |= batt;
 	status_net_dirty |= net;
-	if (screen_off || status_ev_timer)
+	if (screen_off || app_dormant || status_ev_timer)
 		return;
 	status_ev_timer = lv_timer_create(status_ev_run, net ? 300 : 100, NULL);
 	lv_timer_set_repeat_count(status_ev_timer, 1);
@@ -306,8 +308,10 @@ void home_update(lv_timer_t *t)
 	char buf[64];
 	struct tm tm;
 
-	if (screen_off)
+	if (screen_off || app_dormant) {
+		dormant_status_dirty = true;
 		return;		/* (the wake path calls this again) */
+	}
 	/* (Wi-Fi: rtnetlink's events mark it; a poll only without them) */
 	if (rtnl_fd >= 0 ? status_net_dirty : now - last_status >= 30 || now < last_status) {
 		status_net_dirty = false;
@@ -751,6 +755,11 @@ void shade_set(bool open, bool anim)
 
 	if (!shade || open == shade_open)
 		return;
+	if (open && app_pid > 0 && lv_screen_active() == app_scr) {
+		if (app_dormant)
+			app_dormant_wake(false);
+		bz_ensure();
+	}
 	tr_finish();
 	if (open && on_page())
 		shade_to_top();
@@ -782,8 +791,10 @@ void shade_set(bool open, bool anim)
 		}
 	}
 	lv_obj_set_y(shade, open ? 0 : -SHADE_H);
-	if (!open)
+	if (!open) {
 		shade_closed();
+		app_dormant_sync();
+	}
 }
 
 /* Swipe down anywhere on home opens the shade, swipe up closes it. */
@@ -1064,12 +1075,14 @@ static void app_y(void *obj, int32_t v)
 static void app_hide_done(lv_anim_t *a)
 {
 	lv_obj_add_flag(a->var, LV_OBJ_FLAG_HIDDEN);
+	app_dormant_sync();
 }
 
 static void app_shade_done(lv_anim_t *a)
 {
 	LV_UNUSED(a);
 	shade_closed();
+	app_dormant_sync();
 }
 
 static void app_slide(lv_obj_t *obj, int32_t to, lv_anim_completed_cb_t done)
@@ -1127,6 +1140,8 @@ void app_bar_set(bool show)
 		app_bar_timer = NULL;
 	}
 	if (show) {
+		if (app_dormant)
+			app_dormant_wake(false);
 		app_bar_timer = lv_timer_create(app_bar_expire, APP_BAR_MS, NULL);
 		lv_timer_set_repeat_count(app_bar_timer, 1);
 		if (app_bar_shown)
@@ -1260,7 +1275,8 @@ void app_bar_update(void)
 	 * the picture for the next slide, while nothing moves */
 	psl_check(app_bar);
 	/* (only over the application: elsewhere the bar is not needed) */
-	if (!app_bar_shown && lv_screen_active() == app_scr && !lv_anim_count_running() && !(touch_indev &&
+	if (!app_dormant && !mbx_gpu_is_suspended() && !app_bar_shown &&
+	    lv_screen_active() == app_scr && !lv_anim_count_running() && !(touch_indev &&
 	    lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
 		psl_warm(app_bar, app_bar_sig);
 }
@@ -1376,6 +1392,14 @@ lv_draw_buf_t *shade_pic_get(void)
 	return shade_pic;
 }
 
+void shade_pic_free(void)
+{
+	if (sd.sfg == shade_pic)
+		return;
+	tr_free(&shade_pic);
+	shade_pic_dirty = true;
+}
+
 static lv_opa_t sd_scrim_opa(int32_t y)
 {
 	return (lv_opa_t)(LV_OPA_50 * (y + SHADE_H) / SHADE_H);
@@ -1452,6 +1476,8 @@ static void sd_end(bool open)
 			app_bar_set(true);	/* the bar's timeout starts again */
 	}
 	sd.to_page = false;
+	if (!open)
+		app_dormant_sync();
 }
 
 static void sd_anim_done(lv_anim_t *a)
@@ -1528,6 +1554,12 @@ static bool sd_begin(bool touch)
 {
 	bool home = lv_screen_active() == home_scr, page = on_page();
 	lv_draw_buf_t *bg = NULL, *fg;
+
+	if (!home && !page && app_pid > 0) {
+		if (app_dormant)
+			app_dormant_wake(false);
+		bz_ensure();
+	}
 
 	if (touch)
 		ui_touch_lost();
@@ -1796,6 +1828,8 @@ void ui_lock(void)
 	if (shade_open)
 		sd_end(false);
 	app_bar_set(false);
+	if (app_pid > 0)
+		app_dormant_wake(true);
 	if (!lock_scr)
 		lock_build();
 	cur = lv_screen_active();
@@ -1863,6 +1897,7 @@ static void ul_finish(bool open)
 		else
 			mbx_gpu_set_transparent(false);
 		home_update(NULL);
+		app_dormant_sync();
 	} else {
 		lv_screen_load(lock_scr);
 		lv_obj_delete(ul.scr);
@@ -2381,6 +2416,8 @@ static void za_next(void)
 		za_free();
 		if (app_pid <= 0)
 			app_home_ui();
+		else
+			app_dormant_sync();
 		break;
 	case 4:			/* covered: shrink into the icon over home */
 		lv_obj_remove_flag(za.sym, LV_OBJ_FLAG_HIDDEN);
@@ -2516,6 +2553,8 @@ static void qs_to_page(void (*open)(lv_event_t *))
 	if (!shade_open || sd.on || sd.scr || za.phase || locked || !settings_tile ||
 	    (!over_app && lv_screen_active() != home_scr))
 		return;
+	if (over_app)
+		app_dormant_wake(true);
 	push_quiet = true;
 	push_quiet_scr = NULL;
 	open(NULL);
@@ -2605,6 +2644,78 @@ static void pb_done(lv_anim_t *a)
 	tr_free(&pb.pic);
 	if (app_pid <= 0)
 		app_home_ui();
+	else
+		app_dormant_sync();
+}
+
+static void app_dormant_enter(void)
+{
+	app_dormant = true;
+	if (home_timer)
+		lv_timer_pause(home_timer);
+	if (shade_warm_timer)
+		lv_timer_pause(shade_warm_timer);
+	pf_timer_sync();
+	idle_timer_sync();
+	bz_stop();
+	tr_free(&za.home);
+	za.home_stale = true;
+	tr_free(&sd.home_pic);
+	shade_pic_free();
+	pg_pics_free();
+	nav_caches_clear();
+	wp_suspend();
+	mbx_gpu_set_layer_enabled(false);
+	mbx_gpu_suspend();
+}
+
+void app_dormant_wake(bool full)
+{
+	if (!app_dormant && !mbx_gpu_is_suspended())
+		return;
+	if (full) {
+		app_dormant = false;
+		mbx_gpu_resume();
+		wp_resume();
+		if (home_timer)
+			lv_timer_resume(home_timer);
+		if (shade_warm_timer)
+			lv_timer_resume(shade_warm_timer);
+		pf_timer_sync();
+		idle_timer_sync();
+		bz_ensure();
+		if (dormant_status_dirty || status_batt_dirty || status_net_dirty) {
+			dormant_status_dirty = false;
+			if (status_net_dirty)
+				status_kick(status_batt_dirty, true);
+			home_update(NULL);
+		}
+		if (lv_screen_active())
+			lv_obj_invalidate(lv_screen_active());
+	} else if (app_dormant) {
+		app_dormant = false;
+		mbx_gpu_set_layer_enabled(true);
+		idle_timer_sync();
+		if (dormant_status_dirty || status_batt_dirty) {
+			dormant_status_dirty = false;
+			home_update(NULL);
+		}
+		if (lv_screen_active())
+			lv_obj_invalidate(lv_screen_active());
+		lv_obj_invalidate(lv_layer_top());
+	}
+}
+
+void app_dormant_sync(void)
+{
+	bool want = app_pid > 0 && !za.phase && app_scr && lv_screen_active() == app_scr &&
+		    !locked && !shade_open && !sd.on && !sd.scr && !app_bar_shown &&
+		    !psl_sliding(app_bar) && !(app_bar && !lv_obj_has_flag(app_bar, LV_OBJ_FLAG_HIDDEN) &&
+		    lv_anim_get(app_bar, app_y)) && !gp_up() && !kbd_is_open() &&
+		    !vol_hud_visible() && !vc_is_visible() && !page_over_app && !pb.scr && !tr.scr;
+
+	if (want && !app_dormant)
+		app_dormant_enter();
 }
 
 bool page_back_to_app(void)
@@ -2679,6 +2790,7 @@ void apps_reload(void);
 
 static void app_home_ui(void)
 {
+	app_dormant_wake(true);
 	wp_apply_kick();	/* (a restart for the palette waits for no application) */
 	vc_stop();
 	if (apps_stale)
@@ -2720,11 +2832,13 @@ static void app_home_ui(void)
 	lv_obj_invalidate(lv_layer_top());
 	home_update(NULL);
 	pg_warm_kick();
+	games_art_resume();
 }
 
 /* Close: the card covers the application, then goes into its icon. */
 void za_close(void)
 {
+	app_dormant_wake(true);
 	if (za.phase || locked || lv_screen_active() != app_scr || !za.tile) {
 		app_home_ui();
 		return;
@@ -2773,6 +2887,7 @@ static void app_closed(void)
 	}
 	if (za.phase)
 		return;			/* the animation ends on home */
+	app_dormant_wake(true);
 	if (!was_ending && lv_screen_active() == app_scr)
 		za_close();		/* it quit by itself */
 	else

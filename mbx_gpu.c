@@ -19,6 +19,7 @@
 
 int mbx = -1;
 struct mbx_fb_info fb;
+struct mbx_buf pool_buf;
 uint32_t pool_gpu;
 uint8_t *pool;
 
@@ -36,6 +37,8 @@ void *pool_alloc(size_t size)
 {
 	int i;
 
+	if (!pool)
+		return NULL;
 	size = (size + POOL_ALIGN - 1) & ~(size_t)(POOL_ALIGN - 1);
 	for (i = 0; i < nblocks; i++) {
 		if (blocks[i].used || blocks[i].size < size)
@@ -55,11 +58,14 @@ void *pool_alloc(size_t size)
 	return NULL;
 }
 
-static void pool_free(void *p)
+void pool_free(void *p)
 {
-	uint32_t off = (uint8_t *)p - pool;
+	uint32_t off;
 	int i;
 
+	if (!pool || !p)
+		return;
+	off = (uint8_t *)p - pool;
 	for (i = 0; i < nblocks; i++)
 		if (blocks[i].off == off)
 			break;
@@ -76,6 +82,54 @@ static void pool_free(void *p)
 		memmove(&blocks[i], &blocks[i + 1], (nblocks - i - 1) * sizeof(blocks[0]));
 		nblocks--;
 	}
+}
+
+bool pool_is_empty(void)
+{
+	return pool && nblocks == 1 && !blocks[0].used;
+}
+
+void region_remove(const void *cpu)
+{
+	int i;
+
+	for (i = 0; i < nregions; i++) {
+		if (regions[i].cpu == cpu) {
+			memmove(&regions[i], &regions[i + 1],
+				(nregions - i - 1) * sizeof(regions[0]));
+			nregions--;
+			return;
+		}
+	}
+}
+
+void pool_release(void)
+{
+	if (!pool)
+		return;
+	ta_wait_active();
+	region_remove(pool);
+	mbx_free(mbx, &pool_buf);
+	memset(&pool_buf, 0, sizeof(pool_buf));
+	pool = NULL;
+	pool_gpu = 0;
+	nblocks = 0;
+}
+
+bool pool_reacquire(void)
+{
+	if (pool)
+		return true;
+	if (mbx < 0 || nregions >= 4 || mbx_alloc(mbx, POOL_SIZE, MBX_ALLOC_CACHED, &pool_buf))
+		return false;
+	pool = pool_buf.cpu;
+	pool_gpu = pool_buf.gpu;
+	regions[nregions++] = (struct region){ pool, POOL_SIZE, pool_buf.gpu, pool_buf.handle };
+	blocks[0].off = 0;
+	blocks[0].size = POOL_SIZE;
+	blocks[0].used = false;
+	nblocks = 1;
+	return true;
 }
 
 /*
@@ -128,8 +182,13 @@ void sync_range(const void *p, uint32_t size, uint32_t op)
 {
 	double t0 = stat_t0();
 	const struct region *r = region_of(p);
-	struct mbx_buf b = { .cpu = r->cpu, .handle = r->handle, .size = r->size, .cached = 1 };
-	uint32_t off = (const uint8_t *)p - r->cpu;
+	struct mbx_buf b;
+	uint32_t off;
+
+	if (!r)
+		return;
+	b = (struct mbx_buf){ .cpu = r->cpu, .handle = r->handle, .size = r->size, .cached = 1 };
+	off = (const uint8_t *)p - r->cpu;
 
 	if (op == MBX_SYNC_FLUSH)
 		mbx_flush(mbx, &b, off, size);
@@ -225,13 +284,15 @@ void *buf_malloc(size_t size, lv_color_format_t cf)
 {
 	void *p;
 
-	LV_UNUSED(cf);
-	p = pool_alloc(size);
-	if (!p) {
+	if (pool &&
+	    (cf == LV_COLOR_FORMAT_XRGB8888 || cf == LV_COLOR_FORMAT_ARGB8888) &&
+	    size >= 16384) {
+		p = pool_alloc(size);
+		if (p)
+			return p;
 		MBX_STAT_INC(pool_misses);
-		p = lv_malloc(size);		/* CPU-only fallback */
 	}
-	return p;
+	return lv_malloc(size);
 }
 
 /* The 3D core needs strides in multiples of 8 pixels (32 bytes). */
@@ -242,7 +303,7 @@ uint32_t buf_width_to_stride(uint32_t w, lv_color_format_t cf)
 
 void buf_free(void *p)
 {
-	if (p && (uint8_t *)p >= pool && (uint8_t *)p < pool + POOL_SIZE) {
+	if (pool && p && (uint8_t *)p >= pool && (uint8_t *)p < pool + POOL_SIZE) {
 		ta_wait_active();
 		pool_free(p);
 	} else {

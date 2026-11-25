@@ -604,6 +604,10 @@ static void games_art_next(lv_timer_t *t)
 	struct gpage *g = lv_timer_get_user_data(t);
 	int k, j;
 
+	if (app_pid != 0 || lv_obj_get_screen(g->body) != lv_screen_active()) {
+		lv_timer_pause(t);
+		return;
+	}
 	for (k = 0; k < g->nl; k++) {
 		struct flist *l = &g->list[k];
 
@@ -1330,6 +1334,7 @@ static void gp_close(void)
 		lv_draw_buf_destroy(gp.pic);
 		gp.pic = NULL;
 	}
+	app_dormant_sync();
 }
 
 /*
@@ -1344,11 +1349,20 @@ bool gp_home(void)
 		gp_close();
 		return false;	/* (go_home ends it) */
 	}
+	if (app_dormant)
+		app_dormant_wake(false);
 	app_bar_set(false);
 	shade_set(false, false);
 	gp_build();
 	gp_want(1, NULL);
 	return true;
+}
+
+void games_art_resume(void)
+{
+	if (games_cur && games_cur->art_timer && app_pid == 0 &&
+	    lv_obj_get_screen(games_cur->body) == lv_screen_active())
+		lv_timer_resume(games_cur->art_timer);
 }
 
 /* The game has ended (app_closed) */
@@ -1368,6 +1382,7 @@ void gp_gone(void)
 	gp.then = NULL;
 	gp.save_looks = 0;
 	gp.core[0] = gp.base[0] = 0;
+	app_dormant_sync();
 }
 
 /* The game about to start: its name and system for the panel */

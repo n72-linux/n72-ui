@@ -834,6 +834,21 @@ void ta_wait_active(void)
 	memset(ta_slot_seq, 0, sizeof(ta_slot_seq));
 }
 
+void ta_ring_free(void)
+{
+	int i;
+
+	ta_wait_active();
+	for (i = 0; i < TA_RING_BUFS; i++) {
+		if (ta_ring[i].cpu) {
+			mbx_free(mbx, &ta_ring[i]);
+			memset(&ta_ring[i], 0, sizeof(ta_ring[i]));
+		}
+	}
+	ta_ring_idx = 0;
+	ta_ring_state = 0;
+}
+
 static bool ta_ring_ensure(void)
 {
 	int i;

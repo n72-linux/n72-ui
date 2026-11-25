@@ -411,7 +411,7 @@ static void wx_tick(lv_timer_t *t)
 	time_t now = time(NULL);
 
 	LV_UNUSED(t);
-	if (!conf.wx_set || !wifi_up || wx.fetching || screen_off)
+	if (app_pid > 0 || !conf.wx_set || !wifi_up || wx.fetching || screen_off)
 		return;
 	if (wx.ok && now - wx.at < WX_EVERY_S && now >= wx.at)
 		return;

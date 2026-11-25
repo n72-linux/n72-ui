@@ -64,6 +64,8 @@ void playback_check(lv_timer_t *t);
 void uevent_init(void);
 void idle_check(lv_timer_t *t);
 void idle_kick(void);
+void idle_timer_sync(void);
+extern bool app_dormant;
 
 #ifdef N72_DEBUG
 /* bench.c */

@@ -583,8 +583,8 @@ static void rot_pos_ev(int fd)
 
 static void rot_poll(lv_timer_t *t)
 {
-	/* the accelerometer only for Auto-rotate and a video: off, it powers down */
-	bool reads = conf.autorot == ROT_AUTO || (app_pid > 0 && app_is_video());
+	/* the accelerometer only for Auto-rotate (outside fixed-layout apps) and video */
+	bool reads = app_pid <= 0 ? conf.autorot == ROT_AUTO : app_is_video();
 	bool need = !screen_off && !locked && (reads || rot_wanted() != ui_rot);
 	int r, want;
 

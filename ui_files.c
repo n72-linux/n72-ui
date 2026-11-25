@@ -356,8 +356,8 @@ void open_paint(lv_event_t *e);
 static void shade_pic_warm(lv_timer_t *t)
 {
 	LV_UNUSED(t);
-	if (!shade || screen_off || locked || sd.on || sd.scr || za.phase || tr.scr ||
-	    lv_anim_count_running() || (touch_indev &&
+	if (app_pid > 0 || app_dormant || !shade || screen_off || locked || sd.on || sd.scr ||
+	    za.phase || tr.scr || lv_anim_count_running() || (touch_indev &&
 	    lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
 		return;
 	if (!(shade_pic && !shade_pic_dirty && shade_pic_min == bp_minute()))

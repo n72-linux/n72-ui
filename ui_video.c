@@ -127,11 +127,18 @@ static void vc_opa_exec(void *o, int32_t v)
 	lv_obj_set_style_opa(o, (lv_opa_t)v, 0);
 }
 
+bool vc_is_visible(void)
+{
+	return vc.shown || (vc.ui && !lv_obj_has_flag(vc.ui, LV_OBJ_FLAG_HIDDEN));
+}
+
 static void vc_fade_done(lv_anim_t *a)
 {
 	if (!vc.shown)
 		lv_obj_add_flag(a->var, LV_OBJ_FLAG_HIDDEN);
 	lv_obj_remove_local_style_prop(a->var, LV_STYLE_OPA, 0);	/* no layer at rest */
+	if (!vc.shown)
+		app_dormant_sync();
 }
 
 static void vc_show(bool on)
@@ -140,6 +147,8 @@ static void vc_show(bool on)
 
 	if (!vc.ui)
 		return;
+	if (on && app_dormant)
+		app_dormant_wake(false);
 	vc.shown = on;
 	if (on && vc.poll) {
 		lv_timer_set_period(vc.poll, 250);	/* the position, fresh */
@@ -577,6 +586,7 @@ void vc_stop(void)
 		vc.poll = NULL;
 	}
 	vc.up = false;
+	idle_timer_sync();
 }
 
 /*
@@ -1127,6 +1137,8 @@ static void bz_start(lv_timer_t *t)
 	pid_t me = getpid(), pid;
 
 	LV_UNUSED(t);
+	if (app_dormant)
+		return;
 	if (!reaped) {
 		reaped = true;
 		bz_reap_orphans();
@@ -1163,6 +1175,30 @@ static void bz_start(lv_timer_t *t)
 		return;
 	bz_fd = p[0];
 	ui_watch(bz_fd, bz_ev);
+}
+
+void bz_stop(void)
+{
+	if (bz_timer) {
+		lv_timer_delete(bz_timer);
+		bz_timer = NULL;
+	}
+	if (bz_fd >= 0) {
+		ui_unwatch(bz_fd);
+		close(bz_fd);
+		bz_fd = -1;
+	}
+	if (bz_pid > 0) {
+		kill(bz_pid, SIGTERM);
+		waitpid(bz_pid, NULL, 0);
+		bz_pid = 0;
+	}
+}
+
+void bz_ensure(void)
+{
+	if (bz_fd < 0 && !app_dormant)
+		bz_start(NULL);
 }
 
 /* The settings kept on the flash, applied once at start. */

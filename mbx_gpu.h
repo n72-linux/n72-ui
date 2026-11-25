@@ -68,6 +68,20 @@ bool mbx_gpu_draws_direct(void);
 lv_draw_buf_t *mbx_gpu_turn_buf(const lv_draw_buf_t *src, int deg);
 /* straight alpha to premultiplied, in place; flags the picture so */
 void mbx_gpu_premultiply_buf(lv_draw_buf_t *b);
+/*
+ * Dormant GPU lifecycle (when kms_shell is active over an external app):
+ * - mbx_gpu_set_layer_enabled(false): waits for pending TA/flips and disables
+ *   KMS layer 1 in hardware so CLCD DMA stops scanning it out. Re-enabled
+ *   automatically by kms_flip() on the next overlay frame after on=true.
+ * - mbx_gpu_suspend(): disables layer 1, frees TA ring, scan[1..2], unused
+ *   lbuf, and the 6 MiB pool (when empty), keeping scan[0] for instant
+ *   single-buffered transparent overlays.
+ * - mbx_gpu_resume(): re-allocates pool and scan[1..2] and re-arms layer 1.
+ */
+void mbx_gpu_set_layer_enabled(bool on);
+void mbx_gpu_suspend(void);
+void mbx_gpu_resume(void);
+bool mbx_gpu_is_suspended(void);
 
 /*
  * Opt in, for one image draw: the GPU may stretch the whole picture (d->src,

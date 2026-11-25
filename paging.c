@@ -212,10 +212,12 @@ static void pg_layout(void)
 
 /* --------------------------------------------------------- the pictures */
 
-static void pg_pics_free(void)
+void pg_pics_free(void)
 {
 	int i;
 
+	if (pg_warm_timer)
+		lv_timer_pause(pg_warm_timer);
 	for (int k = 0; k < PG_PAGES_MAX; k++)
 		tr_free(&pg.page_pic[k]);
 	tr_free(&pg.dock_pic);
@@ -969,8 +971,9 @@ void pg_warm_kick(void)
 void pg_warm(lv_timer_t *t)
 {
 	LV_UNUSED(t);
-	if (screen_off || locked || pg.scr || lv_screen_active() != home_scr ||
-	    tr.scr || za.phase || sd.on || lv_anim_count_running() ||
+	if (app_pid > 0 || app_dormant || screen_off || locked || pg.scr ||
+	    lv_screen_active() != home_scr || tr.scr || za.phase || sd.on ||
+	    lv_anim_count_running() ||
 	    (touch_indev && lv_indev_get_state(touch_indev) == LV_INDEV_STATE_PRESSED))
 		return;
 	n72_trace("pg-warm", 0);

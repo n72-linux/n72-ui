@@ -557,6 +557,23 @@ static struct {
 	bool gone;		/* out of the table: freed with its last image */
 } wp_holds[WP_HOLDS];
 
+static struct {
+	lv_obj_t *img;
+	int kind;
+} wp_slots[WP_HOLDS];
+static bool wp_suspended;
+
+static void wp_slot_gone(lv_event_t *e)
+{
+	lv_obj_t *img = lv_event_get_current_target(e);
+
+	for (int i = 0; i < WP_HOLDS; i++)
+		if (wp_slots[i].img == img) {
+			wp_slots[i].img = NULL;
+			break;
+		}
+}
+
 static void wp_free(lv_draw_buf_t *b)
 {
 	lv_image_cache_drop(b);
@@ -647,7 +664,7 @@ void wp_load(void)
  */
 lv_draw_buf_t *wp_upright(int kind)
 {
-	if (!wp.set[kind])
+	if (wp_suspended || !wp.set[kind])
 		return NULL;
 	if (!wp.pic[kind][0])
 		wp.pic[kind][0] = wp_read(kind, 0);
@@ -696,7 +713,66 @@ bool wp_put(lv_obj_t *scr, int kind)
 	lv_obj_add_flag(i, LV_OBJ_FLAG_IGNORE_LAYOUT);
 	lv_obj_set_pos(i, 0, 0);
 	lv_obj_move_to_index(i, 0);
+	for (int k = 0; k < WP_HOLDS; k++) {
+		if (!wp_slots[k].img) {
+			wp_slots[k].img = i;
+			wp_slots[k].kind = kind;
+			lv_obj_add_event_cb(i, wp_slot_gone, LV_EVENT_DELETE, NULL);
+			break;
+		}
+	}
 	return true;
+}
+
+void wp_suspend(void)
+{
+	int i, k, t;
+
+	if (wp_suspended)
+		return;
+	for (i = 0; i < WP_HOLDS; i++) {
+		lv_obj_t *img = wp_slots[i].img;
+
+		if (!img || !lv_obj_is_valid(img))
+			continue;
+		lv_image_set_src(img, NULL);
+		lv_obj_remove_event_cb(img, wp_image_gone);
+	}
+	for (i = 0; i < WP_HOLDS; i++) {
+		wp_holds[i].b = NULL;
+		wp_holds[i].refs = 0;
+		wp_holds[i].gone = false;
+	}
+	for (k = 0; k < WP_KINDS; k++) {
+		for (t = 0; t < 2; t++) {
+			if (wp.pic[k][t]) {
+				wp_free(wp.pic[k][t]);
+				wp.pic[k][t] = NULL;
+			}
+		}
+	}
+	wp_suspended = true;
+}
+
+void wp_resume(void)
+{
+	int i;
+
+	if (!wp_suspended)
+		return;
+	wp_suspended = false;
+	for (i = 0; i < WP_HOLDS; i++) {
+		lv_obj_t *img = wp_slots[i].img;
+		lv_draw_buf_t *b;
+
+		if (!img || !lv_obj_is_valid(img))
+			continue;
+		b = wp_pic(wp_slots[i].kind);
+		if (b && wp_hold(img, b)) {
+			lv_image_set_src(img, b);
+			lv_obj_invalidate(img);
+		}
+	}
 }
 
 /* ------------------------------------------------------- Settings page */
@@ -723,7 +799,8 @@ static bool wp_apply_restart;
 static bool wp_apply_try(void)
 {
 	/* (pg.scr: also the frame between a swipe's arrival and home taking over) */
-	if (screen_off || locked || tr.scr || sc.owner || pg.on || pg.settling || pg.scr)
+	if (app_dormant || mbx_gpu_is_suspended() ||
+	    screen_off || locked || tr.scr || sc.owner || pg.on || pg.settling || pg.scr)
 		return false;
 	if (wp_apply_restart) {
 		if (app_pid > 0)
