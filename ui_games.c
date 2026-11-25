@@ -630,6 +630,7 @@ static void games_art_next(lv_timer_t *t)
 			if ((gm->art = games_art_cache_load(cache))) {
 				gm->art_state = 2;
 				games_row_art(l->row[j], gm);
+				pf_label_changed(l->row[j]);
 				return;		/* one a tick */
 			}
 			if (games_art_busy)
@@ -679,8 +680,10 @@ static void games_art_made(const char *out, void *ud)
 			if ((gm->art = games_art_cache_load(cache)))
 				gm->art_state = 2;
 		}
-		if (gm->art && (r = games_row_of(g, i)))
+		if (gm->art && (r = games_row_of(g, i))) {
 			games_row_art(r, gm);
+			pf_label_changed(r);
+		}
 		break;
 	}
 	free(path);

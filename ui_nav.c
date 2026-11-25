@@ -1474,13 +1474,30 @@ static void pf_give(lv_obj_t *owner, lv_obj_t *c, lv_draw_buf_t *b)
 	lv_draw_buf_destroy(b);
 }
 
-/* A label changed: the prefetched picture of the row holding it is stale. */
+/* A child changed: any cached scroll/prefetch picture holding it is stale. */
 void pf_label_changed(lv_obj_t *lbl)
 {
 	for (int i = pf.n - 1; i >= 0; i--)
 		for (lv_obj_t *o = lbl; o; o = lv_obj_get_parent(o))
 			if (o == pf.child[i]) {
 				pf_drop(i);
+				break;
+			}
+	for (int i = sc.n - 1; i >= 0; i--)
+		for (lv_obj_t *o = lbl; o; o = lv_obj_get_parent(o))
+			if (o == sc.live[i]) {
+				if (lv_obj_is_valid(sc.pic[i]))
+					lv_obj_delete(sc.pic[i]);
+				if (lv_obj_is_valid(sc.live[i]))
+					lv_obj_set_style_opa_layered(sc.live[i], LV_OPA_COVER, 0);
+				lv_image_cache_drop(sc.buf[i]);
+				lv_draw_buf_destroy(sc.buf[i]);
+				sc.bytes -= sc.size[i];
+				sc.n--;
+				sc.live[i] = sc.live[sc.n];
+				sc.pic[i] = sc.pic[sc.n];
+				sc.buf[i] = sc.buf[sc.n];
+				sc.size[i] = sc.size[sc.n];
 				break;
 			}
 }

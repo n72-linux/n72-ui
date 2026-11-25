@@ -183,9 +183,14 @@ static void rows_sync(lv_obj_t *body, struct flist *ls, int nl,
 
 		if (!l->card)
 			continue;
-		lv_obj_get_coords(l->card, &cc);
-		first = LV_MAX(floor_div(bc.y1 - cc.y1 - FROW_PAD, FROW_H) - 1, 0);
-		last = LV_MIN(floor_div(bc.y2 - cc.y1 - FROW_PAD, FROW_H) + 2, l->n);
+		if (l->n <= FROW_POOL) {
+			first = 0;
+			last = l->n;
+		} else {
+			lv_obj_get_coords(l->card, &cc);
+			first = LV_MAX(floor_div(bc.y1 - cc.y1 - FROW_PAD, FROW_H) - 1, 0);
+			last = LV_MIN(floor_div(bc.y2 - cc.y1 - FROW_PAD, FROW_H) + 2, l->n);
+		}
 		for (j = 0; j < FROW_POOL; j++)
 			if (l->row[j] && l->at[j] >= 0 && (l->at[j] < first || l->at[j] >= last)) {
 				l->at[j] = -1;
