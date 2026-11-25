@@ -261,7 +261,7 @@ void ui_rebuild(bool load)
 	{
 		lv_obj_t **gone[] = {
 			&status_time, &status_wifi, &status_bt, &batt_lbl, &status_np,
-			&home_clock, &home_date, &home_batt, &home_net,
+			&home_card, &home_clock, &home_date, &home_batt, &home_net,
 			&settings_tile, &home_apps, &home_bar, &home_dots, &home_dock, &home_view,
 		};
 
@@ -338,7 +338,7 @@ void home_fresh(void)
 	{
 		lv_obj_t **gone[] = {
 			&status_time, &status_wifi, &status_bt, &batt_lbl, &status_np,
-			&home_clock, &home_date, &home_batt, &home_net,
+			&home_card, &home_clock, &home_date, &home_batt, &home_net,
 			&settings_tile, &home_apps, &home_bar, &home_dots, &home_dock, &home_view,
 		};
 

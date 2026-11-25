@@ -634,11 +634,14 @@ static void wp_drop(int kind, int turned)
 		wp_free(b);
 }
 
+static void wp_blur_clear(void);
+
 /* (Re)read what is set: at the start, and after a conversion. Frames on demand. */
 void wp_load(void)
 {
 	int k, t;
 
+	wp_blur_clear();
 	for (k = 0; k < WP_KINDS; k++)
 		for (t = 0; t < 2; t++)
 			wp_drop(k, t);
@@ -724,12 +727,490 @@ bool wp_put(lv_obj_t *scr, int kind)
 	return true;
 }
 
+/* ----------------------------------------------------- frosted glass */
+
+#define WP_GLASS_R	24
+#define WP_GLASS_MAX	8
+
+static bool glass_lut_ok;
+static uint8_t glass_corner_a[WP_GLASS_R][WP_GLASS_R];
+static uint8_t glass_corner_rim[WP_GLASS_R][WP_GLASS_R];
+
+static struct {
+	uint8_t *rgb;		/* bw * bh * 3, untinted blurred wallpaper */
+	int bw, bh;
+	int w, h, rot;
+	uint32_t *card_strip;	/* PW * PG_CARD_H, XRGB8888 (0xffRRGGBB) */
+	int strip_px, strip_pw;
+	uint32_t strip_tint;
+	bool strip_dark;
+} wp_blur;
+
+static struct {
+	lv_obj_t *obj;
+	lv_draw_buf_t *b;
+	int32_t sx, sy, w, h, r;
+} wp_glass_slots[WP_GLASS_MAX];
+
+static void wp_glass_lut_init(void)
+{
+	int dy, dx;
+
+	if (glass_lut_ok)
+		return;
+	for (dy = 0; dy < WP_GLASS_R; dy++) {
+		for (dx = 0; dx < WP_GLASS_R; dx++) {
+			float dist = hypotf((float)(WP_GLASS_R - 0.5f) - (float)dx,
+					    (float)(WP_GLASS_R - 0.5f) - (float)dy);
+			float sdf = (float)WP_GLASS_R - dist;
+			float a = LV_CLAMP(0.0f, sdf + 0.5f, 1.0f);
+			float rw = LV_CLAMP(0.0f, 1.0f - fabsf(sdf - 0.7f) / 0.85f, 1.0f) * a;
+
+			glass_corner_a[dy][dx] = (uint8_t)lroundf(a * 255.0f);
+			glass_corner_rim[dy][dx] = (uint8_t)lroundf(rw * 255.0f);
+		}
+	}
+	glass_lut_ok = true;
+}
+
+static inline uint32_t glass_apply_rim(uint32_t rgb, uint8_t rim_w, bool top_half)
+{
+	uint32_t base = conf.dark ? (top_half ? 46u : 26u) : (top_half ? 96u : 56u);
+	uint32_t k = (base * rim_w + 128u) >> 8;
+	uint32_t r = (rgb >> 16) & 255u, g = (rgb >> 8) & 255u, b = rgb & 255u;
+
+	if (!k)
+		return rgb & 0x00ffffffu;
+	r += ((255u - r) * k + 128u) >> 8;
+	g += ((255u - g) * k + 128u) >> 8;
+	b += ((255u - b) * k + 128u) >> 8;
+	return (r << 16) | (g << 8) | b;
+}
+
+static void wp_blur_clear(void)
+{
+	free(wp_blur.rgb);
+	free(wp_blur.card_strip);
+	memset(&wp_blur, 0, sizeof(wp_blur));
+}
+
+/* 3-pass separable 9-tap binomial Gaussian [1, 8, 28, 56, 70, 56, 28, 8, 1] / 256. */
+static bool wp_blur_ensure(void)
+{
+	lv_draw_buf_t *src;
+	int bw, bh, x, y, pass;
+	uint8_t *rgb, *tmp;
+
+	if (!home_wp || wp_suspended)
+		return false;
+	if (wp_blur.rgb && wp_blur.w == W && wp_blur.h == H && wp_blur.rot == ui_rot)
+		return true;
+	src = wp_pic(WP_HOME);
+	if (!src || (int)src->header.w != W || (int)src->header.h != H)
+		return false;
+	wp_blur_clear();
+	bw = W / 4;
+	bh = H / 4;
+	if (bw < 2 || bh < 2)
+		return false;
+	rgb = malloc((size_t)bw * bh * 3);
+	tmp = malloc((size_t)bw * bh * 3);
+	if (!rgb || !tmp) {
+		free(rgb);
+		free(tmp);
+		return false;
+	}
+	/* 4x4 box downsample from XRGB8888 */
+	for (y = 0; y < bh; y++) {
+		const uint32_t *r0 = (const uint32_t *)(src->data + (size_t)(y * 4 + 0) * src->header.stride);
+		const uint32_t *r1 = (const uint32_t *)(src->data + (size_t)(y * 4 + 1) * src->header.stride);
+		const uint32_t *r2 = (const uint32_t *)(src->data + (size_t)(y * 4 + 2) * src->header.stride);
+		const uint32_t *r3 = (const uint32_t *)(src->data + (size_t)(y * 4 + 3) * src->header.stride);
+		uint8_t *o = rgb + (size_t)y * bw * 3;
+
+		for (x = 0; x < bw; x++) {
+			int sx = x * 4, k;
+			uint32_t sr = 0, sg = 0, sb = 0;
+
+			for (k = 0; k < 4; k++) {
+				uint32_t p0 = r0[sx + k], p1 = r1[sx + k];
+				uint32_t p2 = r2[sx + k], p3 = r3[sx + k];
+
+				sr += ((p0 >> 16) & 255u) + ((p1 >> 16) & 255u) +
+				      ((p2 >> 16) & 255u) + ((p3 >> 16) & 255u);
+				sg += ((p0 >> 8) & 255u) + ((p1 >> 8) & 255u) +
+				      ((p2 >> 8) & 255u) + ((p3 >> 8) & 255u);
+				sb += (p0 & 255u) + (p1 & 255u) + (p2 & 255u) + (p3 & 255u);
+			}
+			o[x * 3 + 0] = (uint8_t)((sr + 8u) >> 4);
+			o[x * 3 + 1] = (uint8_t)((sg + 8u) >> 4);
+			o[x * 3 + 2] = (uint8_t)((sb + 8u) >> 4);
+		}
+	}
+	for (pass = 0; pass < 3; pass++) {
+		for (y = 0; y < bh; y++) {
+			const uint8_t *in = rgb + (size_t)y * bw * 3;
+			uint8_t *out = tmp + (size_t)y * bw * 3;
+
+			for (x = 0; x < bw; x++) {
+				int xm4 = LV_MAX(x - 4, 0), xm3 = LV_MAX(x - 3, 0);
+				int xm2 = LV_MAX(x - 2, 0), xm1 = LV_MAX(x - 1, 0);
+				int xp1 = LV_MIN(x + 1, bw - 1), xp2 = LV_MIN(x + 2, bw - 1);
+				int xp3 = LV_MIN(x + 3, bw - 1), xp4 = LV_MIN(x + 4, bw - 1);
+				int c;
+
+				for (c = 0; c < 3; c++) {
+					uint32_t s = in[xm4 * 3 + c] + in[xp4 * 3 + c]
+						   + 8u * (in[xm3 * 3 + c] + in[xp3 * 3 + c])
+						   + 28u * (in[xm2 * 3 + c] + in[xp2 * 3 + c])
+						   + 56u * (in[xm1 * 3 + c] + in[xp1 * 3 + c])
+						   + 70u * in[x * 3 + c];
+
+					out[x * 3 + c] = (uint8_t)((s + 128u) >> 8);
+				}
+			}
+		}
+		for (y = 0; y < bh; y++) {
+			const uint8_t *ym4 = tmp + (size_t)LV_MAX(y - 4, 0) * bw * 3;
+			const uint8_t *ym3 = tmp + (size_t)LV_MAX(y - 3, 0) * bw * 3;
+			const uint8_t *ym2 = tmp + (size_t)LV_MAX(y - 2, 0) * bw * 3;
+			const uint8_t *ym1 = tmp + (size_t)LV_MAX(y - 1, 0) * bw * 3;
+			const uint8_t *y0p = tmp + (size_t)y * bw * 3;
+			const uint8_t *yp1 = tmp + (size_t)LV_MIN(y + 1, bh - 1) * bw * 3;
+			const uint8_t *yp2 = tmp + (size_t)LV_MIN(y + 2, bh - 1) * bw * 3;
+			const uint8_t *yp3 = tmp + (size_t)LV_MIN(y + 3, bh - 1) * bw * 3;
+			const uint8_t *yp4 = tmp + (size_t)LV_MIN(y + 4, bh - 1) * bw * 3;
+			uint8_t *out = rgb + (size_t)y * bw * 3;
+
+			for (x = 0; x < bw * 3; x++) {
+				uint32_t s = ym4[x] + yp4[x]
+					   + 8u * (ym3[x] + yp3[x])
+					   + 28u * (ym2[x] + yp2[x])
+					   + 56u * (ym1[x] + yp1[x])
+					   + 70u * y0p[x];
+
+				out[x] = (uint8_t)((s + 128u) >> 8);
+			}
+		}
+	}
+	free(tmp);
+	wp_blur.rgb = rgb;
+	wp_blur.bw = bw;
+	wp_blur.bh = bh;
+	wp_blur.w = W;
+	wp_blur.h = H;
+	wp_blur.rot = ui_rot;
+	return true;
+}
+
+static void wp_blur_upsample_rect(uint32_t *out, uint32_t out_stride_px,
+				  int32_t sx, int32_t sy, int32_t rw, int32_t rh)
+{
+	int bw = wp_blur.bw, bh = wp_blur.bh;
+	int x0[512], x1[512], tx[512];
+	uint32_t tint = lv_color_to_u32(M.surface_c_high) & 0xffffffu;
+	uint32_t tint_a = conf.dark ? 148u : 158u, wp_a = 256u - tint_a;
+	uint32_t tr = ((tint >> 16) & 255u) * tint_a;
+	uint32_t tg = ((tint >> 8) & 255u) * tint_a;
+	uint32_t tb = (tint & 255u) * tint_a;
+	int32_t x, y;
+
+	if (!wp_blur.rgb || rw <= 0 || rh <= 0 || rw > 512)
+		return;
+	for (x = 0; x < rw; x++) {
+		int fx = LV_CLAMP(0, (int)(sx + x) * 64 - 96, (bw - 1) * 256);
+
+		x0[x] = fx >> 8;
+		x1[x] = LV_MIN(x0[x] + 1, bw - 1);
+		tx[x] = fx & 255;
+	}
+	for (y = 0; y < rh; y++) {
+		int fy = LV_CLAMP(0, (int)(sy + y) * 64 - 96, (bh - 1) * 256);
+		int y0 = fy >> 8, y1 = LV_MIN(y0 + 1, bh - 1);
+		int ty = fy & 255, ity = 256 - ty;
+		const uint8_t *row0 = wp_blur.rgb + (size_t)y0 * bw * 3;
+		const uint8_t *row1 = wp_blur.rgb + (size_t)y1 * bw * 3;
+		uint32_t *dst = out + (size_t)y * out_stride_px;
+
+		for (x = 0; x < rw; x++) {
+			int ix0 = x0[x] * 3, ix1 = x1[x] * 3;
+			int txv = tx[x], itx = 256 - txv;
+			int w00 = itx * ity, w10 = txv * ity, w01 = itx * ty, w11 = txv * ty;
+			int r = (row0[ix0 + 0] * w00 + row0[ix1 + 0] * w10 +
+				 row1[ix0 + 0] * w01 + row1[ix1 + 0] * w11 + 32768) >> 16;
+			int g = (row0[ix0 + 1] * w00 + row0[ix1 + 1] * w10 +
+				 row1[ix0 + 1] * w01 + row1[ix1 + 1] * w11 + 32768) >> 16;
+			int b = (row0[ix0 + 2] * w00 + row0[ix1 + 2] * w10 +
+				 row1[ix0 + 2] * w01 + row1[ix1 + 2] * w11 + 32768) >> 16;
+			int l = (r * 77 + g * 150 + b * 29) >> 8;
+
+			r = LV_CLAMP(0, l + (((r - l) * 320) >> 8), 255);
+			g = LV_CLAMP(0, l + (((g - l) * 320) >> 8), 255);
+			b = LV_CLAMP(0, l + (((b - l) * 320) >> 8), 255);
+
+			r = (int)((tr + (uint32_t)r * wp_a + 128u) >> 8);
+			g = (int)((tg + (uint32_t)g * wp_a + 128u) >> 8);
+			b = (int)((tb + (uint32_t)b * wp_a + 128u) >> 8);
+			dst[x] = 0xff000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+		}
+	}
+}
+
+static lv_draw_buf_t *wp_glass_build(int32_t sx, int32_t sy, int32_t w, int32_t h, int32_t radius)
+{
+	lv_draw_buf_t *b;
+	int32_t r = radius == WP_GLASS_R && w >= 2 * WP_GLASS_R && h >= 2 * WP_GLASS_R ? WP_GLASS_R : 0;
+	int32_t x, y;
+
+	if (!wp_blur_ensure() || w <= 0 || h <= 0 || w > 512)
+		return NULL;
+	wp_glass_lut_init();
+	b = lv_draw_buf_create((uint32_t)w, (uint32_t)h, LV_COLOR_FORMAT_ARGB8888, 0);
+	if (!b)
+		return NULL;
+	wp_blur_upsample_rect((uint32_t *)b->data, b->header.stride / 4, sx, sy, w, h);
+	for (y = 0; y < h; y++) {
+		uint32_t *row = (uint32_t *)(b->data + (size_t)y * b->header.stride);
+		bool top_half = y < h / 2;
+
+		if (r && (y < r || y >= h - r)) {
+			int32_t cy = y < r ? y : h - 1 - y;
+
+			if (y == 0 || y == h - 1) {
+				for (x = r; x < w - r; x++)
+					row[x] = 0xff000000u | glass_apply_rim(row[x], 255u, top_half);
+			}
+			for (x = 0; x < r; x++) {
+				uint8_t a = glass_corner_a[cy][x];
+
+				if (!a) {
+					row[x] = 0;
+				} else {
+					uint8_t rim = glass_corner_rim[cy][x];
+					uint32_t rgb = rim ? glass_apply_rim(row[x], rim, top_half)
+							   : (row[x] & 0x00ffffffu);
+
+					row[x] = ((uint32_t)a << 24) | rgb;
+				}
+			}
+			for (x = w - r; x < w; x++) {
+				uint8_t a = glass_corner_a[cy][w - 1 - x];
+
+				if (!a) {
+					row[x] = 0;
+				} else {
+					uint8_t rim = glass_corner_rim[cy][w - 1 - x];
+					uint32_t rgb = rim ? glass_apply_rim(row[x], rim, top_half)
+							   : (row[x] & 0x00ffffffu);
+
+					row[x] = ((uint32_t)a << 24) | rgb;
+				}
+			}
+		} else {
+			if (y == 0 || y == h - 1) {
+				for (x = 0; x < w; x++)
+					row[x] = 0xff000000u | glass_apply_rim(row[x], 255u, top_half);
+			} else {
+				row[0] = 0xff000000u | glass_apply_rim(row[0], 255u, top_half);
+				row[w - 1] = 0xff000000u | glass_apply_rim(row[w - 1], 255u, top_half);
+			}
+		}
+	}
+	lv_draw_buf_flush_cache(b, NULL);
+	return b;
+}
+
+static void wp_glass_obj_gone(lv_event_t *e)
+{
+	lv_obj_t *obj = lv_event_get_current_target(e);
+
+	for (int i = 0; i < WP_GLASS_MAX; i++) {
+		if (wp_glass_slots[i].obj == obj) {
+			if (wp_glass_slots[i].b)
+				wp_free(wp_glass_slots[i].b);
+			memset(&wp_glass_slots[i], 0, sizeof(wp_glass_slots[i]));
+			break;
+		}
+	}
+}
+
+bool wp_glass_attach(lv_obj_t *obj, int32_t sx, int32_t sy, int32_t w, int32_t h, int32_t radius)
+{
+	int slot = -1;
+	lv_draw_buf_t *b;
+
+	if (!obj || !home_wp || wp_suspended)
+		return false;
+	for (int i = 0; i < WP_GLASS_MAX; i++) {
+		if (wp_glass_slots[i].obj == obj) {
+			slot = i;
+			break;
+		}
+		if (slot < 0 && !wp_glass_slots[i].obj)
+			slot = i;
+	}
+	if (slot < 0)
+		return false;
+	b = wp_glass_build(sx, sy, w, h, radius);
+	if (!b)
+		return false;
+	if (wp_glass_slots[slot].obj == obj) {
+		lv_obj_set_style_bg_image_src(obj, NULL, 0);
+		if (wp_glass_slots[slot].b)
+			wp_free(wp_glass_slots[slot].b);
+	} else {
+		lv_obj_add_event_cb(obj, wp_glass_obj_gone, LV_EVENT_DELETE, NULL);
+	}
+	wp_glass_slots[slot].obj = obj;
+	wp_glass_slots[slot].b = b;
+	wp_glass_slots[slot].sx = sx;
+	wp_glass_slots[slot].sy = sy;
+	wp_glass_slots[slot].w = w;
+	wp_glass_slots[slot].h = h;
+	wp_glass_slots[slot].r = radius;
+	lv_obj_set_style_radius(obj, 0, 0);
+	lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_bg_image_src(obj, b, 0);
+	lv_obj_set_style_bg_image_opa(obj, LV_OPA_COVER, 0);
+	return true;
+}
+
+const uint32_t *wp_glass_card_strip(int32_t *out_w, int32_t *out_h)
+{
+	uint32_t tint = lv_color_to_u32(M.surface_c_high) & 0xffffffu;
+
+	if (!wp_blur_ensure() || PW <= 0 || PW > 512)
+		return NULL;
+	if (!wp_blur.card_strip || wp_blur.strip_px != PX || wp_blur.strip_pw != PW ||
+	    wp_blur.strip_tint != tint || wp_blur.strip_dark != conf.dark) {
+		free(wp_blur.card_strip);
+		wp_blur.card_strip = malloc((size_t)PW * PG_CARD_H * sizeof(uint32_t));
+		if (!wp_blur.card_strip)
+			return NULL;
+		wp_blur_upsample_rect(wp_blur.card_strip, (uint32_t)PW, PX, PG_TOP + 4, PW, PG_CARD_H);
+		wp_blur.strip_px = PX;
+		wp_blur.strip_pw = PW;
+		wp_blur.strip_tint = tint;
+		wp_blur.strip_dark = conf.dark;
+	}
+	if (out_w)
+		*out_w = PW;
+	if (out_h)
+		*out_h = PG_CARD_H;
+	return wp_blur.card_strip;
+}
+
+static inline uint32_t glass_premul_px(uint32_t rgb, uint32_t al)
+{
+	uint32_t rb = (rgb & 0x00ff00ffu) * al + 0x00800080u;
+	uint32_t g = ((rgb & 0x0000ff00u) >> 8) * al + 128u;
+
+	rb = ((rb + ((rb >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
+	g = (g + (g >> 8)) & 0x0000ff00u;
+	return (al << 24) | rb | g;
+}
+
+void wp_glass_compose_card(lv_draw_buf_t *dst, const uint32_t *strip, int32_t strip_w,
+			   const lv_draw_buf_t *fg, const uint16_t *fg_x0, const uint16_t *fg_x1,
+			   int32_t vx, int32_t radius, bool premul)
+{
+	int32_t cw = (int32_t)dst->header.w, ch = (int32_t)dst->header.h;
+	int32_t r = radius == WP_GLASS_R && cw >= 2 * WP_GLASS_R && ch >= 2 * WP_GLASS_R ? WP_GLASS_R : 0;
+	int32_t cx0 = LV_MAX(0, -vx), cx1 = LV_MIN(cw, strip_w - vx);
+	int32_t y;
+
+	if (cx0 >= cx1)
+		return;
+	wp_glass_lut_init();
+	for (y = 0; y < ch; y++) {
+		uint32_t *drow = (uint32_t *)(dst->data + (size_t)y * dst->header.stride);
+		const uint32_t *srow = strip + (size_t)y * strip_w + vx;
+		const uint32_t *frow = (const uint32_t *)(fg->data + (size_t)y * fg->header.stride);
+		bool top_half = y < ch / 2;
+		int32_t fx0 = LV_MAX(cx0, (int32_t)fg_x0[y]);
+		int32_t fx1 = LV_MIN(cx1, (int32_t)fg_x1[y] + 1);
+		int32_t x;
+
+		memcpy(drow + cx0, srow + cx0, (size_t)(cx1 - cx0) * 4);
+		if (y == 0 || y == ch - 1) {
+			int32_t rx0 = LV_MAX(cx0, r), rx1 = LV_MIN(cx1, cw - r);
+
+			for (x = rx0; x < rx1; x++)
+				drow[x] = 0xff000000u | glass_apply_rim(drow[x], 255u, top_half);
+		} else if (y >= r && y < ch - r) {
+			if (cx0 == 0)
+				drow[0] = 0xff000000u | glass_apply_rim(drow[0], 255u, top_half);
+			if (cx1 == cw)
+				drow[cw - 1] = 0xff000000u | glass_apply_rim(drow[cw - 1], 255u, top_half);
+		}
+		for (x = fx0; x < fx1; x++) {
+			uint32_t s = frow[x], a = s >> 24;
+
+			if (!a)
+				continue;
+			if (a >= 253u) {
+				drow[x] = 0xff000000u | (s & 0x00ffffffu);
+			} else {
+				uint32_t d = drow[x], inv = 255u - a;
+				uint32_t rb = (((s & 0x00ff00ffu) * a + (d & 0x00ff00ffu) * inv) >> 8) & 0x00ff00ffu;
+				uint32_t g = ((((s & 0x0000ff00u) >> 8) * a + ((d & 0x0000ff00u) >> 8) * inv)) & 0x0000ff00u;
+
+				drow[x] = 0xff000000u | rb | g;
+			}
+		}
+		if (r && (y < r || y >= ch - r)) {
+			int32_t cy = y < r ? y : ch - 1 - y;
+			int32_t lx1 = LV_MIN(cx1, r), rx0 = LV_MAX(cx0, cw - r);
+
+			for (x = cx0; x < lx1; x++) {
+				uint8_t a = glass_corner_a[cy][x];
+
+				if (!a) {
+					drow[x] = 0;
+				} else {
+					uint8_t rim = glass_corner_rim[cy][x];
+					uint32_t rgb = rim ? glass_apply_rim(drow[x], rim, top_half)
+							   : (drow[x] & 0x00ffffffu);
+
+					drow[x] = premul && a < 255u ? glass_premul_px(rgb, a)
+								     : (((uint32_t)a << 24) | rgb);
+				}
+			}
+			for (x = rx0; x < cx1; x++) {
+				uint8_t a = glass_corner_a[cy][cw - 1 - x];
+
+				if (!a) {
+					drow[x] = 0;
+				} else {
+					uint8_t rim = glass_corner_rim[cy][cw - 1 - x];
+					uint32_t rgb = rim ? glass_apply_rim(drow[x], rim, top_half)
+							   : (drow[x] & 0x00ffffffu);
+
+					drow[x] = premul && a < 255u ? glass_premul_px(rgb, a)
+								     : (((uint32_t)a << 24) | rgb);
+				}
+			}
+		}
+	}
+}
+
 void wp_suspend(void)
 {
 	int i, k, t;
 
 	if (wp_suspended)
 		return;
+	for (i = 0; i < WP_GLASS_MAX; i++) {
+		lv_obj_t *obj = wp_glass_slots[i].obj;
+
+		if (obj && lv_obj_is_valid(obj))
+			lv_obj_set_style_bg_image_src(obj, NULL, 0);
+		if (wp_glass_slots[i].b) {
+			wp_free(wp_glass_slots[i].b);
+			wp_glass_slots[i].b = NULL;
+		}
+	}
+	wp_blur_clear();
 	for (i = 0; i < WP_HOLDS; i++) {
 		lv_obj_t *img = wp_slots[i].img;
 
@@ -772,6 +1253,27 @@ void wp_resume(void)
 			lv_image_set_src(img, b);
 			lv_obj_invalidate(img);
 		}
+	}
+	for (i = 0; i < WP_GLASS_MAX; i++) {
+		lv_obj_t *obj = wp_glass_slots[i].obj;
+		lv_draw_buf_t *b;
+
+		if (!obj || !lv_obj_is_valid(obj) || wp_glass_slots[i].b)
+			continue;
+		b = wp_glass_build(wp_glass_slots[i].sx, wp_glass_slots[i].sy,
+				   wp_glass_slots[i].w, wp_glass_slots[i].h, wp_glass_slots[i].r);
+		if (b) {
+			wp_glass_slots[i].b = b;
+			lv_obj_set_style_radius(obj, 0, 0);
+			lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, 0);
+			lv_obj_set_style_bg_image_src(obj, b, 0);
+			lv_obj_set_style_bg_image_opa(obj, LV_OPA_COVER, 0);
+		} else {
+			lv_obj_set_style_radius(obj, wp_glass_slots[i].r, 0);
+			lv_obj_set_style_bg_color(obj, M.surface_c_high, 0);
+			lv_obj_set_style_bg_opa(obj, home_wp ? LV_OPA_80 : LV_OPA_COVER, 0);
+		}
+		lv_obj_invalidate(obj);
 	}
 }
 

@@ -5,7 +5,7 @@
 /* ------------------------------------------------------------- home */
 
 lv_obj_t *clock_lbl, *date_lbl, *batt_lbl, *status_time;
-lv_obj_t *home_clock, *home_date, *home_batt, *home_net;	/* the widget */
+lv_obj_t *home_card, *home_clock, *home_date, *home_batt, *home_net;	/* the widget */
 lv_obj_t *qs_wifi_sub, *qs_bt_sub, *qs_wifi, *qs_bt;
 lv_obj_t *set_wifi_sub, *set_bt_sub;	/* on the Settings page */
 

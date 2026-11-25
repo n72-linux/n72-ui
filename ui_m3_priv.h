@@ -257,6 +257,11 @@ struct pg {
 	lv_obj_t *scr, *view, *strip_img, *strip_img2, *bar_img, *bar_r_img, *time_img, *dots_img, *wp_img;
 	int strip_k;			/* the page strip_img shows; strip_img2 the next */
 	lv_draw_buf_t *page_pic[PG_PAGES_MAX], *dock_pic, *bar_pic, *bar_l, *bar_r, *dots_pic, *time_pic[PG_TIME_LEVELS + 1];
+	lv_obj_t *card_img;
+	lv_draw_buf_t *card_fg, *card_buf;
+	uint16_t card_fg_x0[PG_CARD_H], card_fg_x1[PG_CARD_H];
+	bool card_live;
+	int card_last_off;
 	lv_area_t time_area;		/* the time's place in the bar */
 	unsigned long pic_ver;		/* home_ver they show */
 	unsigned long fail_ver;		/* (no memory for them at this home_ver) */
@@ -378,6 +383,7 @@ extern lv_obj_t *clock_lbl;
 extern lv_obj_t *date_lbl;
 extern lv_obj_t *batt_lbl;
 extern lv_obj_t *status_time;
+extern lv_obj_t *home_card;
 extern lv_obj_t *home_clock;
 extern lv_obj_t *home_date;
 extern lv_obj_t *home_batt;
@@ -571,6 +577,11 @@ void wp_load(void);
 lv_draw_buf_t *wp_upright(int kind);
 lv_draw_buf_t *wp_pic(int kind);
 bool wp_put(lv_obj_t *scr, int kind);
+bool wp_glass_attach(lv_obj_t *obj, int32_t sx, int32_t sy, int32_t w, int32_t h, int32_t radius);
+const uint32_t *wp_glass_card_strip(int32_t *out_w, int32_t *out_h);
+void wp_glass_compose_card(lv_draw_buf_t *dst, const uint32_t *strip, int32_t strip_w,
+			   const lv_draw_buf_t *fg, const uint16_t *fg_x0, const uint16_t *fg_x1,
+			   int32_t vx, int32_t radius, bool premul);
 void wp_apply_kick(void);
 void open_wallpaper(lv_event_t *e);
 void open_apps(lv_event_t *e);

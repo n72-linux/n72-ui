@@ -455,15 +455,17 @@ void build_home(void)
 
 	/* a widget: the time large, the date, battery and Wi-Fi */
 	{
-		lv_obj_t *c = lv_obj_create(apps);
+		lv_obj_t *c = home_card = lv_obj_create(apps);
 
 		plain(c);
 		lv_obj_set_size(c, PW - 32, PG_CARD_H);
 		lv_obj_set_pos(c, 16, 4);
-		lv_obj_set_style_radius(c, 24, 0);
-		lv_obj_set_style_bg_color(c, M.surface_c_high, 0);
-		/* over a wallpaper the card lets a little of it through */
-		lv_obj_set_style_bg_opa(c, home_wp ? LV_OPA_80 : LV_OPA_COVER, 0);
+		/* over a wallpaper the card blurs what lies behind it */
+		if (!home_wp || !wp_glass_attach(c, PX + 16, PG_TOP + 4, PW - 32, PG_CARD_H, 24)) {
+			lv_obj_set_style_radius(c, 24, 0);
+			lv_obj_set_style_bg_color(c, M.surface_c_high, 0);
+			lv_obj_set_style_bg_opa(c, home_wp ? LV_OPA_80 : LV_OPA_COVER, 0);
+		}
 		lv_obj_set_style_pad_all(c, 0, 0);
 		lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
 		lv_obj_add_event_cb(c, shade_tap_cb, LV_EVENT_CLICKED, (void *)1);

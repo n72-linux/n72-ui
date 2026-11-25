@@ -56,7 +56,7 @@ void n72_trace(const char *what, long v);
 #define STAT_US(field, t0) do { (void)(t0); } while (0)
 #endif
 
-#define PM_SKIP_MAX 4
+#define PM_SKIP_MAX 8
 
 struct pool_block {
 	uint32_t off, size;

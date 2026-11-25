@@ -25,6 +25,13 @@ static bool layer_ok(const lv_draw_task_t *t, const lv_layer_t *src)
 	       !d->bitmap_mask_src;
 }
 
+static inline const lv_area_t *image_area_of(const lv_draw_task_t *t)
+{
+	const lv_draw_image_dsc_t *d = t->draw_dsc;
+
+	return lv_area_get_width(&d->image_area) >= 0 ? &d->image_area : &t->area;
+}
+
 /*
  * An image the GPU can copy: a variable-source image (an lv_draw_buf_t, as
  * lv_snapshot_take() makes) whose pixels live in the GPU pool, drawn 1:1.
@@ -33,13 +40,14 @@ static bool image_ok(const lv_draw_task_t *t)
 {
 	const lv_draw_image_dsc_t *d = t->draw_dsc;
 	const lv_image_dsc_t *img = d->src;
+	const lv_area_t *ia = image_area_of(t);
 
 	if (lv_image_src_get_type(d->src) != LV_IMAGE_SRC_VARIABLE || !img->data ||
 	    !in_pool(img->data) || (gpu_addr(img->data) & 127) ||
 	    (img->header.stride & 31) || d->tile || !cf_ok(img->header.cf))
 		return false;
-	if (lv_area_get_width(&d->image_area) != img->header.w ||
-	    lv_area_get_height(&d->image_area) != img->header.h)
+	if (lv_area_get_width(ia) != img->header.w ||
+	    lv_area_get_height(ia) != img->header.h)
 		return false;
 	return d->rotation == 0 && d->scale_x == LV_SCALE_NONE &&
 	       d->scale_y == LV_SCALE_NONE && d->skew_x == 0 && d->skew_y == 0 &&
@@ -87,13 +95,14 @@ static bool image_premul_ok(const lv_draw_task_t *t)
 {
 	const lv_draw_image_dsc_t *d = t->draw_dsc;
 	const lv_image_dsc_t *img = d->src;
+	const lv_area_t *ia = image_area_of(t);
 
 	if (lv_image_src_get_type(d->src) != LV_IMAGE_SRC_VARIABLE || !img->data ||
 	    img->header.cf != LV_COLOR_FORMAT_ARGB8888 ||
 	    !(img->header.flags & LV_IMAGE_FLAGS_PREMULTIPLIED) || d->tile)
 		return false;
-	if (lv_area_get_width(&d->image_area) != img->header.w ||
-	    lv_area_get_height(&d->image_area) != img->header.h)
+	if (lv_area_get_width(ia) != img->header.w ||
+	    lv_area_get_height(ia) != img->header.h)
 		return false;
 	return d->opa >= LV_OPA_MAX && d->rotation == 0 && d->scale_x == LV_SCALE_NONE &&
 	       d->scale_y == LV_SCALE_NONE && d->skew_x == 0 && d->skew_y == 0 &&
@@ -351,7 +360,7 @@ static bool task_covers(const lv_draw_task_t *u, lv_area_t *out)
 		const lv_image_dsc_t *img = d->src;
 
 		if (d->opa < LV_OPA_MAX || !image_ok(u) || img->header.cf != LV_COLOR_FORMAT_XRGB8888 ||
-		    !lv_area_intersect(&core, &u->area, &d->image_area))
+		    !lv_area_intersect(&core, &u->area, image_area_of(u)))
 			return false;
 	} else {
 		return false;
@@ -785,7 +794,7 @@ static void mbx_layer(lv_draw_unit_t *u, lv_draw_task_t *t)
  */
 static bool mbx_image_premul(lv_draw_unit_t *u, lv_draw_task_t *t, lv_draw_buf_t *sb)
 {
-	lv_draw_image_dsc_t *d = t->draw_dsc;
+	const lv_area_t *ia = image_area_of(t);
 	lv_layer_t *layer = u->target_layer;
 	lv_draw_buf_t *b = layer->draw_buf;
 	lv_area_t a, sa, da;
@@ -795,7 +804,7 @@ static bool mbx_image_premul(lv_draw_unit_t *u, lv_draw_task_t *t, lv_draw_buf_t
 	if (!lv_area_intersect(&a, &t->area, u->clip_area))
 		return true;
 	sa = a;
-	lv_area_move(&sa, -d->image_area.x1, -d->image_area.y1);
+	lv_area_move(&sa, -ia->x1, -ia->y1);
 	da = a;
 	lv_area_move(&da, -layer->buf_area.x1, -layer->buf_area.y1);
 	if (transparent || mbx_gpu_is_suspended() || !in_pool(b->data) || !in_pool(sb->data)) {
@@ -887,11 +896,15 @@ static void mbx_image(lv_draw_unit_t *u, lv_draw_task_t *t)
 	}
 
 	/* the CPU does not write snapshots after taking them: no clean */
-	if (!gpu_copy(u, t, (lv_draw_buf_t *)d->src, d->image_area.x1, d->image_area.y1,
-		      d->opa, false)) {
-		if (lv_area_intersect(&ca, &t->area, u->clip_area))
-			note_cpu_draw(u->target_layer, &ca);
-		lv_draw_sw_image(u, d, &t->area);
+	{
+		const lv_area_t *ia = image_area_of(t);
+
+		if (!gpu_copy(u, t, (lv_draw_buf_t *)d->src, ia->x1, ia->y1,
+			      d->opa, false)) {
+			if (lv_area_intersect(&ca, &t->area, u->clip_area))
+				note_cpu_draw(u->target_layer, &ca);
+			lv_draw_sw_image(u, d, &t->area);
+		}
 	}
 	MBX_STAT_INC(images);
 }
@@ -1185,8 +1198,9 @@ static bool ta_emit_task(struct ta_stream *s, const lv_draw_task_t *t, lv_area_t
 				if (sy1 < 0.5f) sy1 = 0.5f; else if (sy1 > maxy) sy1 = maxy;
 			}
 		} else {
-			int32_t sx_off = src_l ? src_l->buf_area.x1 : d->image_area.x1;
-			int32_t sy_off = src_l ? src_l->buf_area.y1 : d->image_area.y1;
+			const lv_area_t *ia = src_l ? &src_l->buf_area : image_area_of(t);
+			int32_t sx_off = ia->x1;
+			int32_t sy_off = ia->y1;
 
 			if (!lv_area_intersect(&ca, &t->area, &t->clip_area))
 				return true;

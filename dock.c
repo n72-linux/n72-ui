@@ -200,20 +200,29 @@ void dock_build(void)
 {
 	lv_obj_t *d = home_dock = lv_obj_create(home_scr);
 	int side = dock_side();
+	int32_t dx, dy, dw, dh;
 
 	plain(d);
 	if (side == DOCK_BOTTOM) {
-		lv_obj_set_size(d, W - 2 * STATUS_PAD, DOCK_T);
-		lv_obj_set_pos(d, STATUS_PAD, H - DOCK_M - DOCK_T);
+		dw = W - 2 * STATUS_PAD;
+		dh = DOCK_T;
+		dx = STATUS_PAD;
+		dy = H - DOCK_M - DOCK_T;
 	} else {
 		/* the same place in the hand: a column at the side */
-		lv_obj_set_size(d, DOCK_T, H - 2 * STATUS_PAD);
-		lv_obj_set_pos(d, side == DOCK_LEFT ? DOCK_M : W - DOCK_M - DOCK_T, STATUS_PAD);
+		dw = DOCK_T;
+		dh = H - 2 * STATUS_PAD;
+		dx = side == DOCK_LEFT ? DOCK_M : W - DOCK_M - DOCK_T;
+		dy = STATUS_PAD;
 	}
+	lv_obj_set_size(d, dw, dh);
+	lv_obj_set_pos(d, dx, dy);
 	/* the card's shape and colour */
-	lv_obj_set_style_radius(d, 24, 0);
-	lv_obj_set_style_bg_color(d, M.surface_c_high, 0);
-	lv_obj_set_style_bg_opa(d, home_wp ? LV_OPA_80 : LV_OPA_COVER, 0);
+	if (!home_wp || !wp_glass_attach(d, dx, dy, dw, dh, 24)) {
+		lv_obj_set_style_radius(d, 24, 0);
+		lv_obj_set_style_bg_color(d, M.surface_c_high, 0);
+		lv_obj_set_style_bg_opa(d, home_wp ? LV_OPA_80 : LV_OPA_COVER, 0);
+	}
 	lv_obj_set_style_pad_all(d, 0, 0);
 	lv_obj_remove_flag(d, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 	dock_order_apply();

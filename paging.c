@@ -227,6 +227,10 @@ void pg_pics_free(void)
 	tr_free(&pg.dots_pic);
 	for (i = 0; i <= PG_TIME_LEVELS; i++)
 		tr_free(&pg.time_pic[i]);
+	tr_free(&pg.card_fg);
+	tr_free(&pg.card_buf);
+	pg.card_live = false;
+	pg.card_last_off = INT_MIN;
 	pg.pic_ver = ~0UL;
 	pg.pic_dots = -1;
 }
@@ -413,6 +417,45 @@ static bool pg_pics_take(void)
 	pg_pics_free();
 	lv_obj_update_layout(home_scr);
 	pg_time_show(false);		/* (the bar's picture without the time) */
+	if (home_wp && home_card && lv_obj_is_valid(home_card) &&
+	    wp_glass_card_strip(NULL, NULL) != NULL) {
+		const void *old_bg = lv_obj_get_style_bg_image_src(home_card, 0);
+		lv_opa_t old_opa = lv_obj_get_style_bg_opa(home_card, 0);
+
+		lv_obj_set_style_bg_image_src(home_card, NULL, 0);
+		lv_obj_set_style_bg_opa(home_card, LV_OPA_TRANSP, 0);
+		pg.card_fg = snap(home_card, LV_COLOR_FORMAT_ARGB8888);
+		lv_obj_set_style_bg_image_src(home_card, old_bg, 0);
+		lv_obj_set_style_bg_opa(home_card, old_opa, 0);
+		pg.card_buf = lv_draw_buf_create(PW - 32, PG_CARD_H, LV_COLOR_FORMAT_ARGB8888, 0);
+		if (pg.card_fg && pg.card_buf) {
+			int cw = (int)pg.card_fg->header.w;
+			int rows = LV_MIN((int)pg.card_fg->header.h, PG_CARD_H), y;
+
+			if (mode == PG_MODE_LAYER0)
+				pg.card_buf->header.flags |= LV_IMAGE_FLAGS_PREMULTIPLIED;
+			for (y = 0; y < rows; y++) {
+				const uint32_t *row = (const uint32_t *)(pg.card_fg->data +
+							(size_t)y * pg.card_fg->header.stride);
+				int x0 = cw, x1 = 0, x;
+
+				for (x = 0; x < cw; x++) {
+					if (row[x] >> 24) {
+						if (x0 > x)
+							x0 = x;
+						x1 = x;
+					}
+				}
+				pg.card_fg_x0[y] = (uint16_t)x0;
+				pg.card_fg_x1[y] = (uint16_t)x1;
+			}
+			pg.card_live = true;
+			pg.card_last_off = INT_MIN;
+		} else {
+			tr_free(&pg.card_fg);
+			tr_free(&pg.card_buf);
+		}
+	}
 	{
 		lv_area_t s, a;
 		int k;
@@ -422,6 +465,8 @@ static bool pg_pics_take(void)
 			a = s;
 			a.x1 = s.x1 + k * PW;
 			a.x2 = a.x1 + PW - 1;
+			if (k == 0 && pg.card_live)
+				a.y1 = s.y1 + PG_GRID0;
 			if (!(pg.page_pic[k] = pg_snap_area(home_apps, mode, &a)))
 				break;
 		}
@@ -535,12 +580,14 @@ static void pg_frame(int off)
 			pg.strip_k = k;
 			if (k >= 0 && k < n) {
 				lv_image_set_src(pg.strip_img, pg.page_pic[k]);
+				lv_obj_set_y(pg.strip_img, k == 0 && pg.card_live ? PG_GRID0 : 0);
 				lv_obj_remove_flag(pg.strip_img, LV_OBJ_FLAG_HIDDEN);
 			} else {
 				lv_obj_add_flag(pg.strip_img, LV_OBJ_FLAG_HIDDEN);
 			}
 			if (k + 1 >= 0 && k + 1 < n) {
 				lv_image_set_src(pg.strip_img2, pg.page_pic[k + 1]);
+				lv_obj_set_y(pg.strip_img2, k + 1 == 0 && pg.card_live ? PG_GRID0 : 0);
 				lv_obj_remove_flag(pg.strip_img2, LV_OBJ_FLAG_HIDDEN);
 			} else {
 				lv_obj_add_flag(pg.strip_img2, LV_OBJ_FLAG_HIDDEN);
@@ -548,6 +595,31 @@ static void pg_frame(int off)
 		}
 		lv_obj_set_x(pg.strip_img, k * PW - off);
 		lv_obj_set_x(pg.strip_img2, (k + 1) * PW - off);
+	}
+	if (pg.card_img && pg.card_live) {
+		int32_t vx = 16 - off, cw = (int32_t)pg.card_buf->header.w;
+
+		if (vx >= PW || vx + cw <= 0) {
+			lv_obj_add_flag(pg.card_img, LV_OBJ_FLAG_HIDDEN);
+			pg.card_last_off = off;
+		} else if (off != pg.card_last_off) {
+			int32_t sw = 0, sh = 0;
+			const uint32_t *strip = wp_glass_card_strip(&sw, &sh);
+
+			if (strip) {
+				if (pg.mode == PG_MODE_BLEND)
+					mbx_gpu_wait_ta();
+				wp_glass_compose_card(pg.card_buf, strip, sw, pg.card_fg,
+						      pg.card_fg_x0, pg.card_fg_x1, vx, 24,
+						      pg.mode == PG_MODE_LAYER0);
+				if (pg.mode == PG_MODE_BLEND)
+					lv_draw_buf_flush_cache(pg.card_buf, NULL);
+				lv_obj_remove_flag(pg.card_img, LV_OBJ_FLAG_HIDDEN);
+				lv_obj_set_pos(pg.card_img, vx, 4);
+				lv_obj_invalidate(pg.card_img);
+				pg.card_last_off = off;
+			}
+		}
 	}
 	/* the time: nothing on page 0, all of it a page on (pulled past the
 	 * last page: as on it, so a single page never shows it) */
@@ -620,6 +692,12 @@ static bool pg_frames_begin(void)
 	lv_image_set_src(pg.strip_img, pg.page_pic[pg.cur]);
 	pg.strip_img2 = lv_image_create(pg.view);
 	lv_image_set_src(pg.strip_img2, pg.page_pic[pg.cur]);
+	if (pg.card_live) {
+		pg.card_img = lv_image_create(pg.view);
+		lv_image_set_src(pg.card_img, pg.card_buf);
+		lv_obj_remove_flag(pg.card_img, LV_OBJ_FLAG_CLICKABLE);
+		pg.card_last_off = INT_MIN;
+	}
 	if (pg.dock_pic) {
 		lv_area_t d;
 
@@ -670,7 +748,7 @@ static void pg_frames_end(int p)
 	if (!scr)
 		return;
 	pg.scr = NULL;
-	pg.view = pg.strip_img = pg.strip_img2 = pg.bar_img = pg.bar_r_img = pg.time_img = pg.dots_img = pg.wp_img = NULL;
+	pg.view = pg.strip_img = pg.strip_img2 = pg.card_img = pg.bar_img = pg.bar_r_img = pg.time_img = pg.dots_img = pg.wp_img = NULL;
 	if (pg.mode == PG_MODE_LAYER0)
 		mbx_gpu_set_transparent(false);
 	n72_trace("pg-opaque", 0);
@@ -1003,6 +1081,7 @@ void pg_home_gone(void)
 		lv_obj_t *scr = pg.scr;
 
 		pg.scr = NULL;
+		pg.view = pg.strip_img = pg.strip_img2 = pg.card_img = pg.bar_img = pg.bar_r_img = pg.time_img = pg.dots_img = pg.wp_img = NULL;
 		pg.on = pg.settling = false;
 		lv_anim_delete(&pg, NULL);
 		if (pg.mode == PG_MODE_LAYER0)
