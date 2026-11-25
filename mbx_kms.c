@@ -134,6 +134,9 @@ static int kms_fd = -1;			/* /dev/dri/card0 when flipping through KMS */
 static bool kms_layer_on = true;
 static bool kms_layer_want = true;
 static bool gpu_suspended;
+static bool ext_ovl_active;
+static uint32_t ext_ovl_gen;
+static int ext_ovl_rot;
 static bool kms_can_window;
 static uint32_t kms_src_y, kms_win_y, kms_win_h;
 static uint32_t buf_src_y[NSCAN], buf_win_y[NSCAN], buf_win_h[NSCAN];
@@ -1797,6 +1800,24 @@ void mbx_gpu_set_layer_enabled(bool on)
 	if (!flipping || !kms_shell || kms_fd < 0)
 		return;
 	if (on) {
+		if (ext_ovl_active) {
+			flip_wait();
+			if (kms_layer_on) {
+				struct drm_mode_crtc set = { .crtc_id = kms_crtc };
+
+				if (!ioctl(kms_fd, DRM_IOCTL_MODE_SETCRTC, &set))
+					kms_layer_on = false;
+			}
+			pthread_mutex_lock(&flip_mx);
+			st_front = -1;
+			st_latest = -1;
+			for (i = 0; i < NSCAN; i++)
+				buf_frame[i] = -1;
+			scan_zero_transparent();
+			pthread_mutex_unlock(&flip_mx);
+			ext_ovl_active = false;
+			ext_ovl_gen = 0;
+		}
 		kms_layer_want = true;
 		return;
 	}
@@ -1818,6 +1839,8 @@ void mbx_gpu_set_layer_enabled(bool on)
 		buf_frame[i] = -1;
 	scan_zero_transparent();
 	pthread_mutex_unlock(&flip_mx);
+	ext_ovl_active = false;
+	ext_ovl_gen = 0;
 }
 
 void mbx_gpu_suspend(void)
@@ -1902,6 +1925,139 @@ void mbx_gpu_resume(void)
 bool mbx_gpu_is_suspended(void)
 {
 	return gpu_suspended;
+}
+
+bool mbx_gpu_ext_overlay_active(void)
+{
+	return ext_ovl_active;
+}
+
+static void ext_ovl_disable_layer(void)
+{
+	int i;
+
+	if (!ext_ovl_active)
+		return;
+	flip_wait();
+	if (kms_layer_on) {
+		struct drm_mode_crtc set = { .crtc_id = kms_crtc };
+
+		if (!ioctl(kms_fd, DRM_IOCTL_MODE_SETCRTC, &set))
+			kms_layer_on = false;
+	}
+	pthread_mutex_lock(&flip_mx);
+	st_front = -1;
+	st_latest = -1;
+	for (i = 0; i < NSCAN; i++)
+		buf_frame[i] = -1;
+	scan_zero_transparent();
+	pthread_mutex_unlock(&flip_mx);
+	ext_ovl_active = false;
+	ext_ovl_gen = 0;
+}
+
+bool mbx_gpu_sync_ext_overlay(void)
+{
+	struct n72_ext_ovl_hdr hdr;
+	uint32_t exp_w, exp_h, dst_stride, y;
+	uint8_t *buf;
+	ssize_t nr, off = 0, need;
+	int fd;
+
+	if (!flipping || !kms_shell || kms_fd < 0 || !gpu_suspended || !scan[0])
+		return false;
+	fd = open(N72_EXT_OVL_PATH, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		ext_ovl_disable_layer();
+		return false;
+	}
+	nr = read(fd, &hdr, sizeof(hdr));
+	if (nr != (ssize_t)sizeof(hdr) || hdr.magic != N72_EXT_OVL_MAGIC || !hdr.enabled) {
+		close(fd);
+		ext_ovl_disable_layer();
+		return false;
+	}
+	if (hdr.rot != 0 && hdr.rot != 90 && hdr.rot != 270) {
+		close(fd);
+		ext_ovl_disable_layer();
+		return false;
+	}
+	if (hdr.rot && (!kms_can_turn || !kms_fb_l[0])) {
+		close(fd);
+		ext_ovl_disable_layer();
+		return false;
+	}
+	if (!hdr.rot && !kms_fb[0]) {
+		close(fd);
+		ext_ovl_disable_layer();
+		return false;
+	}
+	exp_w = hdr.rot ? fb.height : fb.width;
+	exp_h = hdr.rot ? fb.width : fb.height;
+	if (hdr.width != exp_w || hdr.height != exp_h || hdr.stride != exp_w * 4) {
+		close(fd);
+		ext_ovl_disable_layer();
+		return false;
+	}
+	if (ext_ovl_active && hdr.gen == ext_ovl_gen && ext_ovl_rot == (int)hdr.rot) {
+		close(fd);
+		return true;
+	}
+	dst_stride = hdr.rot ? buf_width_to_stride(fb.height, LV_COLOR_FORMAT_XRGB8888) : fb.stride;
+	if ((uint64_t)dst_stride * exp_h > (uint64_t)fb.stride * fb.height) {
+		close(fd);
+		ext_ovl_disable_layer();
+		return false;
+	}
+	need = (ssize_t)((size_t)hdr.stride * hdr.height);
+	buf = malloc((size_t)need);
+	if (!buf) {
+		close(fd);
+		return false;
+	}
+	while (off < need) {
+		nr = read(fd, buf + off, (size_t)(need - off));
+		if (nr <= 0) {
+			if (nr < 0 && errno == EINTR)
+				continue;
+			free(buf);
+			close(fd);
+			return false;
+		}
+		off += nr;
+	}
+	close(fd);
+
+	flip_wait();
+	if (dst_stride == hdr.stride) {
+		memcpy(scan[0], buf, (size_t)need);
+	} else {
+		for (y = 0; y < exp_h; y++)
+			memcpy(scan[0] + (size_t)y * dst_stride,
+			       buf + (size_t)y * hdr.stride, hdr.stride);
+	}
+	free(buf);
+	sync_range(scan[0], dst_stride * exp_h, MBX_SYNC_CLEAN);
+
+	if (!kms_flip(0, (int)hdr.rot, 0, 0, 0))
+		return false;
+	pthread_mutex_lock(&flip_mx);
+	st_front = 0;
+	st_latest = -1;
+	buf_frame[0] = -1;
+	pthread_mutex_unlock(&flip_mx);
+	ext_ovl_active = true;
+	ext_ovl_gen = hdr.gen;
+	ext_ovl_rot = (int)hdr.rot;
+	return true;
+}
+
+void mbx_gpu_clear_ext_overlay(void)
+{
+	unlink(N72_EXT_OVL_PATH);
+	ext_ovl_active = false;
+	ext_ovl_gen = 0;
+	ext_ovl_rot = 0;
 }
 
 /* LVGL draws into the scan-out buffers themselves: upright, or turned by the display */

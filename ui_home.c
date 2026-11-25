@@ -2716,6 +2716,7 @@ static void app_dormant_enter(void)
 	wp_suspend();
 	mbx_gpu_set_layer_enabled(false);
 	mbx_gpu_suspend();
+	mbx_gpu_sync_ext_overlay();
 }
 
 void app_dormant_wake(bool full)
@@ -2742,6 +2743,8 @@ void app_dormant_wake(bool full)
 		if (lv_screen_active())
 			lv_obj_invalidate(lv_screen_active());
 	} else if (app_dormant) {
+		bool had_ext = mbx_gpu_ext_overlay_active();
+
 		app_dormant = false;
 		mbx_gpu_set_layer_enabled(true);
 		idle_timer_sync();
@@ -2749,7 +2752,7 @@ void app_dormant_wake(bool full)
 			dormant_status_dirty = false;
 			home_update(NULL);
 		}
-		if (!mbx_gpu_is_suspended() || !mbx_gpu_draws_direct() ||
+		if (had_ext || !mbx_gpu_is_suspended() || !mbx_gpu_draws_direct() ||
 		    !app_scr || lv_screen_active() != app_scr) {
 			if (lv_screen_active())
 				lv_obj_invalidate(lv_screen_active());
@@ -2924,6 +2927,7 @@ static void app_closed(void)
 	sd_settle_now();
 
 	app_pid = 0;
+	mbx_gpu_clear_ext_overlay();
 	app_pidfd_close();
 	gp_gone();		/* (a game's pause panel) */
 	kbd_app_gone();

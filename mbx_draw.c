@@ -928,6 +928,10 @@ void ta_wait_active(void)
 	memset(ta_slot_seq, 0, sizeof(ta_slot_seq));
 }
 
+void mbx_gpu_wait_ta(void)
+{
+	ta_wait_active();
+}
 
 void ta_ring_free(void)
 {

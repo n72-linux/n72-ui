@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 /* n72-ui's user interface (see ui_m3.c): paint. */
 #include "ui_m3_priv.h"
+#include "mbx_gpu.h"
 
 /* -------------------------------------------------------------- paint */
 
@@ -16,6 +17,7 @@ static uint32_t paint_hue;
 
 static void paint_clear(void)
 {
+	mbx_gpu_wait_ta();
 	lv_canvas_fill_bg(paint_canvas, M.surface_c, LV_OPA_COVER);
 	lv_draw_buf_flush_cache(paint_buf, NULL);
 }
@@ -63,6 +65,7 @@ static void paint_event(lv_event_t *e)
 	if (dirty.x1 > dirty.x2 || dirty.y1 > dirty.y2)
 		return;
 
+	mbx_gpu_wait_ta();
 	lv_canvas_init_layer(paint_canvas, &layer);
 	layer._clip_area = dirty;
 	layer.phy_clip_area = dirty;

@@ -694,6 +694,50 @@ lv_timer_t *idle_timer;
 void idle_kick(void);
 void rot_kick(void);
 
+static int ext_ovl_sock = -1;
+
+static void ext_ovl_cb(int fd)
+{
+	char buf[64];
+
+	while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0)
+		;
+	if (app_dormant)
+		mbx_gpu_sync_ext_overlay();
+}
+
+static void ext_ovl_sock_cleanup(void)
+{
+	if (ext_ovl_sock >= 0) {
+		close(ext_ovl_sock);
+		ext_ovl_sock = -1;
+	}
+	unlink(N72_EXT_OVL_SOCK);
+}
+
+static void ext_ovl_sock_init(void)
+{
+	struct sockaddr_un sa;
+	int fd;
+
+	if (!mbx_gpu_on_shell_layer())
+		return;
+	fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return;
+	memset(&sa, 0, sizeof(sa));
+	sa.sun_family = AF_UNIX;
+	snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", N72_EXT_OVL_SOCK);
+	unlink(N72_EXT_OVL_SOCK);
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+		ext_ovl_sock = fd;
+		ui_watch(ext_ovl_sock, ext_ovl_cb);
+		atexit(ext_ovl_sock_cleanup);
+	} else {
+		close(fd);
+	}
+}
+
 void ui_unwatch(int fd)
 {
 	int i;
@@ -1630,6 +1674,7 @@ int main(int argc, char **argv)
 	playback_timer = lv_timer_create(playback_check, 2000, NULL);
 	lv_timer_pause(playback_timer);		/* (screen_off_or_sleep starts it) */
 	uevent_init();
+	ext_ovl_sock_init();
 
 	build_home();
 	kbd_init();

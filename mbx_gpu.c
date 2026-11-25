@@ -327,7 +327,5 @@ void buf_invalidate(const lv_draw_buf_t *b, const lv_area_t *a)
 
 void buf_clean(const lv_draw_buf_t *b, const lv_area_t *a)
 {
-	if (ta_active_seq)
-		ta_wait_active();
 	buf_sync_area(b, a, MBX_SYNC_CLEAN);
 }

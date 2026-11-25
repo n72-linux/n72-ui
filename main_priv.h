@@ -29,6 +29,7 @@
 #include <linux/fb.h>
 #include <sys/klog.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/reboot.h>
 #include <sys/resource.h>
 #include <sys/sysinfo.h>

@@ -83,6 +83,25 @@ void mbx_gpu_suspend(void);
 void mbx_gpu_resume(void);
 bool mbx_gpu_is_suspended(void);
 
+#define N72_EXT_OVL_MAGIC 0x4e374f56u	/* "N7OV" */
+#define N72_EXT_OVL_PATH  "/run/n72-retro-overlay.bin"
+#define N72_EXT_OVL_SOCK  "/run/n72-retro-overlay.sock"
+
+struct n72_ext_ovl_hdr {
+	uint32_t magic;
+	uint32_t gen;
+	uint32_t width;
+	uint32_t height;
+	uint32_t stride;
+	uint32_t rot;		/* 0, 90, 270 */
+	uint32_t enabled;
+	uint32_t reserved;
+};
+
+bool mbx_gpu_sync_ext_overlay(void);
+void mbx_gpu_clear_ext_overlay(void);
+bool mbx_gpu_ext_overlay_active(void);
+
 typedef void (*mbx_hw_slide_abort_cb)(void *owner);
 bool mbx_gpu_hw_slide_begin(const lv_draw_buf_t *pic, int32_t x, int32_t init_y,
 			    void *owner, mbx_hw_slide_abort_cb abort_cb);
@@ -100,5 +119,8 @@ void mbx_gpu_hw_slide_abort(void *except_owner);
  * (The browser's pinch-zoom: page tiles drawn bigger or smaller.)
  */
 void mbx_gpu_image_dsc_scaled(lv_draw_image_dsc_t *d);
+
+/* Wait for any in-flight asynchronous TA frame to complete. */
+void mbx_gpu_wait_ta(void);
 
 #endif
