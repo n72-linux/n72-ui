@@ -317,12 +317,14 @@ static void render_start_cb(lv_event_t *e)
 	int i, k, dr = -1, src;
 	long have, f;
 
-	if (scan_count == 1)
-		flip_wait();	/* single-buffered on scan[0] while GPU-suspended */
+	if (scan_count <= 2)
+		flip_wait();	/* double-buffered on scan[0..1] (or single fallback) while GPU-suspended */
 
 	pthread_mutex_lock(&flip_mx);
 	if (scan_count == 1) {
 		dr = 0;
+	} else if (scan_count == 2) {
+		dr = st_front == 0 ? 1 : 0;
 	} else {
 		for (i = 0; i < scan_count; i++)
 			if (i != st_front && i != st_latching && i != st_ready)
@@ -1394,6 +1396,8 @@ bool mbx_gpu_set_rotation(int deg)
 
 void mbx_gpu_set_layer_enabled(bool on)
 {
+	int i;
+
 	if (!flipping || !kms_shell || kms_fd < 0)
 		return;
 	if (on) {
@@ -1409,6 +1413,12 @@ void mbx_gpu_set_layer_enabled(bool on)
 		if (!ioctl(kms_fd, DRM_IOCTL_MODE_SETCRTC, &set))
 			kms_layer_on = false;
 	}
+	pthread_mutex_lock(&flip_mx);
+	st_front = -1;
+	st_latest = -1;
+	for (i = 0; i < NSCAN; i++)
+		buf_frame[i] = -1;
+	pthread_mutex_unlock(&flip_mx);
 }
 
 void mbx_gpu_suspend(void)
@@ -1420,13 +1430,14 @@ void mbx_gpu_suspend(void)
 		return;
 	mbx_gpu_set_layer_enabled(false);
 	ta_ring_free();
-	for (i = 1; i < NSCAN; i++)
+	for (i = 2; i < NSCAN; i++)
 		kms_release_scan(i);
 	pthread_mutex_lock(&flip_mx);
-	scan_count = 1;
+	scan_count = scan[1] ? 2 : 1;
 	st_front = -1;
-	st_latest = 0;
-	buf_frame[0] = -1;
+	st_latest = -1;
+	for (i = 0; i < NSCAN; i++)
+		buf_frame[i] = -1;
 	pthread_mutex_unlock(&flip_mx);
 	if (lbuf && (!rot_deg || hw_turn)) {
 		pool_free(lbuf);
@@ -1443,6 +1454,7 @@ void mbx_gpu_suspend(void)
 void mbx_gpu_resume(void)
 {
 	uint32_t size = fb.stride * fb.height;
+	bool had[NSCAN] = { false };
 	bool ok = true;
 	int i;
 
@@ -1455,6 +1467,9 @@ void mbx_gpu_resume(void)
 	if (!pool_reacquire())
 		fprintf(stderr, "n72-ui: pool reacquire failed; continuing with CPU fallback\n");
 	for (i = 1; i < NSCAN; i++) {
+		had[i] = scan[i] != NULL;
+		if (had[i])
+			continue;
 		scan[i] = alloc_scan_buf(size, i);
 		if (!scan[i] || !kms_import_scan(kms_fd, i)) {
 			ok = false;
@@ -1463,9 +1478,12 @@ void mbx_gpu_resume(void)
 	}
 	if (!ok) {
 		for (i = 1; i < NSCAN; i++)
-			kms_release_scan(i);
-		scan_count = 1;
-		fprintf(stderr, "n72-ui: scan[1..2] reacquire failed; single-buffered\n");
+			if (!had[i])
+				kms_release_scan(i);
+		pthread_mutex_lock(&flip_mx);
+		scan_count = scan[1] ? 2 : 1;
+		pthread_mutex_unlock(&flip_mx);
+		fprintf(stderr, "n72-ui: scan[2] reacquire failed; double-buffered\n");
 	} else {
 		pthread_mutex_lock(&flip_mx);
 		scan_count = NSCAN;
@@ -1529,12 +1547,11 @@ void mbx_gpu_premultiply_buf(lv_draw_buf_t *b)
 	lv_area_t all;
 	uint32_t y;
 
-	if (!b || b->header.cf != LV_COLOR_FORMAT_ARGB8888)
+	if (!b || b->header.cf != LV_COLOR_FORMAT_ARGB8888 || !in_pool(b->data))
 		return;
 	for (y = 0; y < b->header.h; y++)
 		premultiply_span((uint32_t *)(b->data + y * b->header.stride), b->header.w);
 	lv_area_set(&all, 0, 0, b->header.w - 1, b->header.h - 1);
-	if (in_pool(b->data))
-		buf_clean(b, &all);
+	buf_clean(b, &all);
 	b->header.flags |= LV_IMAGE_FLAGS_PREMULTIPLIED;
 }
