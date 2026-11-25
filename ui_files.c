@@ -25,7 +25,14 @@ static int fent_cmp(const void *a, const void *b)
 	return strcasecmp(x->name, y->name);
 }
 
-/* video, sound, picture or other, by the name's extension (*kind: its word) */
+static bool files_is_ipa(const char *name)
+{
+	const char *e = strrchr(name, '.');
+
+	return e && !strcasecmp(e + 1, "ipa");
+}
+
+/* video, sound, picture, iOS app or other, by the name's extension (*kind: its word) */
 static const char *files_icon(const char *name, bool *media, const char **kind)
 {
 	static const char *const video[] = { "mp4", "m4v", "mov", "mkv", "webm", "avi",
@@ -41,6 +48,8 @@ static const char *files_icon(const char *name, bool *media, const char **kind)
 	if (!e)
 		return LV_SYMBOL_FILE;
 	e++;
+	if (!strcasecmp(e, "ipa"))
+		return *kind = "iOS app", LV_SYMBOL_DOWNLOAD;
 	for (i = 0; i < sizeof(video) / sizeof(video[0]); i++)
 		if (!strcasecmp(e, video[i]))
 			return *media = true, *kind = "Video", LV_SYMBOL_VIDEO;
@@ -135,11 +144,12 @@ static void files_bind(struct fpage *fp, struct flist *l, int j, int i)
 	} else {
 		const char *kind;
 		char size[24];
-		bool media;
+		bool media, action;
 
 		icon = files_icon(f->name, &media, &kind);
-		bg = media ? M.tertiary_c : M.secondary_c;
-		fg = media ? M.on_tertiary_c : M.on_secondary_c;
+		action = media || files_is_ipa(f->name);
+		bg = action ? M.tertiary_c : M.secondary_c;
+		fg = action ? M.on_tertiary_c : M.on_secondary_c;
 		files_size(f->size, size, sizeof(size));
 		snprintf(sub, sizeof(sub), "%s, %s", kind, size);	/* (the fonts are ASCII) */
 	}
@@ -225,6 +235,10 @@ static void files_row_cb(lv_event_t *e)
 	snprintf(full, sizeof(full), "%s/%s", fp->path, fp->v[i].name);
 	if (fp->v[i].dir) {
 		files_open_dir(full);
+		return;
+	}
+	if (files_is_ipa(fp->v[i].name)) {
+		open_ipa_install(full);
 		return;
 	}
 	files_icon(fp->v[i].name, &media, &kind);

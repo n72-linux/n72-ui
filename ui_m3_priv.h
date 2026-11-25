@@ -572,6 +572,8 @@ lv_draw_buf_t *wp_pic(int kind);
 bool wp_put(lv_obj_t *scr, int kind);
 void wp_apply_kick(void);
 void open_wallpaper(lv_event_t *e);
+void open_apps(lv_event_t *e);
+void open_ipa_install(const char *path);
 void open_settings(lv_event_t *e);
 
 /* ui_logs.c */

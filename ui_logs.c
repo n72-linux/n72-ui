@@ -374,6 +374,8 @@ void ui_reopen(void)
 		open_power(NULL);
 	else if (!strcmp(p, "wallpaper"))
 		open_wallpaper(NULL);
+	else if (!strcmp(p, "apps"))
+		open_apps(NULL);
 	else if (!strcmp(p, "about"))
 		open_about(NULL);
 	else if (!strcmp(p, "logs"))
