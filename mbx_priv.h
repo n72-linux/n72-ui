@@ -105,6 +105,7 @@ void buf_clean(const lv_draw_buf_t *b, const lv_area_t *a);
 /* mbx_draw.c */
 extern bool transparent;
 extern bool frame_cpu_dirty;
+extern int32_t cpu_dirty_y1, cpu_dirty_y2;
 extern bool frame_drew_any;
 extern uint32_t ta_active_seq;
 int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t);
@@ -119,6 +120,9 @@ extern bool kms_shell;
 bool mbx_kms_direct_scan_buf(const void *p);
 bool mbx_kms_can_async_ta(const lv_layer_t *layer, const lv_draw_task_t *last);
 void mbx_kms_note_async_ta(uint32_t seq);
+bool mbx_kms_buf_needs_invalidate(const void *p);
+void mbx_kms_note_buf_invalidated(const void *p, const lv_area_t *a);
+void mbx_kms_note_cpu_touch(const void *p);
 
 #ifdef N72_DEBUG
 static inline double stat_t0(void)

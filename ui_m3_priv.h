@@ -179,7 +179,7 @@ struct kbd {
 
 struct sd {
 	int8_t cand;		/* this touch may start a drag: +1 down (open), -1 up */
-	bool on, pics;
+	bool on, pics, hw;
 	int px, py;		/* where the finger came down */
 	int32_t base, y;	/* the shade's y at the start, and now */
 	int last_y;
@@ -332,6 +332,7 @@ void psl_check(lv_obj_t *live);
 void psl_warm(lv_obj_t *live, psl_sig_fn sig);
 void psl_stop(lv_obj_t *live);
 bool psl_sliding(lv_obj_t *live);
+bool psl_active(lv_obj_t *live);
 void nav_caches_clear(void);
 void pf_timer_sync(void);
 lv_draw_buf_t *grab_or_snap(lv_obj_t *scr);

@@ -201,7 +201,7 @@ lv_draw_buf_t *snap(lv_obj_t *obj, lv_color_format_t cf)
  * is back, at its place, once the slide ends. iOS's longer timings (300 to
  * 350 ms) then cost nothing more per frame.
  */
-#define PSL_MAX 2
+#define PSL_MAX 4
 #define PSL_SIG 160
 
 /*
@@ -217,9 +217,10 @@ struct psl {
 	lv_obj_t *live, *img;
 	lv_draw_buf_t *pic;
 	int32_t ext;		/* the picture's margin (shadows) */
-	int32_t to;
+	int32_t to, cur_y;
 	bool hide;		/* hidden at the end (a slide out) */
 	bool resting;		/* the picture shows in the object's place */
+	bool hw;		/* hardware-scrolled via CLCD layer 1 */
 	psl_sig_fn sig;
 	char pic_sig[PSL_SIG];	/* what the picture shows */
 };
@@ -230,7 +231,11 @@ static void psl_y(void *var, int32_t v)
 {
 	struct psl *s = var;
 
-	lv_obj_set_y(s->img, v - s->ext);
+	s->cur_y = v;
+	if (s->hw)
+		mbx_gpu_hw_slide_move(v - s->ext);
+	else
+		lv_obj_set_y(s->img, v - s->ext);
 }
 
 static void psl_img_free(struct psl *s)
@@ -238,6 +243,27 @@ static void psl_img_free(struct psl *s)
 	if (s->img) {
 		lv_obj_delete(s->img);
 		s->img = NULL;
+	}
+}
+
+static struct psl *psl_of(lv_obj_t *live);
+
+static void psl_hw_abort(void *owner)
+{
+	struct psl *s = psl_of((lv_obj_t *)owner);
+
+	if (!s || !s->hw)
+		return;
+	lv_anim_delete(s, psl_y);
+	mbx_gpu_hw_slide_end(!s->hide);
+	s->hw = false;
+	s->resting = false;
+	lv_obj_set_y(s->live, s->to);
+	if (!s->hide)
+		lv_obj_remove_flag(s->live, LV_OBJ_FLAG_HIDDEN);
+	if (!s->sig) {
+		tr_free(&s->pic);
+		s->live = NULL;
 	}
 }
 
@@ -250,6 +276,10 @@ static void psl_finish(struct psl *s)
 	if (!s->hide && s->sig) {	/* the picture stays in its place */
 		s->resting = true;
 		return;
+	}
+	if (s->hw) {
+		mbx_gpu_hw_slide_end(!s->hide);
+		s->hw = false;
 	}
 	if (!s->hide)
 		lv_obj_remove_flag(s->live, LV_OBJ_FLAG_HIDDEN);
@@ -287,7 +317,7 @@ bool psl_covers(lv_obj_t *live, int x, int y)
 	struct psl *s = psl_of(live);
 	lv_area_t a;
 
-	if (!s || !s->img || s->hide)
+	if (!s || (!s->img && !s->hw) || s->hide)
 		return false;
 	lv_obj_get_coords(live, &a);	/* (already at the end, hidden) */
 	return x >= a.x1 && x <= a.x2 && y >= a.y1 && y <= a.y2;
@@ -345,44 +375,66 @@ static struct psl *psl_slot(lv_obj_t *live, psl_sig_fn sig)
 bool psl_start_sig(lv_obj_t *live, int32_t to, uint32_t ms, lv_anim_path_cb_t path,
 			  bool hide, psl_sig_fn sig)
 {
-	struct psl *s = psl_slot(live, sig);
+	struct psl *s;
 	int32_t from;
 	lv_anim_t a;
 
+	mbx_gpu_hw_slide_abort(live);
+	s = psl_slot(live, sig);
 	if (!s)
 		return false;
-	if (s->img) {
+	if (s->hw || s->img) {
 		/* sliding, or resting as its picture: from where that is now */
-		from = lv_obj_get_style_y(s->img, LV_PART_MAIN) + s->ext;
+		from = s->hw ? s->cur_y : lv_obj_get_style_y(s->img, LV_PART_MAIN) + s->ext;
 		lv_anim_delete(s, psl_y);
-		if (s->resting) {	/* (the picture may be old: the object again) */
+		if (s->sig) {		/* (the picture may be old: take it again if needed) */
 			char now[PSL_SIG] = "";
 
 			s->sig(now, sizeof(now));
-			if (strcmp(now, s->pic_sig))
+			if (strcmp(now, s->pic_sig)) {
+				if (s->hw) {
+					mbx_gpu_hw_slide_end(true);
+					s->hw = false;
+				}
 				psl_img_free(s);
+			}
 		}
 	} else {
 		from = lv_obj_get_style_y(live, LV_PART_MAIN);
 	}
 	s->resting = false;
-	if (!s->img) {
+	if (!s->hw && !s->img) {
+		int32_t px;
+
 		lv_obj_set_y(live, from);
 		if (!psl_take(s, live)) {
 			if (!s->sig)
 				s->live = NULL;
 			return false;
 		}
-		s->img = lv_image_create(lv_obj_get_parent(live));
-		lv_image_set_src(s->img, s->pic);
-		lv_obj_remove_flag(s->img, LV_OBJ_FLAG_CLICKABLE);
-		lv_obj_move_to_index(s->img, lv_obj_get_index(live) + 1);
-		lv_obj_set_pos(s->img, lv_obj_get_x(live) - s->ext, from - s->ext);
+		px = lv_obj_get_x(live) - s->ext;
+		lv_obj_add_flag(live, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_y(live, to);		/* (touches go by its final place) */
+		if (mbx_gpu_hw_slide_begin(s->pic, px, from - s->ext, live, psl_hw_abort)) {
+			s->hw = true;
+			s->cur_y = from;
+		} else {
+			s->img = lv_image_create(lv_obj_get_parent(live));
+			lv_image_set_src(s->img, s->pic);
+			lv_obj_remove_flag(s->img, LV_OBJ_FLAG_CLICKABLE);
+			lv_obj_move_to_index(s->img, lv_obj_get_index(live) + 1);
+			lv_obj_set_pos(s->img, px, from - s->ext);
+		}
+	} else {
+		if (s->hw)
+			quiet_begin();
+		lv_obj_add_flag(live, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_y(live, to);		/* (touches go by its final place) */
+		if (s->hw)
+			quiet_end();
 	}
 	s->to = to;
 	s->hide = hide;
-	lv_obj_add_flag(live, LV_OBJ_FLAG_HIDDEN);
-	lv_obj_set_y(live, to);		/* (touches go by its final place) */
 	lv_anim_init(&a);
 	lv_anim_set_var(&a, s);
 	lv_anim_set_exec_cb(&a, psl_y);
@@ -407,6 +459,10 @@ static void psl_wake(lv_obj_t *live)
 	if (!s || !s->resting)
 		return;
 	s->resting = false;
+	if (s->hw) {
+		mbx_gpu_hw_slide_end(true);
+		s->hw = false;
+	}
 	psl_img_free(s);
 	lv_obj_remove_flag(live, LV_OBJ_FLAG_HIDDEN);
 }
@@ -420,7 +476,7 @@ void psl_touch(lv_obj_t *live)
 {
 	struct psl *s = psl_of(live);
 
-	if (!s || !s->img || (s->hide && !s->resting))
+	if (!s || (!s->img && !s->hw) || (s->hide && !s->resting))
 		return;
 	if (!s->resting)
 		psl_finish(s);
@@ -445,7 +501,8 @@ void psl_warm(lv_obj_t *live, psl_sig_fn sig)
 {
 	struct psl *s;
 
-	if (!lv_obj_has_flag(live, LV_OBJ_FLAG_HIDDEN) || !(s = psl_slot(live, sig)) || s->img)
+	if (!lv_obj_has_flag(live, LV_OBJ_FLAG_HIDDEN) || !(s = psl_slot(live, sig)) ||
+	    s->img || s->hw)
 		return;
 	psl_take(s, live);
 }
@@ -457,9 +514,13 @@ void psl_stop(lv_obj_t *live)
 
 	if (!s)
 		return;
-	if (s->img && !s->resting)
+	if ((s->img || s->hw) && !s->resting)
 		psl_finish(s);
 	if (s->resting) {
+		if (s->hw) {
+			mbx_gpu_hw_slide_end(false);
+			s->hw = false;
+		}
 		psl_img_free(s);
 		lv_obj_remove_flag(live, LV_OBJ_FLAG_HIDDEN);
 	}
@@ -471,7 +532,14 @@ bool psl_sliding(lv_obj_t *live)
 {
 	struct psl *s = psl_of(live);
 
-	return s && s->img && !s->resting;
+	return s && (s->img || s->hw) && !s->resting;
+}
+
+bool psl_active(lv_obj_t *live)
+{
+	struct psl *s = psl_of(live);
+
+	return s && (s->img != NULL || s->hw);
 }
 
 static void sc_restore(bool delete_pics);
@@ -484,7 +552,7 @@ void nav_caches_clear(void)
 	for (i = 0; i < BP_MAX; i++)
 		bp_drop(i);
 	for (i = 0; i < PSL_MAX; i++) {
-		if (psl[i].live && !psl[i].img) {
+		if (psl[i].live && !psl[i].img && !psl[i].hw) {
 			tr_free(&psl[i].pic);
 			psl[i].pic_sig[0] = 0;
 		}

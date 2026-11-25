@@ -20,6 +20,7 @@ static uint8_t *scan[NSCAN];		/* flip mode: the scan-out buffers */
 static struct mbx_buf scan_buf[NSCAN];
 static uint32_t scan_handle[NSCAN];
 static uint32_t scan_ta_seq[NSCAN];	/* pending async TA frame on scan[i] */
+static bool scan_cpu_cached[NSCAN] = { true, true, true };
 static int scan_count = NSCAN;
 static uint32_t flush_words[16 * 64];
 static int flush_n;
@@ -130,7 +131,20 @@ static bool cur_all;
 
 static int notify_pipe[2] = { -1, -1 };
 static int kms_fd = -1;			/* /dev/dri/card0 when flipping through KMS */
-static bool kms_flip(int r);
+static bool kms_layer_on = true;
+static bool kms_layer_want = true;
+static bool gpu_suspended;
+static bool kms_can_window;
+static uint32_t kms_src_y, kms_win_y, kms_win_h;
+static uint32_t buf_src_y[NSCAN], buf_win_y[NSCAN], buf_win_h[NSCAN];
+static bool kms_flip(int r, int rot, uint32_t sy, uint32_t wy, uint32_t wh);
+static void shell_active_y_bounds(uint32_t *out_y, uint32_t *out_h);
+static bool hw_slide_active;
+static int hw_slide_fb = -1, hw_slide_blank_fb = -1;
+static bool hw_slide_blank_zeroed;
+static int32_t hw_slide_h, hw_slide_last_y;
+static void *hw_slide_owner;
+static mbx_hw_slide_abort_cb hw_slide_abort_fn;
 
 /* a finished frame is waiting for the display (drawing another is wasted) */
 bool mbx_gpu_frame_waiting(void)
@@ -166,13 +180,18 @@ static void *flip_main(void *arg)
 	pthread_mutex_lock(&flip_mx);
 	for (;;) {
 		double t0;
-		int r;
+		int r, rot;
+		uint32_t sy, wy, wh;
 
 		while (st_ready < 0)
 			pthread_cond_wait(&flip_cv, &flip_mx);
 		r = st_ready;
 		st_ready = -1;
 		st_latching = r;
+		rot = buf_rot[r];
+		sy = buf_src_y[r];
+		wy = buf_win_y[r];
+		wh = buf_win_h[r];
 		pthread_mutex_unlock(&flip_mx);
 		if (notify_pipe[1] >= 0) {	/* the main loop may draw again */
 			char c = 1;
@@ -182,7 +201,7 @@ static void *flip_main(void *arg)
 		}
 		t0 = stat_t0();
 		/* flipping implies KMS (flip_setup): waits for the flip's own event */
-		bool shown = kms_flip(r);
+		bool shown = kms_flip(r, rot, sy, wy, wh);
 
 		pthread_mutex_lock(&flip_mx);
 		STAT_US(flip_us, t0);
@@ -225,14 +244,33 @@ static lv_area_t sync_q[SYNC_BATCH];
 static int sync_qn;
 static int32_t sync_y1, sync_y2;
 
-static void sync_flush(int dst, int src)
+static bool sync_flush(int dst, int src)
 {
 	uint32_t ss = scan_stride();
 	int i;
 
 	if (!sync_qn || !scan[dst] || !scan[src]) {
 		sync_qn = 0;
-		return;
+		return false;
+	}
+	if (gpu_suspended || transparent) {
+		mbx_kms_note_cpu_touch(scan[dst]);
+		mbx_kms_note_cpu_touch(scan[src]);
+		for (i = 0; i < sync_qn; i++) {
+			lv_area_t *c = &sync_q[i];
+			size_t bytes = (size_t)lv_area_get_width(c) * 4;
+			int32_t y, h = lv_area_get_height(c);
+			uint8_t *dp = scan[dst] + c->y1 * (int32_t)ss + c->x1 * 4;
+			const uint8_t *sp = scan[src] + c->y1 * (int32_t)ss + c->x1 * 4;
+
+			for (y = 0; y < h; y++) {
+				memcpy(dp, sp, bytes);
+				dp += ss;
+				sp += ss;
+			}
+		}
+		sync_qn = 0;
+		return true;
 	}
 	sync_range(scan[dst] + sync_y1 * ss, (sync_y2 - sync_y1 + 1) * ss, MBX_SYNC_FLUSH);
 	if (sync_qn == 1 && !transparent &&
@@ -244,7 +282,7 @@ static void sync_flush(int dst, int src)
 
 		if (!blit3d(8, gpu_addr(scan[dst]), gpu_addr(scan[src]), w3, n)) {
 			sync_qn = 0;
-			return;
+			return false;
 		}
 	}
 	for (i = 0; i < sync_qn; i++) {
@@ -263,6 +301,7 @@ static void sync_flush(int dst, int src)
 		flush_n = 0;
 	}
 	sync_qn = 0;
+	return false;
 }
 
 static void sync_rect(int dst, int src, const lv_area_t *a)
@@ -306,9 +345,47 @@ void mbx_kms_note_async_ta(uint32_t seq)
 	ta_active_seq = seq;
 }
 
-static bool kms_layer_on = true;
-static bool kms_layer_want = true;
-static bool gpu_suspended;
+bool mbx_kms_buf_needs_invalidate(const void *p)
+{
+	if (mbx_kms_direct_scan_buf(p))
+		return scan_cpu_cached[st_drawing] || frame_cpu_dirty;
+	return true;
+}
+
+void mbx_kms_note_buf_invalidated(const void *p, const lv_area_t *a)
+{
+	if (mbx_kms_direct_scan_buf(p) && a && a->y1 <= 0 && a->y2 >= scan_h() - 1)
+		scan_cpu_cached[st_drawing] = false;
+}
+
+void mbx_kms_note_cpu_touch(const void *p)
+{
+	int i;
+
+	for (i = 0; i < NSCAN; i++) {
+		if (scan[i] == p) {
+			scan_cpu_cached[i] = true;
+			return;
+		}
+	}
+}
+
+static void scan_zero_transparent(void)
+{
+	uint32_t size = (uint32_t)scan_h() * scan_stride();
+	int i;
+
+	if (!transparent || (rot_deg && !hw_turn))
+		return;
+	for (i = 0; i < scan_count; i++) {
+		if (!scan[i])
+			continue;
+		memset(scan[i], 0, size);
+		sync_range(scan[i], size, MBX_SYNC_CLEAN);
+		scan_cpu_cached[i] = true;
+		buf_frame[i] = frame_no;
+	}
+}
 
 static void render_start_cb(lv_event_t *e)
 {
@@ -316,6 +393,9 @@ static void render_start_cb(lv_event_t *e)
 	lv_area_t all = { 0, 0, scan_w() - 1, scan_h() - 1 };
 	int i, k, dr = -1, src;
 	long have, f;
+
+	if (hw_slide_active)
+		mbx_gpu_hw_slide_end(true);
 
 	if (scan_count <= 2)
 		flip_wait();	/* double-buffered on scan[0..1] (or single fallback) while GPU-suspended */
@@ -352,6 +432,8 @@ static void render_start_cb(lv_event_t *e)
 
 	/* bring the buffer up to date: frames buf_frame[dr]+1 .. frame_no */
 	double dbg_t0 = stat_t0();
+	bool synced_cpu = false;
+	int32_t sy1 = 0, sy2 = -1;
 	have = buf_frame[dr];
 	sync_qn = 0;
 	if (scan_count > 1 && src >= 0 && src != dr && scan[src] && have < frame_no) {
@@ -371,15 +453,21 @@ static void render_start_cb(lv_event_t *e)
 						sync_rect(dr, src, &hist[k].a[i]);
 			}
 		}
-		sync_flush(dr, src);
+		sy1 = sync_y1;
+		sy2 = sync_y2;
+		synced_cpu = sync_flush(dr, src);
 	}
 	d->buf_1->data = rot_deg && !hw_turn ? lbuf : scan[dr];
 	cur_n = 0;
 	cur_all = false;
 	pm_skip_n = 0;
-	frame_cpu_dirty = false;
+	frame_cpu_dirty = synced_cpu;
+	cpu_dirty_y1 = synced_cpu ? sy1 : 0;
+	cpu_dirty_y2 = synced_cpu ? sy2 : -1;
 	frame_drew_any = false;
-	clean_has_rows = false;
+	clean_has_rows = synced_cpu;
+	clean_y1 = sy1;
+	clean_y2 = sy2;
 	n72_trace("draw", 0);
 #ifdef N72_DEBUG
 	if (mbx_gpu_timing && gpu_now_us() - dbg_t0 > 8000 && getenv("N72_FPS"))
@@ -399,7 +487,17 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 
 	n72_trace("flush", lv_area_get_height(area));
 	if (transparent) {
+		mbx_kms_note_cpu_touch(px_map);
 		premultiply(px_map, area);
+		if (!frame_cpu_dirty || cpu_dirty_y1 > cpu_dirty_y2) {
+			cpu_dirty_y1 = area->y1;
+			cpu_dirty_y2 = area->y2;
+		} else {
+			if (area->y1 < cpu_dirty_y1)
+				cpu_dirty_y1 = area->y1;
+			if (area->y2 > cpu_dirty_y2)
+				cpu_dirty_y2 = area->y2;
+		}
 		frame_cpu_dirty = true;
 	}
 	dbg_t1 = stat_t0();
@@ -433,7 +531,12 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 		else
 			cur_all = true;
 		if (last && frame_cpu_dirty && clean_has_rows) {
-			lv_area_t ca = { 0, clean_y1, 0, clean_y2 };
+			lv_area_t ca = {
+				0,
+				cpu_dirty_y1 <= cpu_dirty_y2 ? cpu_dirty_y1 : clean_y1,
+				0,
+				cpu_dirty_y1 <= cpu_dirty_y2 ? cpu_dirty_y2 : clean_y2,
+			};
 
 			clean_rows(px_map, &ca);
 		}
@@ -460,6 +563,7 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 			uint32_t x, y, bad = 0, fx = 0, fy = 0;
 
 			ta_wait_active();
+			mbx_kms_note_cpu_touch(px_map);
 			for (y = 0; y < fb.height; y++)
 				for (x = 0; x < fb.width; x++)
 					if ((((uint32_t *)(px_map + y * fb.stride))[x] >> 24) != 255 && !bad++) {
@@ -482,6 +586,9 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 			lv_display_flush_ready(disp);
 			return;
 		}
+		uint32_t wy = 0, wh = fb.height;
+
+		shell_active_y_bounds(&wy, &wh);
 		memcpy(hist[k].a, cur_areas, sizeof(cur_areas));
 		hist[k].n = cur_n;
 		hist[k].all = cur_all;
@@ -490,6 +597,9 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 		frame_no = n;
 		buf_frame[st_drawing] = n;
 		buf_rot[st_drawing] = hw_turn ? rot_deg : 0;
+		buf_src_y[st_drawing] = (hw_turn && rot_deg) ? 0 : wy;
+		buf_win_y[st_drawing] = wy;
+		buf_win_h[st_drawing] = wh;
 		st_latest = st_drawing;
 		st_ready = st_drawing;		/* (replaces an older ready frame) */
 		st_drawing = -1;
@@ -531,12 +641,17 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 	lv_display_flush_ready(disp);
 }
 
-/* Before the CPU draws the next frame into disp_buf. */
+/* Before LVGL lays out and draws the next frame. */
 static void refr_start_cb(lv_event_t *e)
 {
-	LV_UNUSED(e);
+	lv_display_t *d = lv_event_get_target(e);
+
+	if (hw_slide_active && d && d->inv_p > 0)
+		mbx_gpu_hw_slide_abort(NULL);
 	if (!flipping) {
 		frame_cpu_dirty = false;
+		cpu_dirty_y1 = 0;
+		cpu_dirty_y2 = -1;
 		frame_drew_any = false;
 	}
 	n72_refr_start();
@@ -578,9 +693,38 @@ bool kms_shell;				/* on the display's layer 1, over the applications */
  */
 static uint32_t kms_fb_l[NSCAN];
 static uint32_t kms_plane, kms_prop_rot, kms_prop_fb, kms_prop_sw, kms_prop_sh;
+static uint32_t kms_prop_cx, kms_prop_cy, kms_prop_cw, kms_prop_ch, kms_prop_sx, kms_prop_sy;
+static uint32_t kms_prop_plane_crtc, kms_prop_active, kms_prop_mode_id, kms_prop_conn_crtc;
+static uint32_t kms_mode_blob;
 static uint64_t kms_rot_cur;		/* the plane's rotation (DRM_MODE_ROTATE_*) */
 
 #define ROT_BITS(deg) ((deg) == 90 ? 2u : (deg) == 270 ? 8u : 1u)	/* DRM_MODE_ROTATE_* */
+
+static uint32_t kms_obj_prop(int fd, uint32_t obj_id, uint32_t obj_type, const char *name)
+{
+	struct drm_mode_obj_get_properties op = {
+		.obj_id = obj_id, .obj_type = obj_type,
+	};
+	uint32_t ids[24];
+	uint64_t vals[24];
+	unsigned int k;
+
+	if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &op))
+		return 0;
+	op.props_ptr = (uintptr_t)ids;
+	op.prop_values_ptr = (uintptr_t)vals;
+	if (op.count_props > 24)
+		op.count_props = 24;
+	if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &op))
+		return 0;
+	for (k = 0; k < op.count_props; k++) {
+		struct drm_mode_get_property gp = { .prop_id = ids[k] };
+
+		if (!ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &gp) && !strcmp(gp.name, name))
+			return ids[k];
+	}
+	return 0;
+}
 
 /* The layer's plane and its properties; false if it cannot turn. */
 static bool kms_find_plane(int fd)
@@ -603,7 +747,8 @@ static bool kms_find_plane(int fd)
 		};
 		uint32_t ids[24];
 		uint64_t vals[24];
-		uint32_t rot = 0, fbp = 0, sw = 0, sh = 0;
+		uint32_t rot = 0, fbp = 0, crtcp = 0, sw = 0, sh = 0;
+		uint32_t cx = 0, cy = 0, cw = 0, ch = 0, sx = 0, sy = 0;
 		uint64_t rotv = 1, type = 0;
 
 		if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &op))
@@ -624,6 +769,20 @@ static bool kms_find_plane(int fd)
 				rotv = vals[k];
 			} else if (!strcmp(gp.name, "FB_ID")) {
 				fbp = ids[k];
+			} else if (!strcmp(gp.name, "CRTC_ID")) {
+				crtcp = ids[k];
+			} else if (!strcmp(gp.name, "CRTC_X")) {
+				cx = ids[k];
+			} else if (!strcmp(gp.name, "CRTC_Y")) {
+				cy = ids[k];
+			} else if (!strcmp(gp.name, "CRTC_W")) {
+				cw = ids[k];
+			} else if (!strcmp(gp.name, "CRTC_H")) {
+				ch = ids[k];
+			} else if (!strcmp(gp.name, "SRC_X")) {
+				sx = ids[k];
+			} else if (!strcmp(gp.name, "SRC_Y")) {
+				sy = ids[k];
 			} else if (!strcmp(gp.name, "SRC_W")) {
 				sw = ids[k];
 			} else if (!strcmp(gp.name, "SRC_H")) {
@@ -634,11 +793,18 @@ static bool kms_find_plane(int fd)
 		}
 		if (type != 1 /* primary */ || !rot || !fbp || !sw || !sh)
 			continue;
+		kms_prop_cx = cx;
+		kms_prop_cy = cy;
+		kms_prop_cw = cw;
+		kms_prop_ch = ch;
+		kms_prop_sx = sx;
+		kms_prop_sy = sy;
 		kms_prop_sw = sw;
 		kms_prop_sh = sh;
 		kms_plane = planes[i];
 		kms_prop_rot = rot;
 		kms_prop_fb = fbp;
+		kms_prop_plane_crtc = crtcp;
 		kms_rot_cur = rotv;
 		return true;
 	}
@@ -800,59 +966,232 @@ static bool kms_wait_flip(uint64_t seq, int ms)
 
 static uint64_t kms_seq;
 
-/* The flip to buffer @r, waited for: true once it is on the screen. */
-static bool kms_flip(int r)
+static void shell_active_y_bounds(uint32_t *out_y, uint32_t *out_h)
 {
-	uint64_t want = ROT_BITS(buf_rot[r]);
+	lv_obj_t *scr = lv_screen_active();
+	lv_obj_t *roots[3];
+	int32_t min_y = (int32_t)fb.height, max_y = -1;
+	int r;
+
+	if (!kms_can_window || !transparent || rot_deg) {
+		*out_y = 0;
+		*out_h = fb.height;
+		return;
+	}
+	if (scr && lv_obj_get_style_bg_opa(scr, LV_PART_MAIN) > LV_OPA_TRANSP) {
+		*out_y = 0;
+		*out_h = fb.height;
+		return;
+	}
+	roots[0] = scr;
+	roots[1] = lv_layer_top();
+	roots[2] = lv_layer_sys();
+	for (r = 0; r < 3; r++) {
+		uint32_t n, i;
+
+		if (!roots[r])
+			continue;
+		n = lv_obj_get_child_count(roots[r]);
+		for (i = 0; i < n; i++) {
+			lv_obj_t *c = lv_obj_get_child(roots[r], (int32_t)i);
+			lv_area_t a;
+			int32_t ext, y1, y2;
+
+			if (!c || lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+				continue;
+			lv_obj_get_coords(c, &a);
+			ext = lv_obj_get_ext_draw_size(c);
+			y1 = a.y1 - ext;
+			y2 = a.y2 + ext;
+			if (y2 < 0 || y1 >= (int32_t)fb.height)
+				continue;
+			if (y1 < 0)
+				y1 = 0;
+			if (y2 >= (int32_t)fb.height)
+				y2 = (int32_t)fb.height - 1;
+			if (y1 < min_y)
+				min_y = y1;
+			if (y2 > max_y)
+				max_y = y2;
+		}
+	}
+	if (min_y > max_y) {
+		*out_y = 0;
+		*out_h = 16;
+		return;
+	}
+	{
+		uint32_t h = (uint32_t)(max_y - min_y + 1);
+
+		if (h < 16) {
+			h = 16;
+			if ((uint32_t)min_y + h > fb.height)
+				min_y = (int32_t)fb.height - 16;
+		}
+		*out_y = (uint32_t)min_y;
+		*out_h = h;
+	}
+}
+
+/* The flip to buffer @r, waited for: true once it is on the screen. */
+static bool kms_flip(int r, int rot, uint32_t sy, uint32_t wy, uint32_t wh)
+{
+	uint64_t want = ROT_BITS(rot);
+	uint32_t fsy = rot ? 0 : sy;
+	uint32_t fwy = (rot || !wh) ? 0 : wy;
+	uint32_t fwh = (rot || !wh) ? fb.height : wh;
 	struct drm_mode_crtc_page_flip pf = {
-		.crtc_id = kms_crtc, .fb_id = buf_rot[r] ? kms_fb_l[r] : kms_fb[r],
+		.crtc_id = kms_crtc, .fb_id = rot ? kms_fb_l[r] : kms_fb[r],
 		.flags = DRM_MODE_PAGE_FLIP_EVENT, .user_data = ++kms_seq,
 	};
+	bool need_rot, need_win;
 	int tries;
 
 	if (!kms_layer_on) {
-		struct drm_mode_crtc set = {
-			.crtc_id = kms_crtc,
-			.fb_id = pf.fb_id,
-			.mode = kms_mode,
-			.mode_valid = 1,
-			.set_connectors_ptr = (uintptr_t)&kms_conn,
-			.count_connectors = 1,
-		};
+		if (kms_can_window && kms_mode_blob && kms_prop_active &&
+		    kms_prop_mode_id && kms_prop_conn_crtc && kms_prop_plane_crtc) {
+			uint32_t objs[3] = { kms_crtc, kms_conn, kms_plane };
+			uint32_t counts[3] = { 2, 1, 0 };
+			uint32_t props[16];
+			uint64_t vals[16];
+			struct drm_mode_atomic a = { 0 };
+			int n = 0;
 
-		if (kms_can_turn && want != kms_rot_cur)
-			kms_set_rot(kms_fd, want);
-		if (ioctl(kms_fd, DRM_IOCTL_MODE_SETCRTC, &set)) {
-			fprintf(stderr, "n72-ui: re-enabling layer 1: %s\n", strerror(errno));
-			return false;
+			props[n] = kms_prop_active;
+			vals[n++] = 1;
+			props[n] = kms_prop_mode_id;
+			vals[n++] = kms_mode_blob;
+			props[n] = kms_prop_conn_crtc;
+			vals[n++] = kms_crtc;
+			props[n] = kms_prop_plane_crtc;
+			vals[n++] = kms_crtc;
+			props[n] = kms_prop_fb;
+			vals[n++] = pf.fb_id;
+			if (kms_can_turn) {
+				props[n] = kms_prop_rot;
+				vals[n++] = want;
+			}
+			props[n] = kms_prop_cx;
+			vals[n++] = 0;
+			props[n] = kms_prop_cy;
+			vals[n++] = fwy;
+			props[n] = kms_prop_cw;
+			vals[n++] = fb.width;
+			props[n] = kms_prop_ch;
+			vals[n++] = fwh;
+			props[n] = kms_prop_sx;
+			vals[n++] = 0;
+			props[n] = kms_prop_sy;
+			vals[n++] = (uint64_t)fsy << 16;
+			props[n] = kms_prop_sw;
+			vals[n++] = (uint64_t)(rot ? fb.height : fb.width) << 16;
+			props[n] = kms_prop_sh;
+			vals[n++] = (uint64_t)(rot ? fb.width : fwh) << 16;
+			counts[2] = (uint32_t)(n - 3);
+			a.flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
+			a.count_objs = 3;
+			a.objs_ptr = (uintptr_t)objs;
+			a.count_props_ptr = (uintptr_t)counts;
+			a.props_ptr = (uintptr_t)props;
+			a.prop_values_ptr = (uintptr_t)vals;
+			if (!ioctl(kms_fd, DRM_IOCTL_MODE_ATOMIC, &a)) {
+				kms_layer_on = true;
+				if (kms_can_turn)
+					kms_rot_cur = want;
+				kms_src_y = fsy;
+				kms_win_y = fwy;
+				kms_win_h = fwh;
+				if (handoff_n)
+					kms_drop_handoff();
+				return true;
+			}
+			fprintf(stderr, "n72-ui: atomic enable layer 1: %s\n", strerror(errno));
+		}
+		{
+			struct drm_mode_crtc set = {
+				.crtc_id = kms_crtc,
+				.fb_id = pf.fb_id,
+				.mode = kms_mode,
+				.mode_valid = 1,
+				.set_connectors_ptr = (uintptr_t)&kms_conn,
+				.count_connectors = 1,
+			};
+
+			if (kms_can_turn && want != kms_rot_cur)
+				kms_set_rot(kms_fd, want);
+			if (ioctl(kms_fd, DRM_IOCTL_MODE_SETCRTC, &set)) {
+				fprintf(stderr, "n72-ui: re-enabling layer 1: %s\n", strerror(errno));
+				return false;
+			}
 		}
 		kms_layer_on = true;
+		kms_src_y = 0;
+		kms_win_y = 0;
+		kms_win_h = fb.height;
 		if (handoff_n)
 			kms_drop_handoff();
-		return true;
+		if (!kms_can_window || rot ||
+		    (fsy == kms_src_y && fwy == kms_win_y && fwh == kms_win_h))
+			return true;
 	}
-	if (kms_can_turn && want != kms_rot_cur) {
-		/* the turn changes: the buffer, its size and the rotation in one
-		 * commit (the source rectangle must fit the new buffer) */
-		uint32_t objs[1] = { kms_plane }, counts[1] = { 4 };
-		uint32_t props[4] = { kms_prop_fb, kms_prop_rot, kms_prop_sw, kms_prop_sh };
-		uint64_t vals[4] = {
-			pf.fb_id, want,
-			(uint64_t)(buf_rot[r] ? fb.height : fb.width) << 16,
-			(uint64_t)(buf_rot[r] ? fb.width : fb.height) << 16,
-		};
-		struct drm_mode_atomic a = {
-			.flags = DRM_MODE_PAGE_FLIP_EVENT, .count_objs = 1,
-			.objs_ptr = (uintptr_t)objs, .count_props_ptr = (uintptr_t)counts,
-			.props_ptr = (uintptr_t)props, .prop_values_ptr = (uintptr_t)vals,
-			.user_data = pf.user_data,
-		};
+	need_rot = kms_can_turn && want != kms_rot_cur;
+	need_win = kms_can_window &&
+		   (fsy != kms_src_y || fwy != kms_win_y || fwh != kms_win_h);
+	if (need_rot || need_win) {
+		uint32_t objs[1] = { kms_plane }, counts[1] = { 0 };
+		uint32_t props[10];
+		uint64_t vals[10];
+		int n = 0;
 
-		if (ioctl(kms_fd, DRM_IOCTL_MODE_ATOMIC, &a)) {
-			fprintf(stderr, "n72-ui: turning the layer: %s\n", strerror(errno));
-			return false;
+		props[n] = kms_prop_fb;
+		vals[n++] = pf.fb_id;
+		if (need_rot) {
+			props[n] = kms_prop_rot;
+			vals[n++] = want;
+		}
+		if (kms_can_window) {
+			props[n] = kms_prop_cx;
+			vals[n++] = 0;
+			props[n] = kms_prop_cy;
+			vals[n++] = fwy;
+			props[n] = kms_prop_cw;
+			vals[n++] = fb.width;
+			props[n] = kms_prop_ch;
+			vals[n++] = fwh;
+			props[n] = kms_prop_sx;
+			vals[n++] = 0;
+			props[n] = kms_prop_sy;
+			vals[n++] = (uint64_t)fsy << 16;
+			props[n] = kms_prop_sw;
+			vals[n++] = (uint64_t)(rot ? fb.height : fb.width) << 16;
+			props[n] = kms_prop_sh;
+			vals[n++] = (uint64_t)(rot ? fb.width : fwh) << 16;
+		} else {
+			props[n] = kms_prop_sw;
+			vals[n++] = (uint64_t)(rot ? fb.height : fb.width) << 16;
+			props[n] = kms_prop_sh;
+			vals[n++] = (uint64_t)(rot ? fb.width : fb.height) << 16;
+		}
+		counts[0] = n;
+		{
+			struct drm_mode_atomic a = {
+				.flags = DRM_MODE_PAGE_FLIP_EVENT, .count_objs = 1,
+				.objs_ptr = (uintptr_t)objs, .count_props_ptr = (uintptr_t)counts,
+				.props_ptr = (uintptr_t)props, .prop_values_ptr = (uintptr_t)vals,
+				.user_data = pf.user_data,
+			};
+
+			if (ioctl(kms_fd, DRM_IOCTL_MODE_ATOMIC, &a)) {
+				fprintf(stderr, "n72-ui: atomic flip: %s\n", strerror(errno));
+				return false;
+			}
 		}
 		kms_rot_cur = want;
+		if (kms_can_window) {
+			kms_src_y = fsy;
+			kms_win_y = fwy;
+			kms_win_h = fwh;
+		}
 		goto wait;
 	}
 	for (tries = 0; tries < 50; tries++) {
@@ -1006,18 +1345,52 @@ static bool kms_setup(bool shell_layer)
 		/* the layer stays on the old picture until the first flip */
 		kms_fd = fd;
 		kms_layer_on = true;
-		return true;
+	} else {
+		set.crtc_id = kms_crtc;
+		set.fb_id = kms_fb[0];
+		set.mode = kms_mode;
+		set.mode_valid = 1;
+		set.set_connectors_ptr = (uintptr_t)&kms_conn;
+		set.count_connectors = 1;
+		if (ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &set))
+			goto fail;
+		kms_fd = fd;
+		kms_layer_on = true;
+		kms_win_y = 0;
+		kms_win_h = fb.height;
+		kms_src_y = 0;
 	}
-	set.crtc_id = kms_crtc;
-	set.fb_id = kms_fb[0];
-	set.mode = kms_mode;
-	set.mode_valid = 1;
-	set.set_connectors_ptr = (uintptr_t)&kms_conn;
-	set.count_connectors = 1;
-	if (ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &set))
-		goto fail;
-	kms_fd = fd;
-	kms_layer_on = true;
+	if (kms_shell && kms_prop_cx && kms_prop_cy && kms_prop_cw && kms_prop_ch &&
+	    kms_prop_sx && kms_prop_sy && kms_prop_fb && kms_prop_sw && kms_prop_sh) {
+		uint32_t objs[1] = { kms_plane }, counts[1] = { 9 };
+		uint32_t props[9] = {
+			kms_prop_fb, kms_prop_cx, kms_prop_cy, kms_prop_cw, kms_prop_ch,
+			kms_prop_sx, kms_prop_sy, kms_prop_sw, kms_prop_sh,
+		};
+		uint64_t vals[9] = {
+			kms_fb[0], 0, 16, fb.width, 4,
+			0, (uint64_t)32 << 16, (uint64_t)fb.width << 16, (uint64_t)4 << 16,
+		};
+		struct drm_mode_atomic a = {
+			.flags = DRM_MODE_ATOMIC_TEST_ONLY, .count_objs = 1,
+			.objs_ptr = (uintptr_t)objs, .count_props_ptr = (uintptr_t)counts,
+			.props_ptr = (uintptr_t)props, .prop_values_ptr = (uintptr_t)vals,
+		};
+
+		kms_can_window = !ioctl(fd, DRM_IOCTL_MODE_ATOMIC, &a);
+		if (kms_can_window) {
+			struct drm_mode_create_blob cb = {
+				.data = (uintptr_t)&kms_mode,
+				.length = sizeof(kms_mode),
+			};
+
+			kms_prop_active = kms_obj_prop(fd, kms_crtc, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+			kms_prop_mode_id = kms_obj_prop(fd, kms_crtc, DRM_MODE_OBJECT_CRTC, "MODE_ID");
+			kms_prop_conn_crtc = kms_obj_prop(fd, kms_conn, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+			if (!ioctl(fd, DRM_IOCTL_MODE_CREATEPROPBLOB, &cb))
+				kms_mode_blob = cb.blob_id;
+		}
+	}
 	return true;
 fail:
 	if (fd >= 0)
@@ -1047,6 +1420,8 @@ static uint8_t *alloc_scan_buf(uint32_t size, int i)
 		if (p)
 			fprintf(stderr, "n72-ui: contiguous memory after compaction\n");
 	}
+	if (p)
+		scan_cpu_cached[i] = true;
 	return p;
 }
 
@@ -1255,8 +1630,19 @@ extern bool transparent;
 
 void mbx_gpu_set_transparent(bool on)
 {
+	int i;
+
 	if (on == transparent || !mbx_gpu_on_shell_layer())
 		return;
+	if (on && flipping) {
+		uint32_t size = fb.stride * fb.height;
+
+		ta_wait_active();
+		flip_wait();
+		for (i = 0; i < scan_count; i++)
+			if (scan[i])
+				sync_range(scan[i], size, MBX_SYNC_FLUSH);
+	}
 	transparent = on;
 	lv_display_set_color_format(lv_display_get_default(),
 				    on ? LV_COLOR_FORMAT_ARGB8888 : LV_COLOR_FORMAT_XRGB8888);
@@ -1298,41 +1684,48 @@ static void premultiply(uint8_t *px_map, const lv_area_t *a)
 }
 
 /* Straight alpha to premultiplied over @w pixels; runs of one colour reuse
- * the last result; c * a / 255 rounded without a division. */
+ * the last result; SWAR 2-multiply rb + g channel rounding without division. */
 static void premultiply_span(uint32_t *p, int32_t w)
 {
-#define MUL255(c, al) ({ uint32_t t_ = (c) * (al) + 128; (t_ + (t_ >> 8)) >> 8; })
 	uint32_t last_in = 0, last_out = 0;
 	int32_t x;
 
 	for (x = 0; x < w; x++) {
-		uint32_t v = p[x], al = v >> 24;
+		uint32_t v = p[x], al;
 
-		if (al == 255)
+		if (v == 0 || v >= 0xff000000u)
 			continue;
+		al = v >> 24;
 		if (!al) {
-			if (v)
-				p[x] = 0;
+			p[x] = 0;
 			continue;
 		}
 		if (v != last_in) {
+			uint32_t rb = (v & 0x00ff00ffu) * al + 0x00800080u;
+			uint32_t g = ((v & 0x0000ff00u) >> 8) * al + 128u;
+
+			rb = ((rb + ((rb >> 8) & 0x00ff00ffu)) >> 8) & 0x00ff00ffu;
+			g = (g + (g >> 8)) & 0x0000ff00u;
 			last_in = v;
-			last_out = al << 24 | MUL255(v >> 16 & 255, al) << 16 |
-				   MUL255(v >> 8 & 255, al) << 8 | MUL255(v & 255, al);
+			last_out = (al << 24) | rb | g;
 		}
 		p[x] = last_out;
 	}
-#undef MUL255
 }
 
 /* The pixels on screen now (stride fb.stride), for screenshots. */
 const uint8_t *mbx_gpu_front(uint32_t *stride)
 {
+	const uint8_t *p;
+
 	*stride = fb.stride;
 	ta_wait_active();
 	if (flipping)
 		flip_wait();
-	return flipping ? scan[st_latest >= 0 && scan[st_latest] ? st_latest : 0] : disp_buf;
+	p = flipping ? scan[st_latest >= 0 && scan[st_latest] ? st_latest : 0] : disp_buf;
+	if (flipping)
+		mbx_kms_note_cpu_touch(p);
+	return p;
 }
 
 /* Debugging the flip buffers: both scan-out buffers (NULL if not flipping). */
@@ -1343,6 +1736,7 @@ const uint8_t *mbx_gpu_scan(int i, int *is_front)
 	ta_wait_active();
 	flip_wait();
 	*is_front = i == st_front;
+	scan_cpu_cached[i] = true;
 	return scan[i];
 }
 
@@ -1361,6 +1755,8 @@ bool mbx_gpu_set_rotation(int deg)
 		return true;
 	if (!flipping || mbx < 0 || (deg != 0 && deg != 90 && deg != 270))
 		return false;
+	if (hw_slide_active)
+		mbx_gpu_hw_slide_abort(NULL);
 	if (deg)
 		lstride = buf_width_to_stride(fb.height, LV_COLOR_FORMAT_XRGB8888);
 	if (deg && !kms_can_turn && !lbuf) {
@@ -1405,6 +1801,8 @@ void mbx_gpu_set_layer_enabled(bool on)
 		return;
 	}
 	kms_layer_want = false;
+	if (hw_slide_active)
+		mbx_gpu_hw_slide_abort(NULL);
 	ta_wait_active();
 	flip_wait();
 	if (kms_layer_on) {
@@ -1418,6 +1816,7 @@ void mbx_gpu_set_layer_enabled(bool on)
 	st_latest = -1;
 	for (i = 0; i < NSCAN; i++)
 		buf_frame[i] = -1;
+	scan_zero_transparent();
 	pthread_mutex_unlock(&flip_mx);
 }
 
@@ -1437,7 +1836,8 @@ void mbx_gpu_suspend(void)
 	st_front = -1;
 	st_latest = -1;
 	for (i = 0; i < NSCAN; i++)
-		buf_frame[i] = -1;
+		if (!transparent || i >= scan_count || (rot_deg && !hw_turn))
+			buf_frame[i] = -1;
 	pthread_mutex_unlock(&flip_mx);
 	if (lbuf && (!rot_deg || hw_turn)) {
 		pool_free(lbuf);
@@ -1462,6 +1862,8 @@ void mbx_gpu_resume(void)
 		mbx_gpu_set_layer_enabled(true);
 		return;
 	}
+	if (hw_slide_active)
+		mbx_gpu_hw_slide_abort(NULL);
 	ta_wait_active();
 	flip_wait();
 	if (!pool_reacquire())
@@ -1539,19 +1941,263 @@ lv_draw_buf_t *mbx_gpu_turn_buf(const lv_draw_buf_t *src, int deg)
 }
 
 /*
- * @b (ARGB8888, straight alpha) premultiplied in place, written out for
- * the GPU, and flagged so: the transparent display copies it as it is.
+ * @b (ARGB8888, straight alpha) premultiplied in place, cleaned if in GPU
+ * memory, and flagged so: the transparent display copies it as it is.
  */
 void mbx_gpu_premultiply_buf(lv_draw_buf_t *b)
 {
 	lv_area_t all;
 	uint32_t y;
 
-	if (!b || b->header.cf != LV_COLOR_FORMAT_ARGB8888 || !in_pool(b->data))
+	if (!b || b->header.cf != LV_COLOR_FORMAT_ARGB8888 ||
+	    (b->header.flags & LV_IMAGE_FLAGS_PREMULTIPLIED))
 		return;
 	for (y = 0; y < b->header.h; y++)
 		premultiply_span((uint32_t *)(b->data + y * b->header.stride), b->header.w);
-	lv_area_set(&all, 0, 0, b->header.w - 1, b->header.h - 1);
-	buf_clean(b, &all);
+	if (in_pool(b->data)) {
+		lv_area_set(&all, 0, 0, b->header.w - 1, b->header.h - 1);
+		buf_clean(b, &all);
+	}
 	b->header.flags |= LV_IMAGE_FLAGS_PREMULTIPLIED;
+}
+
+static bool hw_slide_solo_check(void)
+{
+	lv_obj_t *scr = lv_screen_active();
+	lv_obj_t *roots[3];
+	int r;
+
+	if (scr && lv_obj_get_style_bg_opa(scr, LV_PART_MAIN) > LV_OPA_TRANSP)
+		return false;
+	roots[0] = scr;
+	roots[1] = lv_layer_top();
+	roots[2] = lv_layer_sys();
+	for (r = 0; r < 3; r++) {
+		uint32_t n, i;
+
+		if (!roots[r])
+			continue;
+		n = lv_obj_get_child_count(roots[r]);
+		for (i = 0; i < n; i++) {
+			lv_obj_t *c = lv_obj_get_child(roots[r], (int32_t)i);
+
+			if (c && !lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+				return false;
+		}
+	}
+	return true;
+}
+
+bool mbx_gpu_hw_slide_begin(const lv_draw_buf_t *pic, int32_t x, int32_t init_y,
+			    void *owner, mbx_hw_slide_abort_cb abort_cb)
+{
+	lv_display_t *d = lv_display_get_default();
+	uint32_t size = fb.stride * fb.height;
+	int32_t pw, ph, sx0, dx0, cw, y;
+	int sfb, bfb;
+
+	if (!flipping || !kms_shell || !kms_can_window || !transparent || rot_deg ||
+	    scan_count < 2 || !scan[0] || !scan[1] || hw_slide_active)
+		return false;
+	if (!pic || pic->header.cf != LV_COLOR_FORMAT_ARGB8888 ||
+	    !(pic->header.flags & LV_IMAGE_FLAGS_PREMULTIPLIED) ||
+	    pic->header.h == 0 || pic->header.h > fb.height)
+		return false;
+	if (!hw_slide_solo_check())
+		return false;
+
+	ta_wait_active();
+	flip_wait();
+
+	sfb = (st_front == 0) ? 1 : 0;
+	bfb = 1 - sfb;
+
+	pw = (int32_t)pic->header.w;
+	ph = (int32_t)pic->header.h;
+	sx0 = x < 0 ? -x : 0;
+	dx0 = x < 0 ? 0 : x;
+	cw = pw - sx0;
+	if (dx0 + cw > (int32_t)fb.width)
+		cw = (int32_t)fb.width - dx0;
+	if (dx0 != 0 || cw != (int32_t)fb.width)
+		memset(scan[sfb], 0, size);
+	else if (ph < (int32_t)fb.height)
+		memset(scan[sfb] + (size_t)ph * fb.stride, 0,
+		       (size_t)(fb.height - ph) * fb.stride);
+	if (cw > 0) {
+		size_t bytes = (size_t)cw * 4;
+		uint8_t *dp = scan[sfb] + dx0 * 4;
+		const uint8_t *sp = pic->data + sx0 * 4;
+
+		for (y = 0; y < ph; y++) {
+			memcpy(dp, sp, bytes);
+			dp += fb.stride;
+			sp += pic->header.stride;
+		}
+	}
+	sync_range(scan[sfb], size, MBX_SYNC_CLEAN);
+
+	hw_slide_blank_zeroed = false;
+	if (st_front != bfb) {
+		memset(scan[bfb], 0, size);
+		sync_range(scan[bfb], size, MBX_SYNC_CLEAN);
+		hw_slide_blank_zeroed = true;
+	}
+
+	pthread_mutex_lock(&flip_mx);
+	buf_frame[sfb] = -1;
+	if (hw_slide_blank_zeroed)
+		buf_frame[bfb] = -1;
+	pthread_mutex_unlock(&flip_mx);
+
+	if (d) {
+		d->inv_p = 0;
+		memset(d->inv_area_joined, 0, sizeof(d->inv_area_joined));
+	}
+
+	hw_slide_fb = sfb;
+	hw_slide_blank_fb = bfb;
+	hw_slide_active = true;
+	hw_slide_h = ph;
+	hw_slide_last_y = 0x7fffffff;
+	hw_slide_owner = owner;
+	hw_slide_abort_fn = abort_cb;
+	mbx_gpu_hw_slide_move(init_y);
+	return true;
+}
+
+void mbx_gpu_hw_slide_move(int32_t py)
+{
+	int32_t dst_y1, dst_y2;
+	int fb_idx;
+	uint32_t sy, wy, wh;
+
+	if (!hw_slide_active || py == hw_slide_last_y)
+		return;
+	hw_slide_last_y = py;
+	dst_y1 = py > 0 ? py : 0;
+	dst_y2 = py + hw_slide_h - 1;
+	if (dst_y2 >= (int32_t)fb.height)
+		dst_y2 = (int32_t)fb.height - 1;
+	if (dst_y1 > dst_y2) {
+		int bfb = hw_slide_blank_fb;
+
+		if (!hw_slide_blank_zeroed) {
+			bool busy;
+
+			pthread_mutex_lock(&flip_mx);
+			busy = (st_front == bfb || st_latching == bfb || st_ready == bfb);
+			pthread_mutex_unlock(&flip_mx);
+			if (busy)
+				return;
+			memset(scan[bfb], 0, fb.stride * fb.height);
+			sync_range(scan[bfb], fb.stride * fb.height, MBX_SYNC_CLEAN);
+			hw_slide_blank_zeroed = true;
+		}
+		fb_idx = bfb;
+		sy = 0;
+		wy = 0;
+		wh = 16;
+	} else {
+		fb_idx = hw_slide_fb;
+		sy = (uint32_t)(dst_y1 - py);
+		wy = (uint32_t)dst_y1;
+		wh = (uint32_t)(dst_y2 - dst_y1 + 1);
+	}
+	pthread_mutex_lock(&flip_mx);
+	buf_rot[fb_idx] = 0;
+	buf_src_y[fb_idx] = sy;
+	buf_win_y[fb_idx] = wy;
+	buf_win_h[fb_idx] = wh;
+	st_ready = fb_idx;
+	pthread_cond_signal(&flip_cv);
+	pthread_mutex_unlock(&flip_mx);
+	n72_frame_shown();
+}
+
+void mbx_gpu_hw_slide_end(bool keep_visible)
+{
+	uint32_t size = fb.stride * fb.height;
+	int sfb, bfb;
+	bool bzero;
+
+	if (!hw_slide_active)
+		return;
+	flip_wait();
+	sfb = hw_slide_fb;
+	bfb = hw_slide_blank_fb;
+	bzero = hw_slide_blank_zeroed;
+	hw_slide_active = false;
+	hw_slide_owner = NULL;
+	hw_slide_abort_fn = NULL;
+	hw_slide_fb = -1;
+	hw_slide_blank_fb = -1;
+	hw_slide_blank_zeroed = false;
+
+	if (keep_visible && sfb >= 0 && st_front == sfb) {
+		if (bfb >= 0 && scan[bfb] && !bzero) {
+			memset(scan[bfb], 0, size);
+			sync_range(scan[bfb], size, MBX_SYNC_CLEAN);
+		}
+	} else {
+		if (!keep_visible && sfb >= 0 && st_front == sfb && bfb >= 0 && scan[bfb]) {
+			if (!bzero) {
+				memset(scan[bfb], 0, size);
+				sync_range(scan[bfb], size, MBX_SYNC_CLEAN);
+				bzero = true;
+			}
+			pthread_mutex_lock(&flip_mx);
+			buf_rot[bfb] = 0;
+			buf_src_y[bfb] = 0;
+			buf_win_y[bfb] = 0;
+			buf_win_h[bfb] = 16;
+			st_ready = bfb;
+			pthread_cond_signal(&flip_cv);
+			pthread_mutex_unlock(&flip_mx);
+			flip_wait();
+		} else if (!keep_visible && bfb >= 0 && st_front == bfb && !bzero &&
+			   sfb >= 0 && scan[sfb]) {
+			memset(scan[sfb], 0, size);
+			sync_range(scan[sfb], size, MBX_SYNC_CLEAN);
+			pthread_mutex_lock(&flip_mx);
+			buf_rot[sfb] = 0;
+			buf_src_y[sfb] = 0;
+			buf_win_y[sfb] = 0;
+			buf_win_h[sfb] = 16;
+			st_ready = sfb;
+			pthread_cond_signal(&flip_cv);
+			pthread_mutex_unlock(&flip_mx);
+			flip_wait();
+		}
+		if (sfb >= 0 && scan[sfb] && st_front != sfb) {
+			memset(scan[sfb], 0, size);
+			sync_range(scan[sfb], size, MBX_SYNC_CLEAN);
+		}
+		if (bfb >= 0 && scan[bfb] && st_front != bfb && !bzero) {
+			memset(scan[bfb], 0, size);
+			sync_range(scan[bfb], size, MBX_SYNC_CLEAN);
+		}
+	}
+	pthread_mutex_lock(&flip_mx);
+	st_latest = -1;
+	if (sfb >= 0)
+		buf_frame[sfb] = -1;
+	if (bfb >= 0)
+		buf_frame[bfb] = -1;
+	pthread_mutex_unlock(&flip_mx);
+}
+
+void mbx_gpu_hw_slide_abort(void *except_owner)
+{
+	void *owner;
+	mbx_hw_slide_abort_cb cb;
+
+	if (!hw_slide_active || hw_slide_owner == except_owner)
+		return;
+	owner = hw_slide_owner;
+	cb = hw_slide_abort_fn;
+	if (cb)
+		cb(owner);
+	else
+		mbx_gpu_hw_slide_end(true);
 }

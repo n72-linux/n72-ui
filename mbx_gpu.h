@@ -83,6 +83,13 @@ void mbx_gpu_suspend(void);
 void mbx_gpu_resume(void);
 bool mbx_gpu_is_suspended(void);
 
+typedef void (*mbx_hw_slide_abort_cb)(void *owner);
+bool mbx_gpu_hw_slide_begin(const lv_draw_buf_t *pic, int32_t x, int32_t init_y,
+			    void *owner, mbx_hw_slide_abort_cb abort_cb);
+void mbx_gpu_hw_slide_move(int32_t y);
+void mbx_gpu_hw_slide_end(bool keep_visible);
+void mbx_gpu_hw_slide_abort(void *except_owner);
+
 /*
  * Opt in, for one image draw: the GPU may stretch the whole picture (d->src,
  * an XRGB8888 lv_draw_buf_t in the GPU pool, drawn opaque) over d->image_area

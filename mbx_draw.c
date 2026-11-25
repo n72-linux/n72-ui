@@ -80,6 +80,27 @@ static bool image_scaled_ok(const lv_draw_task_t *t)
 	       d->clip_radius == 0 && !d->bitmap_mask_src;
 }
 
+/*
+ * Premultiplied 1:1 ARGB8888 variable image (can live in GPU pool or heap).
+ */
+static bool image_premul_ok(const lv_draw_task_t *t)
+{
+	const lv_draw_image_dsc_t *d = t->draw_dsc;
+	const lv_image_dsc_t *img = d->src;
+
+	if (lv_image_src_get_type(d->src) != LV_IMAGE_SRC_VARIABLE || !img->data ||
+	    img->header.cf != LV_COLOR_FORMAT_ARGB8888 ||
+	    !(img->header.flags & LV_IMAGE_FLAGS_PREMULTIPLIED) || d->tile)
+		return false;
+	if (lv_area_get_width(&d->image_area) != img->header.w ||
+	    lv_area_get_height(&d->image_area) != img->header.h)
+		return false;
+	return d->opa >= LV_OPA_MAX && d->rotation == 0 && d->scale_x == LV_SCALE_NONE &&
+	       d->scale_y == LV_SCALE_NONE && d->skew_x == 0 && d->skew_y == 0 &&
+	       d->recolor_opa <= LV_OPA_MIN && d->blend_mode == LV_BLEND_MODE_NORMAL &&
+	       d->clip_radius == 0 && !d->bitmap_mask_src;
+}
+
 /* Is nothing drawn before @t in its layer where @t draws? */
 static bool first_over(const lv_draw_task_t *t)
 {
@@ -98,13 +119,37 @@ static bool first_over(const lv_draw_task_t *t)
 
 bool transparent;		/* (mbx_gpu_set_transparent) */
 bool frame_cpu_dirty;
+int32_t cpu_dirty_y1, cpu_dirty_y2 = -1;
 bool frame_drew_any;
 
-static inline void note_cpu_draw(const lv_layer_t *layer)
+static inline void note_cpu_draw(const lv_layer_t *layer, const lv_area_t *area)
 {
 	lv_display_t *d = lv_display_get_default();
 
 	if (d && d->buf_1 && layer->draw_buf && layer->draw_buf->data == d->buf_1->data) {
+		int32_t h = (int32_t)layer->draw_buf->header.h;
+		int32_t y1 = 0, y2 = h - 1;
+
+		mbx_kms_note_cpu_touch(layer->draw_buf->data);
+		if (area) {
+			y1 = area->y1 - layer->buf_area.y1;
+			y2 = area->y2 - layer->buf_area.y1;
+			if (y1 < 0)
+				y1 = 0;
+			if (y2 >= h)
+				y2 = h - 1;
+		}
+		if (y1 <= y2) {
+			if (!frame_cpu_dirty || cpu_dirty_y1 > cpu_dirty_y2) {
+				cpu_dirty_y1 = y1;
+				cpu_dirty_y2 = y2;
+			} else {
+				if (y1 < cpu_dirty_y1)
+					cpu_dirty_y1 = y1;
+				if (y2 > cpu_dirty_y2)
+					cpu_dirty_y2 = y2;
+			}
+		}
 		frame_cpu_dirty = true;
 		frame_drew_any = true;
 	}
@@ -118,6 +163,8 @@ static inline void note_gpu_draw(const lv_layer_t *layer)
 		frame_drew_any = true;
 }
 
+static bool ta_target_ok(const lv_layer_t *layer);
+
 int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 {
 	const lv_draw_dsc_base_t *base = t->draw_dsc;
@@ -129,7 +176,8 @@ int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 	if (t->type < 16)
 		MBX_STAT_INC(seen[t->type]);
 	if (!size || !cf_ok(dcf)) {
-		note_cpu_draw(base->layer);
+		if (size)
+			note_cpu_draw(base->layer, &ca);
 		return 0;
 	}
 
@@ -146,12 +194,18 @@ int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 		 */
 		if (d->radius != 0 || d->grad.dir != LV_GRAD_DIR_NONE || d->opa <= LV_OPA_MIN ||
 		    size < 16384 || (d->opa < LV_OPA_MAX && !first_over(t))) {
-			note_cpu_draw(base->layer);
+			note_cpu_draw(base->layer, &ca);
 			return 0;
 		}
 	} else if (t->type == LV_DRAW_TASK_TYPE_FILL) {
 		const lv_draw_fill_dsc_t *d = t->draw_dsc;
-		int32_t min_sz = (d->opa >= LV_OPA_MAX || d->radius != 0) ? 16384 : 8192;
+		bool ta_small = d->grad.dir == LV_GRAD_DIR_NONE && d->radius == 0 &&
+				d->opa >= LV_OPA_MAX &&
+				base->layer->draw_task_head &&
+				base->layer->draw_task_head != t &&
+				base->layer->draw_task_head->preferred_draw_unit_id == DRAW_UNIT_ID_MBX &&
+				ta_target_ok(base->layer);
+		int32_t min_sz = (d->opa >= LV_OPA_MAX || d->radius != 0) ? (ta_small ? 1 : 16384) : 8192;
 
 		/*
 		 * Rounded fills (opaque or large translucent on XRGB8888): the
@@ -165,7 +219,7 @@ int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 			MBX_STAT_INC(fill_small);
 		if (d->grad.dir != LV_GRAD_DIR_NONE || d->opa <= LV_OPA_MIN ||
 		    size < min_sz || dcf != LV_COLOR_FORMAT_XRGB8888) {
-			note_cpu_draw(base->layer);
+			note_cpu_draw(base->layer, &ca);
 			return 0;
 		}
 	} else if (t->type == LV_DRAW_TASK_TYPE_LAYER) {
@@ -174,49 +228,48 @@ int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t)
 		int32_t min_sz;
 
 		if (dcf != LV_COLOR_FORMAT_XRGB8888 || !layer_ok(t, src)) {
-			note_cpu_draw(base->layer);
+			note_cpu_draw(base->layer, &ca);
 			return 0;
 		}
 		min_sz = (src->color_format == LV_COLOR_FORMAT_ARGB8888 || d->opa < LV_OPA_MAX) ? 8192 : 4096;
 		if (size < min_sz) {
-			note_cpu_draw(base->layer);
+			note_cpu_draw(base->layer, &ca);
 			return 0;
 		}
 	} else if (t->type == LV_DRAW_TASK_TYPE_IMAGE) {
 		const lv_draw_image_dsc_t *d = t->draw_dsc;
 		const lv_image_dsc_t *img = d->src;
 		bool scaled = image_scaled_ok(t);
-		bool premul;
+		bool premul = !scaled && dcf == LV_COLOR_FORMAT_ARGB8888 && transparent &&
+			      image_premul_ok(t);
 
 		if (scaled) {
 			if (dcf != LV_COLOR_FORMAT_XRGB8888) {
-				note_cpu_draw(base->layer);
+				note_cpu_draw(base->layer, &ca);
 				return 0;
 			}
-		} else if (!image_ok(t)) {
-			note_cpu_draw(base->layer);
+		} else if (!premul && !image_ok(t)) {
+			note_cpu_draw(base->layer, &ca);
 			return 0;
 		}
-		premul = (dcf == LV_COLOR_FORMAT_ARGB8888 && transparent && d->opa >= LV_OPA_MAX &&
-			  (img->header.flags & LV_IMAGE_FLAGS_PREMULTIPLIED));
 		if (dcf == LV_COLOR_FORMAT_ARGB8888 && !premul) {
-			note_cpu_draw(base->layer);
+			note_cpu_draw(base->layer, &ca);
 			return 0;
 		}
 		if (dcf != LV_COLOR_FORMAT_XRGB8888 && dcf != LV_COLOR_FORMAT_ARGB8888) {
-			note_cpu_draw(base->layer);
+			note_cpu_draw(base->layer, &ca);
 			return 0;
 		}
 		if (!scaled && !premul) {
 			int32_t min_sz = (img->header.cf == LV_COLOR_FORMAT_ARGB8888 || d->opa < LV_OPA_MAX) ? 8192 : 4096;
 
 			if (size < min_sz) {
-				note_cpu_draw(base->layer);
+				note_cpu_draw(base->layer, &ca);
 				return 0;
 			}
 		}
 	} else {
-		note_cpu_draw(base->layer);
+		note_cpu_draw(base->layer, &ca);
 		return 0;
 	}
 	if (t->preference_score > 50) {
@@ -377,8 +430,8 @@ full:		/* no room to split further: keep what there is */
 	if (px < 16384) {
 		/* little left (margins round a card): not worth a GPU job */
 		rect_flush();
-		note_cpu_draw(layer);
 		for (i = 0; i < n; i++) {
+			note_cpu_draw(layer, &rects[i]);
 			unit->clip_area = &rects[i];
 			lv_draw_sw_fill(unit, t->draw_dsc, &t->area);
 		}
@@ -418,7 +471,7 @@ static void mbx_fill(lv_draw_unit_t *u, lv_draw_task_t *t)
 		return;
 	if (!in_pool(b->data)) {
 		rect_flush();
-		note_cpu_draw(layer);
+		note_cpu_draw(layer, &a);
 		lv_draw_sw_fill(u, d, c);
 		return;
 	}
@@ -443,7 +496,6 @@ static void mbx_fill(lv_draw_unit_t *u, lv_draw_task_t *t)
 		rect_add(layer, clip, &band, d->color);
 	}
 	rect_flush();
-	note_cpu_draw(layer);
 	for (i = 0; i < 4; i++) {
 		corner.x1 = i & 1 ? c->x2 - r + 1 : c->x1;
 		corner.x2 = corner.x1 + r - 1;
@@ -451,6 +503,7 @@ static void mbx_fill(lv_draw_unit_t *u, lv_draw_task_t *t)
 		corner.y2 = corner.y1 + r - 1;
 		if (!lv_area_intersect(&cclip, &corner, clip))
 			continue;
+		note_cpu_draw(layer, &cclip);
 		u->clip_area = &cclip;
 		lv_draw_sw_fill(u, d, c);
 	}
@@ -505,12 +558,6 @@ static void mbx_fill_straight(lv_draw_unit_t *u, lv_draw_task_t *t)
 	rect_flush();
 	if (!lv_area_intersect(&a, &t->area, u->clip_area))
 		return;
-	if (!in_pool(b->data)) {
-		note_cpu_draw(layer);
-		lv_draw_sw_fill(u, d, &t->area);
-		return;
-	}
-	note_gpu_draw(layer);
 	scr = a;
 	word = (uint32_t)d->opa << 24 | (lv_color_to_u32(d->color) & 0xffffff);
 	if (transparent && b->data == lv_display_get_default()->buf_1->data &&
@@ -518,6 +565,30 @@ static void mbx_fill_straight(lv_draw_unit_t *u, lv_draw_task_t *t)
 		word = premul_word(d->opa, d->color);
 		pm_skip[pm_skip_n++] = scr;	/* (screen = buffer coordinates here) */
 	}
+	if (transparent || mbx_gpu_is_suspended() || !in_pool(b->data)) {
+		int32_t w = lv_area_get_width(&a), h = lv_area_get_height(&a), x, y;
+		uint32_t stride = b->header.stride;
+		uint8_t *dst = b->data + (a.y1 - layer->buf_area.y1) * (int32_t)stride +
+			       (a.x1 - layer->buf_area.x1) * 4;
+
+		for (y = 0; y < h; y++) {
+			uint32_t *row = (uint32_t *)dst;
+
+			for (x = 0; x + 3 < w; x += 4) {
+				row[x] = word;
+				row[x + 1] = word;
+				row[x + 2] = word;
+				row[x + 3] = word;
+			}
+			for (; x < w; x++)
+				row[x] = word;
+			dst += stride;
+		}
+		note_cpu_draw(layer, &scr);
+		MBX_STAT_INC(fills);
+		return;
+	}
+	note_gpu_draw(layer);
 	lv_area_move(&a, -layer->buf_area.x1, -layer->buf_area.y1);
 	rect_buf = b;
 	rect_rows = a;
@@ -557,7 +628,7 @@ static void mbx_fill_blend(lv_draw_unit_t *u, lv_draw_task_t *t)
 	if (!lv_area_intersect(&a, c, clip))
 		return;
 	if (!in_pool(b->data) || (b->header.stride & 31)) {
-		note_cpu_draw(layer);
+		note_cpu_draw(layer, &a);
 		lv_draw_sw_fill(u, d, c);
 		return;
 	}
@@ -571,7 +642,7 @@ static void mbx_fill_blend(lv_draw_unit_t *u, lv_draw_task_t *t)
 		if (blit3d(7, gpu_addr(b->data), 0, w,
 			   mbx_cmd_fill(w, 1, b->header.stride, da.x1, da.y1,
 					da.x2 + 1, da.y2 + 1, argb))) {
-			note_cpu_draw(layer);
+			note_cpu_draw(layer, &a);
 			lv_draw_sw_fill(u, d, c);
 		}
 		MBX_STAT_INC(blends);
@@ -592,34 +663,33 @@ static void mbx_fill_blend(lv_draw_unit_t *u, lv_draw_task_t *t)
 		if (bot.x2 >= bot.x1 && lv_area_intersect(&ca, &bot, clip))
 			body_px += lv_area_get_size(&ca);
 		if (body_px < 4096) {
-			note_cpu_draw(layer);
+			note_cpu_draw(layer, &a);
 			lv_draw_sw_fill(u, d, c);
 			return;
 		}
 		buf_invalidate(b, &da);
 		note_gpu_draw(layer);
 		if (mid.y2 >= mid.y1 && !blit_blend_band(u, &mid, argb)) {
-			note_cpu_draw(layer);
 			if (lv_area_intersect(&cclip, &mid, clip)) {
+				note_cpu_draw(layer, &cclip);
 				u->clip_area = &cclip;
 				lv_draw_sw_fill(u, d, c);
 			}
 		}
 		if (top.x2 >= top.x1 && !blit_blend_band(u, &top, argb)) {
-			note_cpu_draw(layer);
 			if (lv_area_intersect(&cclip, &top, clip)) {
+				note_cpu_draw(layer, &cclip);
 				u->clip_area = &cclip;
 				lv_draw_sw_fill(u, d, c);
 			}
 		}
 		if (bot.x2 >= bot.x1 && !blit_blend_band(u, &bot, argb)) {
-			note_cpu_draw(layer);
 			if (lv_area_intersect(&cclip, &bot, clip)) {
+				note_cpu_draw(layer, &cclip);
 				u->clip_area = &cclip;
 				lv_draw_sw_fill(u, d, c);
 			}
 		}
-		note_cpu_draw(layer);
 		for (i = 0; i < 4; i++) {
 			corner.x1 = i & 1 ? c->x2 - r + 1 : c->x1;
 			corner.x2 = corner.x1 + r - 1;
@@ -627,6 +697,7 @@ static void mbx_fill_blend(lv_draw_unit_t *u, lv_draw_task_t *t)
 			corner.y2 = corner.y1 + r - 1;
 			if (!lv_area_intersect(&cclip, &corner, clip))
 				continue;
+			note_cpu_draw(layer, &cclip);
 			u->clip_area = &cclip;
 			lv_draw_sw_fill(u, d, c);
 		}
@@ -697,17 +768,20 @@ static void mbx_layer(lv_draw_unit_t *u, lv_draw_task_t *t)
 	if (!src->draw_buf)
 		return;
 	if (!gpu_copy(u, t, src->draw_buf, src->buf_area.x1, src->buf_area.y1, d->opa, true)) {
-		note_cpu_draw(u->target_layer);
+		lv_area_t a;
+
+		if (lv_area_intersect(&a, &t->area, u->clip_area))
+			note_cpu_draw(u->target_layer, &a);
 		lv_draw_sw_layer(u, d, &t->area);	/* software fallback */
 	}
 }
 
 /* Draw a pool-resident image 1:1 (a snapshot, during transitions). */
 /*
- * A premultiplied picture onto the transparent display: the 2D engine's
- * exact copy (alpha and all), and the flush told not to premultiply it
- * again. What it covers is replaced, not blended (fine for the shade:
- * only its rounded corners' edge pixels lose what was under them).
+ * A premultiplied picture onto the transparent display: CPU row memcpy when
+ * GPU-suspended or off-pool (or in transparent mode to avoid mbx->lock stalls
+ * behind games), else 2D engine's exact copy; flush told not to premultiply
+ * it again. What it covers is replaced, not blended.
  */
 static bool mbx_image_premul(lv_draw_unit_t *u, lv_draw_task_t *t, lv_draw_buf_t *sb)
 {
@@ -720,12 +794,28 @@ static bool mbx_image_premul(lv_draw_unit_t *u, lv_draw_task_t *t, lv_draw_buf_t
 	rect_flush();
 	if (!lv_area_intersect(&a, &t->area, u->clip_area))
 		return true;
-	if (!in_pool(b->data) || !in_pool(sb->data))
-		return false;
 	sa = a;
 	lv_area_move(&sa, -d->image_area.x1, -d->image_area.y1);
 	da = a;
 	lv_area_move(&da, -layer->buf_area.x1, -layer->buf_area.y1);
+	if (transparent || mbx_gpu_is_suspended() || !in_pool(b->data) || !in_pool(sb->data)) {
+		int32_t rw = lv_area_get_width(&a), rh = lv_area_get_height(&a), y;
+		size_t bytes = (size_t)rw * 4;
+		uint8_t *dst = b->data + da.y1 * (int32_t)b->header.stride + da.x1 * 4;
+		const uint8_t *src = sb->data + sa.y1 * (int32_t)sb->header.stride + sa.x1 * 4;
+
+		for (y = 0; y < rh; y++) {
+			memcpy(dst, src, bytes);
+			dst += b->header.stride;
+			src += sb->header.stride;
+		}
+		note_cpu_draw(layer, &a);
+		if (b->data == lv_display_get_default()->buf_1->data && pm_skip_n < PM_SKIP_MAX &&
+		    !later_over(t, &a))
+			pm_skip[pm_skip_n++] = a;
+		MBX_STAT_INC(layers);
+		return true;
+	}
 	buf_invalidate(b, &da);
 	note_gpu_draw(layer);
 	submit(w, put_copy(w, gpu_addr(b->data), b->header.stride, gpu_addr(sb->data),
@@ -775,10 +865,12 @@ static bool gpu_copy_scaled(lv_draw_unit_t *u, lv_draw_task_t *t, const lv_draw_
 static void mbx_image(lv_draw_unit_t *u, lv_draw_task_t *t)
 {
 	lv_draw_image_dsc_t *d = t->draw_dsc;
+	lv_area_t ca;
 
 	if (image_scaled_ok(t)) {
 		if (!gpu_copy_scaled(u, t, (lv_draw_buf_t *)d->src)) {
-			note_cpu_draw(u->target_layer);
+			if (lv_area_intersect(&ca, &t->area, u->clip_area))
+				note_cpu_draw(u->target_layer, &ca);
 			lv_draw_sw_image(u, d, &t->area);	/* (1:1, unscaled) */
 		}
 		return;
@@ -786,7 +878,8 @@ static void mbx_image(lv_draw_unit_t *u, lv_draw_task_t *t)
 
 	if (u->target_layer->draw_buf->header.cf == LV_COLOR_FORMAT_ARGB8888) {
 		if (!mbx_image_premul(u, t, (lv_draw_buf_t *)d->src)) {
-			note_cpu_draw(u->target_layer);
+			if (lv_area_intersect(&ca, &t->area, u->clip_area))
+				note_cpu_draw(u->target_layer, &ca);
 			lv_draw_sw_image(u, d, &t->area);
 		}
 		MBX_STAT_INC(images);
@@ -796,7 +889,8 @@ static void mbx_image(lv_draw_unit_t *u, lv_draw_task_t *t)
 	/* the CPU does not write snapshots after taking them: no clean */
 	if (!gpu_copy(u, t, (lv_draw_buf_t *)d->src, d->image_area.x1, d->image_area.y1,
 		      d->opa, false)) {
-		note_cpu_draw(u->target_layer);
+		if (lv_area_intersect(&ca, &t->area, u->clip_area))
+			note_cpu_draw(u->target_layer, &ca);
 		lv_draw_sw_image(u, d, &t->area);
 	}
 	MBX_STAT_INC(images);
@@ -834,6 +928,7 @@ void ta_wait_active(void)
 	memset(ta_slot_seq, 0, sizeof(ta_slot_seq));
 }
 
+
 void ta_ring_free(void)
 {
 	int i;
@@ -856,7 +951,8 @@ static bool ta_ring_ensure(void)
 	if (ta_ring_state)
 		return ta_ring_state > 0;
 	for (i = 0; i < TA_RING_BUFS; i++) {
-		if (mbx_alloc(mbx, TA_RING_WORDS * 4, MBX_ALLOC_CONTIG | MBX_ALLOC_CACHED,
+		if (mbx_alloc(mbx, TA_RING_WORDS * 4,
+			      MBX_ALLOC_CONTIG | MBX_ALLOC_CACHED | MBX_ALLOC_NO_GPU,
 			      &ta_ring[i])) {
 			while (--i >= 0)
 				mbx_free(mbx, &ta_ring[i]);
@@ -1199,6 +1295,15 @@ static int ta_batch_run(lv_layer_t *layer, lv_draw_task_t *first)
 	}
 	if (!last || (count < 2 && !worthy))
 		return 0;
+	if (!use_clear_bg && !worthy && count == 2 &&
+	    first->type == LV_DRAW_TASK_TYPE_FILL && last->type == LV_DRAW_TASK_TYPE_IMAGE) {
+		lv_area_t cov, fca;
+
+		if (task_covers(last, &cov) &&
+		    lv_area_intersect(&fca, &first->area, &first->clip_area) &&
+		    lv_area_is_in(&fca, &cov, 0))
+			return 0;
+	}
 
 	if (s.block_tris) {
 		s.w[s.n++] = 3;
@@ -1222,11 +1327,22 @@ static int ta_batch_run(lv_layer_t *layer, lv_draw_task_t *first)
 	}
 
 	if (frame_cpu_dirty) {
-		lv_area_t all = { 0, 0, (int32_t)b->header.w - 1, (int32_t)b->header.h - 1 };
+		lv_area_t inv = {
+			0,
+			cpu_dirty_y1 <= cpu_dirty_y2 ? cpu_dirty_y1 : 0,
+			(int32_t)b->header.w - 1,
+			cpu_dirty_y1 <= cpu_dirty_y2 ? cpu_dirty_y2 : (int32_t)b->header.h - 1,
+		};
 
-		buf_invalidate(b, &all);
-	} else if (dirty.x1 <= dirty.x2) {
+		if (dirty.x1 <= dirty.x2) {
+			inv.y1 = LV_MIN(inv.y1, dirty.y1);
+			inv.y2 = LV_MAX(inv.y2, dirty.y2);
+		}
+		buf_invalidate(b, &inv);
+		mbx_kms_note_buf_invalidated(b->data, &inv);
+	} else if (dirty.x1 <= dirty.x2 && mbx_kms_buf_needs_invalidate(b->data)) {
 		buf_invalidate(b, &dirty);
+		mbx_kms_note_buf_invalidated(b->data, &dirty);
 	}
 
 	can_async = mbx_kms_can_async_ta(layer, last);

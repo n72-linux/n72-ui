@@ -170,6 +170,7 @@ static void ui_rebuild_overlays_free(void)
 		vol_hud_timer = NULL;
 	}
 	if (vol_hud) {
+		psl_stop(vol_hud);
 		lv_obj_delete(vol_hud);
 		vol_hud = NULL;
 	}

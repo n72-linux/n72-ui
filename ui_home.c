@@ -1124,7 +1124,7 @@ static void app_bar_expire(lv_timer_t *t)
 {
 	LV_UNUSED(t);
 	app_bar_timer = NULL;
-	if (shade_open) {
+	if (shade_open || sd.on || sd.hw || sd.scr) {
 		app_bar_set(true);	/* again once the shade is closed */
 		return;
 	}
@@ -1309,7 +1309,7 @@ bool ui_wants_touch(int x, int y)
 		return true;
 	if (app_bar_shown && y < APP_BAR_H)
 		return true;
-	return in_obj(vol_hud, x, y);
+	return in_obj(vol_hud, x, y) || psl_covers(vol_hud, x, y);
 }
 
 /*
@@ -1330,6 +1330,10 @@ struct sd sd;
 
 void sd_free_pics(void)
 {
+	if (sd.hw) {
+		mbx_gpu_hw_slide_end(false);
+		sd.hw = false;
+	}
 	if (sd.scr) {
 		lv_obj_delete(sd.scr);
 		sd.scr = NULL;
@@ -1384,9 +1388,12 @@ lv_draw_buf_t *shade_pic_get(void)
 	 * Putting it back there left it open for good.
 	 */
 	y = lv_obj_get_style_y(shade, LV_PART_MAIN);
+	lv_obj_update_layout(shade);
+	quiet_begin();
 	lv_obj_set_y(shade, 0);
 	shade_pic = snap(shade, LV_COLOR_FORMAT_ARGB8888);
 	lv_obj_set_y(shade, y);
+	quiet_end();
 	shade_pic_dirty = false;
 	shade_pic_min = bp_minute();
 	return shade_pic;
@@ -1408,6 +1415,10 @@ static lv_opa_t sd_scrim_opa(int32_t y)
 static void sd_set(int32_t y)
 {
 	sd.y = LV_CLAMP(-SHADE_H, y, 0);
+	if (sd.hw) {
+		mbx_gpu_hw_slide_move(sd.y);
+		return;
+	}
 	if (sd.pics) {
 		/* the scrim only where the shade does not cover (its corners
 		 * have the radius): less to blend, and to redraw */
@@ -1446,6 +1457,15 @@ static void sd_anim_exec(void *var, int32_t v)
 /* The shade has settled: the real objects take over from the pictures. */
 static void sd_end(bool open)
 {
+	if (sd.hw) {
+		mbx_gpu_hw_slide_end(open);
+		sd.hw = false;
+		tr_free(&sd.sfg);
+		sd.fg_cached = false;
+		lv_obj_remove_flag(shade, LV_OBJ_FLAG_HIDDEN);
+		if (app_bar && app_bar_shown)
+			lv_obj_remove_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
+	}
 	if (sd.pics) {
 		lv_screen_load(sd.back);
 		if (open && sd.back == home_scr && sd.sbg) {
@@ -1480,6 +1500,16 @@ static void sd_end(bool open)
 		app_dormant_sync();
 }
 
+static void sd_hw_abort(void *owner)
+{
+	LV_UNUSED(owner);
+	if (!sd.hw)
+		return;
+	lv_anim_delete(&sd, sd_anim_exec);
+	sd.on = false;
+	sd_end(sd.y > -SHADE_H / 2);
+}
+
 static void sd_anim_done(lv_anim_t *a)
 {
 	sd_end(a->end_value == 0);
@@ -1496,14 +1526,14 @@ static bool sd_animate(bool open)
 {
 	lv_anim_t a;
 
-	if (sd.on || sd.scr ||
+	if (sd.on || sd.scr || sd.hw ||
 	    !(lv_screen_active() == home_scr || (app_scr && lv_screen_active() == app_scr) ||
 	      on_page()))
 		return false;
 	shade_open = !open;	/* (sd_begin starts from where it is) */
 	sd_begin(false);
 	sd.on = false;
-	if (!sd.scr) {
+	if (!sd.scr && !sd.hw) {
 		shade_open = open;
 		return false;
 	}
@@ -1561,6 +1591,7 @@ static bool sd_begin(bool touch)
 		bz_ensure();
 	}
 
+	mbx_gpu_hw_slide_abort(&sd);
 	if (touch)
 		ui_touch_lost();
 	tr_finish();
@@ -1598,18 +1629,34 @@ static bool sd_begin(bool touch)
 	sd.fg_cached = fg != NULL;
 	if (fg && !home && !page) {
 		/*
-		 * Over an application: a premultiplied copy, which the GPU
-		 * copies into the transparent frame as it is (the straight
-		 * one cost a CPU blend and a premultiply of its whole area
-		 * every frame: 17-23 ms, 30-47 fps over a video).
+		 * Over an application: take ownership of shade_pic (freed after
+		 * the drag anyway, instead of 600 KiB dup) and premultiply it
+		 * once in place so CPU/GPU copies (or hardware-scrolled layer 1)
+		 * skip blending and per-frame premultiplication.
 		 */
-		lv_draw_buf_t *pm = lv_draw_buf_dup(fg);
-
-		if (pm) {
-			mbx_gpu_premultiply_buf(pm);
-			fg = pm;
-			sd.fg_cached = false;	/* (freed with the drag) */
+		if (fg == shade_pic) {
+			shade_pic = NULL;
+			shade_pic_dirty = true;
 		}
+		sd.fg_cached = false;
+		mbx_gpu_premultiply_buf(fg);
+		if (app_bar)
+			lv_obj_add_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_add_flag(shade, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+		if (mbx_gpu_hw_slide_begin(fg, 0, sd.base, &sd, sd_hw_abort)) {
+			sd.hw = true;
+			sd.sfg = fg;
+			sd.on = true;
+			sd.v = 0;
+			sd_set(sd.base);
+			return true;
+		}
+		if (app_bar && app_bar_shown)
+			lv_obj_remove_flag(app_bar, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_remove_flag(shade, LV_OBJ_FLAG_HIDDEN);
+		if (shade_open)
+			lv_obj_remove_flag(scrim, LV_OBJ_FLAG_HIDDEN);
 	}
 	if (fg && (bg || !home)) {
 		sd.sbg = bg;
@@ -2025,6 +2072,8 @@ bool ui_drag(int phase, int x, int y)
 		return true;
 	if (phase == 0 && app_bar && y < APP_BAR_H)
 		psl_touch(app_bar);	/* (the bar itself takes its touches) */
+	if (phase == 0 && vol_hud && psl_covers(vol_hud, x, y))
+		psl_touch(vol_hud);
 	if (phase == 0 && kbd.obj && kbd_wants(x, y))
 		psl_touch(kbd.obj);
 	if (pg_drag(phase, x, y))	/* sideways on home: the pages */
@@ -2700,16 +2749,19 @@ void app_dormant_wake(bool full)
 			dormant_status_dirty = false;
 			home_update(NULL);
 		}
-		if (lv_screen_active())
-			lv_obj_invalidate(lv_screen_active());
-		lv_obj_invalidate(lv_layer_top());
+		if (!mbx_gpu_is_suspended() || !mbx_gpu_draws_direct() ||
+		    !app_scr || lv_screen_active() != app_scr) {
+			if (lv_screen_active())
+				lv_obj_invalidate(lv_screen_active());
+			lv_obj_invalidate(lv_layer_top());
+		}
 	}
 }
 
 void app_dormant_sync(void)
 {
 	bool want = app_pid > 0 && !za.phase && app_scr && lv_screen_active() == app_scr &&
-		    !locked && !shade_open && !sd.on && !sd.scr && !app_bar_shown &&
+		    !locked && !shade_open && !sd.on && !sd.scr && !sd.hw && !app_bar_shown &&
 		    !psl_sliding(app_bar) && !(app_bar && !lv_obj_has_flag(app_bar, LV_OBJ_FLAG_HIDDEN) &&
 		    lv_anim_get(app_bar, app_y)) && !gp_up() && !kbd_is_open() &&
 		    !vol_hud_visible() && !vc_is_visible() && !page_over_app && !pb.scr && !tr.scr;

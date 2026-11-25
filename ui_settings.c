@@ -589,37 +589,17 @@ static void snd_summary(char *buf, size_t len)
 		snprintf(buf, len, "%d%%, %s", conf.vol, snd_output_name());
 }
 
-static void vol_hud_opa(void *obj, int32_t v)
+#define VOL_HUD_Y	36
+#define VOL_HUD_HIDE_Y	(-84)
+
+static void vol_hud_sig(char *buf, size_t len)
 {
-	lv_obj_set_style_opa(obj, v, 0);
+	snprintf(buf, len, "%d:%d", conf.vol, (int)W);
 }
 
 bool vol_hud_visible(void)
 {
-	return vol_hud && !lv_obj_has_flag(vol_hud, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void vol_hud_gone(lv_anim_t *a)
-{
-	lv_obj_add_flag(a->var, LV_OBJ_FLAG_HIDDEN);
-	app_dormant_sync();
-}
-
-/* Material motion: fade in 150 ms, out 150 ms. */
-static void vol_hud_fade(bool in)
-{
-	lv_anim_t a;
-
-	lv_anim_delete(vol_hud, vol_hud_opa);
-	lv_anim_init(&a);
-	lv_anim_set_var(&a, vol_hud);
-	lv_anim_set_exec_cb(&a, vol_hud_opa);
-	lv_anim_set_values(&a, lv_obj_get_style_opa(vol_hud, 0), in ? LV_OPA_COVER : LV_OPA_TRANSP);
-	lv_anim_set_duration(&a, 150);
-	lv_anim_set_path_cb(&a, in ? ios_path_ease_out : ios_path_ease_in);
-	if (!in)
-		lv_anim_set_completed_cb(&a, vol_hud_gone);
-	lv_anim_start(&a);
+	return vol_hud && (!lv_obj_has_flag(vol_hud, LV_OBJ_FLAG_HIDDEN) || psl_active(vol_hud));
 }
 
 static void vol_hud_hide(lv_timer_t *t)
@@ -631,19 +611,24 @@ static void vol_hud_hide(lv_timer_t *t)
 		lv_timer_set_repeat_count(vol_hud_timer, 1);
 		return;
 	}
-	if (vol_hud)
-		vol_hud_fade(false);
+	if (vol_hud && !psl_start_sig(vol_hud, VOL_HUD_HIDE_Y, 160, ios_path_ease_in,
+				      true, vol_hud_sig)) {
+		lv_obj_add_flag(vol_hud, LV_OBJ_FLAG_HIDDEN);
+		lv_obj_set_y(vol_hud, VOL_HUD_HIDE_Y);
+		app_dormant_sync();
+	}
 }
 
 static void snd_refresh_ui(void)
 {
 	char buf[64];
 
-	if (vol_hud && !lv_obj_has_flag(vol_hud, LV_OBJ_FLAG_HIDDEN)) {
+	if (vol_hud) {
 		if (!lv_obj_has_state(vol_hud_slider, LV_STATE_PRESSED))
 			lv_slider_set_value(vol_hud_slider, conf.vol, LV_ANIM_OFF);
 		label_set_if_changed(vol_hud_icon, !conf.vol ? LV_SYMBOL_MUTE :
 				     conf.vol < 50 ? LV_SYMBOL_VOLUME_MID : LV_SYMBOL_VOLUME_MAX);
+		psl_check(vol_hud);
 	}
 	if (snd_page && lv_obj_is_valid(snd_page)) {
 		lv_slider_set_value(snd_slider, conf.vol, LV_ANIM_OFF);
@@ -669,17 +654,19 @@ static void vol_hud_slider_cb(lv_event_t *e)
 /*
  * The volume pop-up: the brightness control's look (a full-width pill in
  * surface container highest, the icon, a slider), raised over the page by
- * a shadow, below the status bar. The slider can be dragged too.
+ * a shadow, sliding down below the status bar via psl. The slider can be
+ * dragged too.
  */
 void vol_hud_show(void)
 {
 	if (app_dormant)
 		app_dormant_wake(false);
+	mbx_gpu_hw_slide_abort(vol_hud);
 	if (!vol_hud) {
 		vol_hud = lv_obj_create(lv_layer_top());
 		plain(vol_hud);
 		lv_obj_set_size(vol_hud, W - 2 * STATUS_PAD, 56);
-		lv_obj_align(vol_hud, LV_ALIGN_TOP_MID, 0, 36);
+		lv_obj_set_pos(vol_hud, STATUS_PAD, VOL_HUD_HIDE_Y);
 		lv_obj_set_style_radius(vol_hud, LV_RADIUS_CIRCLE, 0);
 		lv_obj_set_style_bg_color(vol_hud, M.surface_c_highest, 0);
 		lv_obj_set_style_bg_opa(vol_hud, LV_OPA_COVER, 0);
@@ -687,7 +674,6 @@ void vol_hud_show(void)
 		lv_obj_set_style_shadow_offset_y(vol_hud, 4, 0);
 		lv_obj_set_style_shadow_opa(vol_hud, LV_OPA_30, 0);
 		lv_obj_set_style_pad_hor(vol_hud, 18, 0);
-		lv_obj_set_style_opa(vol_hud, LV_OPA_TRANSP, 0);
 		lv_obj_remove_flag(vol_hud, LV_OBJ_FLAG_SCROLLABLE);
 		lv_obj_set_flex_flow(vol_hud, LV_FLEX_FLOW_ROW);
 		lv_obj_set_flex_align(vol_hud, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
@@ -702,13 +688,15 @@ void vol_hud_show(void)
 		lv_obj_remove_flag(vol_hud_slider, LV_OBJ_FLAG_GESTURE_BUBBLE);
 		lv_obj_add_flag(vol_hud, LV_OBJ_FLAG_HIDDEN);
 	}
-	if (lv_obj_has_flag(vol_hud, LV_OBJ_FLAG_HIDDEN) ||
-	    lv_anim_get(vol_hud, vol_hud_opa)) {
-		lv_obj_remove_flag(vol_hud, LV_OBJ_FLAG_HIDDEN);
-		vol_hud_fade(true);
-	}
-	lv_obj_move_foreground(vol_hud);
 	snd_refresh_ui();
+	lv_obj_move_foreground(vol_hud);
+	if (!vol_hud_visible() || psl_sliding(vol_hud)) {
+		if (!psl_start_sig(vol_hud, VOL_HUD_Y, 180, ios_path_ease_out,
+				   false, vol_hud_sig)) {
+			lv_obj_set_y(vol_hud, VOL_HUD_Y);
+			lv_obj_remove_flag(vol_hud, LV_OBJ_FLAG_HIDDEN);
+		}
+	}
 	if (vol_hud_timer)
 		lv_timer_reset(vol_hud_timer);
 	else {
