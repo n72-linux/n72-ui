@@ -136,12 +136,13 @@ static inline int mbx_cmd_copy(uint32_t *p, int blend, uint32_t dstride, uint32_
 }
 
 /*
- * Type 8 copy, scaled: the source rectangle (sx0, sy0)-(sx1, sy1), in
- * fractional pixels, stretched over the destination (dx0, dy0)-(dx1, dy1)
- * (ends exclusive). Opaque, point sampled (the filtering word, p[31], stays
- * 0: its encoding for bilinear is not known yet). For pinch-zoom previews.
+ * Type 8 copy, scaled with bilinear filtering: the source rectangle
+ * (sx0, sy0)-(sx1, sy1), in fractional pixels, stretched over the destination
+ * (dx0, dy0)-(dx1, dy1) (ends exclusive). UV endpoints are clamped to half a
+ * texel inside [0..sw, 0..sh] so bilinear taps stay within non-POT bounds.
  */
 static inline int mbx_cmd_copy_scaled(uint32_t *p, uint32_t dstride, uint32_t sstride,
+				      int sw, int sh,
 				      float sx0, float sy0, float sx1, float sy1,
 				      int dx0, int dy0, int dx1, int dy1)
 {
@@ -149,15 +150,31 @@ static inline int mbx_cmd_copy_scaled(uint32_t *p, uint32_t dstride, uint32_t ss
 	float tw, th;
 	int lw, lh, i;
 
+	if (sw > 0 && right > (uint32_t)sw)
+		right = (uint32_t)sw;
+	if (sh > 0 && bottom > (uint32_t)sh)
+		bottom = (uint32_t)sh;
 	if (spx > 8 && !(spx & (spx - 1)))
 		right = spx;	/* power-of-two stride: texture as wide as a row */
 	lw = mbx_log2_ceil8(right);
 	lh = mbx_log2_ceil8(bottom);
 	tw = (float)(1u << lw);
 	th = (float)(1u << lh);
+	if (sw > 1) {
+		float maxx = sw - 0.5f;
+
+		if (sx0 < 0.5f) sx0 = 0.5f; else if (sx0 > maxx) sx0 = maxx;
+		if (sx1 < 0.5f) sx1 = 0.5f; else if (sx1 > maxx) sx1 = maxx;
+	}
+	if (sh > 1) {
+		float maxy = sh - 0.5f;
+
+		if (sy0 < 0.5f) sy0 = 0.5f; else if (sy0 > maxy) sy0 = maxy;
+		if (sy1 < 0.5f) sy1 = 0.5f; else if (sy1 > maxy) sy1 = maxy;
+	}
 
 	mbx_cmd_dst(p, dstride, dx0, dy0, dx1, dy1);
-	p[10] = 0;
+	p[10] = (2u << 30) | (2u << 28);	/* CLAMP_TO_EDGE */
 	p[11] = lw - 3;
 	p[12] = lh - 3;
 	p[13] = 0x18000;			/* source ARGB8888 */
@@ -168,7 +185,7 @@ static inline int mbx_cmd_copy_scaled(uint32_t *p, uint32_t dstride, uint32_t ss
 	p[25] = mbx_f(sx0 / tw); p[26] = mbx_f(sy0 / th);
 	p[27] = mbx_f(sx1 / tw); p[28] = mbx_f(sy1 / th);
 	p[29] = mbx_f(sx1 / tw); p[30] = mbx_f(sy0 / th);
-	p[31] = 0;				/* no filtering */
+	p[31] = 0x80000000u;			/* bilinear filtering */
 	p[32] = 0xffffffff;
 	p[33] = 0;
 	for (i = 34; i < 38; i++)

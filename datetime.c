@@ -24,7 +24,33 @@ static const char *dt_zone_name(void)
 /* chronyd running: the time is the network's */
 static bool dt_auto(void)
 {
-	return !system("pidof chronyd >/dev/null 2>&1");
+	DIR *dir = opendir("/proc");
+	struct dirent *de;
+	bool found = false;
+
+	if (!dir)
+		return false;
+	while ((de = readdir(dir)) != NULL) {
+		char path[64], comm[32];
+		FILE *f;
+
+		if (de->d_name[0] < '0' || de->d_name[0] > '9')
+			continue;
+		snprintf(path, sizeof(path), "/proc/%s/comm", de->d_name);
+		f = fopen(path, "r");
+		if (!f)
+			continue;
+		if (fgets(comm, sizeof(comm), f)) {
+			comm[strcspn(comm, "\n")] = 0;
+			if (!strcmp(comm, "chronyd"))
+				found = true;
+		}
+		fclose(f);
+		if (found)
+			break;
+	}
+	closedir(dir);
+	return found;
 }
 
 /* clocks shown everywhere: again now (a zone or the time changed) */

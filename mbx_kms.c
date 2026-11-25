@@ -18,9 +18,12 @@ static uint8_t *disp_buf;		/* copy mode: the draw buffer */
 #define NSCAN 3
 static uint8_t *scan[NSCAN];		/* flip mode: the scan-out buffers */
 static uint32_t scan_handle[NSCAN];
+static uint32_t scan_ta_seq[NSCAN];	/* pending async TA frame on scan[i] */
 static uint32_t flush_words[16 * 64];
 static int flush_n;
 static bool flipping;
+static int32_t clean_y1, clean_y2;
+static bool clean_has_rows;
 
 /*
  * A turned screen (mbx_gpu_set_rotation): LVGL draws the upright picture
@@ -214,23 +217,89 @@ static bool covered(const lv_area_t *a, lv_display_t *d)
 	return false;
 }
 
-/* GPU-copy @a from buffer @src into @dst (batched; flushed by sync_flush()) */
+/* Batch catch-up copy rects, coalescing cache sync across all queued rows. */
+#define SYNC_BATCH 64
+static lv_area_t sync_q[SYNC_BATCH];
+static int sync_qn;
+static int32_t sync_y1, sync_y2;
+
+static void sync_flush(int dst, int src)
+{
+	uint32_t ss = scan_stride();
+	int i;
+
+	if (!sync_qn)
+		return;
+	sync_range(scan[dst] + sync_y1 * ss, (sync_y2 - sync_y1 + 1) * ss, MBX_SYNC_FLUSH);
+	if (sync_qn == 1 && !transparent &&
+	    lv_area_get_size(&sync_q[0]) >= 320 * 120 && !(ss & 31)) {
+		lv_area_t *c = &sync_q[0];
+		uint32_t w3[48];
+		int n = mbx_cmd_copy(w3, 0, ss, ss, c->x1, c->y1, c->x1, c->y1,
+				     lv_area_get_width(c), lv_area_get_height(c), LV_OPA_COVER);
+
+		if (!blit3d(8, gpu_addr(scan[dst]), gpu_addr(scan[src]), w3, n)) {
+			sync_qn = 0;
+			return;
+		}
+	}
+	for (i = 0; i < sync_qn; i++) {
+		lv_area_t *c = &sync_q[i];
+
+		if (flush_n > (int)(sizeof(flush_words) / 4) - 16) {
+			submit(flush_words, flush_n);
+			flush_n = 0;
+		}
+		flush_n += put_copy(flush_words + flush_n, gpu_addr(scan[dst]), ss,
+				    gpu_addr(scan[src]), ss, c->x1, c->y1, c->x1, c->y1,
+				    lv_area_get_width(c), lv_area_get_height(c));
+	}
+	if (flush_n) {
+		submit(flush_words, flush_n);
+		flush_n = 0;
+	}
+	sync_qn = 0;
+}
+
 static void sync_rect(int dst, int src, const lv_area_t *a)
 {
 	lv_area_t c;
 	lv_area_t all = { 0, 0, scan_w() - 1, scan_h() - 1 };
-	uint32_t ss = scan_stride();
 
 	if (!lv_area_intersect(&c, a, &all))
 		return;
-	sync_range(scan[dst] + c.y1 * ss, lv_area_get_height(&c) * ss, MBX_SYNC_FLUSH);
-	if (flush_n > (int)(sizeof(flush_words) / 4) - 16) {
-		submit(flush_words, flush_n);
-		flush_n = 0;
+	if (sync_qn >= SYNC_BATCH)
+		sync_flush(dst, src);
+	if (!sync_qn) {
+		sync_y1 = c.y1;
+		sync_y2 = c.y2;
+	} else {
+		sync_y1 = LV_MIN(sync_y1, c.y1);
+		sync_y2 = LV_MAX(sync_y2, c.y2);
 	}
-	flush_n += put_copy(flush_words + flush_n, gpu_addr(scan[dst]), ss,
-			    gpu_addr(scan[src]), ss, c.x1, c.y1, c.x1, c.y1,
-			    lv_area_get_width(&c), lv_area_get_height(&c));
+	sync_q[sync_qn++] = c;
+}
+
+bool mbx_kms_direct_scan_buf(const void *p)
+{
+	return flipping && (!rot_deg || hw_turn) && st_drawing >= 0 && p == scan[st_drawing];
+}
+
+bool mbx_kms_can_async_ta(const lv_layer_t *layer, const lv_draw_task_t *last)
+{
+	lv_display_t *d = lv_refr_get_disp_refreshing();
+
+	return flipping && (!rot_deg || hw_turn) && st_drawing >= 0 &&
+	       d && d->last_area && layer == d->layer_head &&
+	       layer->draw_buf && layer->draw_buf->data == scan[st_drawing] &&
+	       last && !last->next;
+}
+
+void mbx_kms_note_async_ta(uint32_t seq)
+{
+	if (st_drawing >= 0)
+		scan_ta_seq[st_drawing] = seq;
+	ta_active_seq = seq;
 }
 
 static void render_start_cb(lv_event_t *e)
@@ -259,9 +328,15 @@ static void render_start_cb(lv_event_t *e)
 	src = st_latest;
 	pthread_mutex_unlock(&flip_mx);
 
+	if (scan_ta_seq[dr]) {
+		ta_wait_active();
+		scan_ta_seq[dr] = 0;
+	}
+
 	/* bring the buffer up to date: frames buf_frame[dr]+1 .. frame_no */
 	double dbg_t0 = stat_t0();
 	have = buf_frame[dr];
+	sync_qn = 0;
 	if (src >= 0 && src != dr && have < frame_no) {
 		if (have < 0 || frame_no - have > HIST - 1) {
 			if (!covered(&all, d))
@@ -279,15 +354,15 @@ static void render_start_cb(lv_event_t *e)
 						sync_rect(dr, src, &hist[k].a[i]);
 			}
 		}
-		if (flush_n) {
-			submit(flush_words, flush_n);
-			flush_n = 0;
-		}
+		sync_flush(dr, src);
 	}
 	d->buf_1->data = rot_deg && !hw_turn ? lbuf : scan[dr];
 	cur_n = 0;
 	cur_all = false;
 	pm_skip_n = 0;
+	frame_cpu_dirty = false;
+	frame_drew_any = false;
+	clean_has_rows = false;
 	n72_trace("draw", 0);
 #ifdef N72_DEBUG
 	if (mbx_gpu_timing && gpu_now_us() - dbg_t0 > 8000 && getenv("N72_FPS"))
@@ -303,13 +378,49 @@ static void premultiply(uint8_t *px_map, const lv_area_t *a);
 static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
 	double dbg_t0 = stat_t0(), dbg_t1;
+	bool last = lv_display_flush_is_last(disp);
 
 	n72_trace("flush", lv_area_get_height(area));
-	if (transparent)
+	if (transparent) {
 		premultiply(px_map, area);
+		frame_cpu_dirty = true;
+	}
 	dbg_t1 = stat_t0();
-	/* what the CPU drew in this area goes out to memory for the display */
-	clean_rows(px_map, area);
+	if (rot_deg && !hw_turn) {
+		uint32_t cw[48];
+		lv_area_t pa;
+		int n = mbx_cmd_copy_turn(cw, fb.stride, lstride, area->x1, area->y1,
+					  lv_area_get_width(area), lv_area_get_height(area),
+					  rot_deg, fb.height, fb.width);
+
+		if (frame_cpu_dirty)
+			clean_rows(px_map, area);
+		to_panel(area, &pa);
+		if (blit3d(8, gpu_addr(scan[st_drawing]), gpu_addr(lbuf), cw, n))
+			fprintf(stderr, "n72-ui: turned copy failed\n");
+		if (cur_n < HIST_AREAS)
+			cur_areas[cur_n++] = pa;
+		else
+			cur_all = true;
+	} else {
+		if (!clean_has_rows) {
+			clean_y1 = area->y1;
+			clean_y2 = area->y2;
+			clean_has_rows = true;
+		} else {
+			clean_y1 = LV_MIN(clean_y1, area->y1);
+			clean_y2 = LV_MAX(clean_y2, area->y2);
+		}
+		if (cur_n < HIST_AREAS)
+			cur_areas[cur_n++] = *area;
+		else
+			cur_all = true;
+		if (last && frame_cpu_dirty && clean_has_rows) {
+			lv_area_t ca = { 0, clean_y1, 0, clean_y2 };
+
+			clean_rows(px_map, &ca);
+		}
+	}
 #ifdef N72_DEBUG
 	if (mbx_gpu_timing && gpu_now_us() - dbg_t0 > 8000 && getenv("N72_FPS"))
 		fprintf(stderr, "flush: premultiply %.1f ms, clean %.1f ms (%d rows)\n",
@@ -319,25 +430,7 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 	(void)dbg_t0;
 	(void)dbg_t1;
 #endif
-	if (rot_deg && !hw_turn) {
-		uint32_t cw[48];
-		lv_area_t pa;
-		int n = mbx_cmd_copy_turn(cw, fb.stride, lstride, area->x1, area->y1,
-					  lv_area_get_width(area), lv_area_get_height(area),
-					  rot_deg, fb.height, fb.width);
-
-		to_panel(area, &pa);
-		if (blit3d(8, gpu_addr(scan[st_drawing]), gpu_addr(lbuf), cw, n))
-			fprintf(stderr, "n72-ui: turned copy failed\n");
-		if (cur_n < HIST_AREAS)
-			cur_areas[cur_n++] = pa;
-		else
-			cur_all = true;
-	} else if (cur_n < HIST_AREAS)
-		cur_areas[cur_n++] = *area;
-	else
-		cur_all = true;
-	if (lv_display_flush_is_last(disp)) {
+	if (last) {
 		long n = frame_no + 1;
 		int k = n % HIST;
 #ifdef N72_DEBUG
@@ -349,6 +442,7 @@ static void flush_flip(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 			/* an opaque frame must have alpha 255 everywhere */
 			uint32_t x, y, bad = 0, fx = 0, fy = 0;
 
+			ta_wait_active();
 			for (y = 0; y < fb.height; y++)
 				for (x = 0; x < fb.width; x++)
 					if ((((uint32_t *)(px_map + y * fb.stride))[x] >> 24) != 255 && !bad++) {
@@ -389,8 +483,9 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 		flush_flip(disp, area, px_map);
 		return;
 	}
-	sync_range(disp_buf + area->y1 * stride, lv_area_get_height(area) * stride,
-		   MBX_SYNC_CLEAN);
+	if (frame_cpu_dirty)
+		sync_range(disp_buf + area->y1 * stride, lv_area_get_height(area) * stride,
+			   MBX_SYNC_CLEAN);
 	if (flush_n > (int)(sizeof(flush_words) / 4) - 16) {
 		submit(flush_words, flush_n);
 		flush_n = 0;
@@ -414,6 +509,10 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 static void refr_start_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
+	if (!flipping) {
+		frame_cpu_dirty = false;
+		frame_drew_any = false;
+	}
 	n72_refr_start();
 }
 
@@ -440,7 +539,7 @@ static uint8_t *region_add(uint32_t size, uint32_t flags, uint32_t *handle)
  */
 static uint32_t kms_fb[NSCAN], kms_crtc;
 static uint32_t kms_handle[NSCAN];	/* the scan buffers' GEM handles on kms_fd */
-static bool kms_shell;
+bool kms_shell;				/* on the display's layer 1, over the applications */
 
 /*
  * A turned screen by the display (kernel n72-clcd: the plane's "rotation"):
@@ -599,7 +698,6 @@ static void kms_drop_handoff(void)
 	}
 	handoff_n = 0;
 }
-static bool kms_shell;		/* on the display's layer 1, over the applications */
 
 /*
  * The launcher's own layer if the kernel has it: n72-clcd-shell, the
@@ -1126,6 +1224,7 @@ static void premultiply_span(uint32_t *p, int32_t w)
 const uint8_t *mbx_gpu_front(uint32_t *stride)
 {
 	*stride = fb.stride;
+	ta_wait_active();
 	if (flipping)
 		flip_wait();
 	return flipping ? scan[st_latest] : disp_buf;
@@ -1136,6 +1235,7 @@ const uint8_t *mbx_gpu_scan(int i, int *is_front)
 {
 	if (!flipping || i < 0 || i >= NSCAN)
 		return NULL;
+	ta_wait_active();
 	flip_wait();
 	*is_front = i == st_front;
 	return scan[i];
@@ -1162,7 +1262,10 @@ bool mbx_gpu_set_rotation(int deg)
 		if (!lbuf)
 			return false;
 	}
+	ta_wait_active();
 	flip_wait();
+	for (i = 0; i < NSCAN; i++)
+		scan_ta_seq[i] = 0;
 	/* the GPU writes the scan-out buffers now (or the CPU again): no
 	 * cache lines of the other way may be written back over them */
 	for (i = 0; i < NSCAN; i++)

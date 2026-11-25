@@ -242,10 +242,12 @@ uint32_t buf_width_to_stride(uint32_t w, lv_color_format_t cf)
 
 void buf_free(void *p)
 {
-	if (p && (uint8_t *)p >= pool && (uint8_t *)p < pool + POOL_SIZE)
+	if (p && (uint8_t *)p >= pool && (uint8_t *)p < pool + POOL_SIZE) {
+		ta_wait_active();
 		pool_free(p);
-	else
+	} else {
 		lv_free(p);
+	}
 }
 
 static void buf_sync_area(const lv_draw_buf_t *b, const lv_area_t *a, uint32_t op)
@@ -264,5 +266,7 @@ void buf_invalidate(const lv_draw_buf_t *b, const lv_area_t *a)
 
 void buf_clean(const lv_draw_buf_t *b, const lv_area_t *a)
 {
+	if (ta_active_seq)
+		ta_wait_active();
 	buf_sync_area(b, a, MBX_SYNC_CLEAN);
 }

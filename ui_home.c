@@ -554,16 +554,15 @@ static lv_draw_buf_t *icon_shadow_make(void)
 		}
 	for (i = 0; i < 3; i++)
 		blur_box(a, tmp, n, n, 3);
-	b = lv_draw_buf_create(n, n, LV_COLOR_FORMAT_ARGB8888, 0);
+	b = lv_draw_buf_create(n, n, LV_COLOR_FORMAT_A8, 0);
 	if (!b)
 		goto out;
 	for (y = 0; y < n; y++) {
-		uint32_t *row = (uint32_t *)(b->data + (size_t)y * b->header.stride);
+		uint8_t *row = b->data + (size_t)y * b->header.stride;
 
 		for (x = 0; x < n; x++)
-			row[x] = (uint32_t)(a[y * n + x] * peak / 255) << 24;	/* black */
+			row[x] = (uint8_t)(a[y * n + x] * peak / 255);
 	}
-	lv_draw_buf_flush_cache(b, NULL);
 out:
 	free(a);
 	free(tmp);
@@ -588,6 +587,7 @@ static void tile_shadow_cb(lv_event_t *e)
 		    a.y1 - SHADOW_R + SHADOW_DY + icon_shadow->header.h - 1);
 	lv_draw_image_dsc_init(&d);
 	d.src = icon_shadow;
+	d.recolor = lv_color_black();
 	lv_draw_image(lv_event_get_layer(e), &d, &a);
 }
 
@@ -2719,6 +2719,7 @@ static void app_home_ui(void)
 	}
 	lv_obj_invalidate(lv_layer_top());
 	home_update(NULL);
+	pg_warm_kick();
 }
 
 /* Close: the card covers the application, then goes into its icon. */

@@ -38,7 +38,9 @@ void n72_trace(const char *what, long v);
 
 #define DRAW_UNIT_ID_MBX	5
 
+#ifndef POOL_SIZE
 #define POOL_SIZE		(6 * 1024 * 1024)	/* display, layers, snapshots */
+#endif
 
 #define POOL_BLOCKS		256
 
@@ -96,10 +98,20 @@ void buf_clean(const lv_draw_buf_t *b, const lv_area_t *a);
 
 /* mbx_draw.c */
 extern bool transparent;
+extern bool frame_cpu_dirty;
+extern bool frame_drew_any;
+extern uint32_t ta_active_seq;
 int32_t mbx_evaluate(lv_draw_unit_t *u, lv_draw_task_t *t);
 extern lv_area_t pm_skip[PM_SKIP_MAX];
 extern int pm_skip_n;
 int32_t mbx_dispatch(lv_draw_unit_t *u, lv_layer_t *layer);
+void ta_wait_active(void);
+
+/* mbx_kms.c */
+extern bool kms_shell;
+bool mbx_kms_direct_scan_buf(const void *p);
+bool mbx_kms_can_async_ta(const lv_layer_t *layer, const lv_draw_task_t *last);
+void mbx_kms_note_async_ta(uint32_t seq);
 
 #ifdef N72_DEBUG
 static inline double stat_t0(void)

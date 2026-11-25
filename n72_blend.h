@@ -41,11 +41,20 @@ static inline void n72_tab_set(uint32_t c)
 
 static inline uint32_t n72_mix_tab(uint32_t d, uint32_t m)
 {
-	uint32_t inv = 255 - m;
-	uint32_t rb = ((n72_tab_rb[m] + (d & 0xff00ff) * inv) >> 8) & 0xff00ff;
-	uint32_t g = (n72_tab_g[m] + ((d & 0xff00) >> 8) * inv) & 0xff00;
+	uint32_t inv = 255u - m;
+	uint32_t rb = ((n72_tab_rb[m] + (d & 0xff00ffu) * inv) >> 8) & 0xff00ffu;
+	uint32_t g = (n72_tab_g[m] + ((d & 0xff00u) >> 8) * inv) & 0xff00u;
 
-	return (d & 0xff000000) | rb | g;
+	return (d & 0xff000000u) | rb | g;
+}
+
+static inline uint32_t n72_mix_rgb_word(uint32_t s_rgb, uint32_t d, uint32_t m)
+{
+	uint32_t inv = 255u - m;
+	uint32_t rb = (((s_rgb & 0x00ff00ffu) * m + (d & 0x00ff00ffu) * inv) >> 8) & 0x00ff00ffu;
+	uint32_t g = ((((s_rgb & 0x0000ff00u) >> 8) * m + ((d & 0x0000ff00u) >> 8) * inv)) & 0x0000ff00u;
+
+	return rb | g;
 }
 
 /*
@@ -147,8 +156,171 @@ static inline lv_result_t n72_blend_color_mask_xrgb(lv_draw_sw_blend_fill_dsc_t 
 	return LV_RESULT_OK;
 }
 
-#define LV_DRAW_SW_COLOR_BLEND_TO_RGB888_WITH_MASK(dsc, px)	n72_blend_color_mask_xrgb(dsc, px, LV_OPA_COVER)
-#define LV_DRAW_SW_COLOR_BLEND_TO_RGB888_MIX_MASK_OPA(dsc, px)	n72_blend_color_mask_xrgb(dsc, px, (dsc)->opa)
+/* Colour with uniform opacity into 4-byte RGB888 (XRGB8888). */
+static inline lv_result_t n72_blend_color_opa_xrgb(lv_draw_sw_blend_fill_dsc_t *dsc, uint32_t px)
+{
+	int32_t w = dsc->dest_w, h = dsc->dest_h, x, y;
+	uint8_t *dest = dsc->dest_buf;
+	uint32_t opa = dsc->opa, inv, c, s_rb, s_g;
+
+	if (px != 4)
+		return LV_RESULT_INVALID;
+	if (opa == 0)
+		return LV_RESULT_OK;
+	c = lv_color_to_u32(dsc->color) & 0x00ffffffu;
+	if (opa >= LV_OPA_MAX) {
+		for (y = 0; y < h; y++) {
+			uint32_t *d = (uint32_t *)dest;
+
+			for (x = 0; x < w; x++)
+				d[x] = (d[x] & 0xff000000u) | c;
+			dest += dsc->dest_stride;
+		}
+		return LV_RESULT_OK;
+	}
+	inv = 255u - opa;
+	s_rb = (c & 0x00ff00ffu) * opa;
+	s_g = ((c & 0x0000ff00u) >> 8) * opa;
+	for (y = 0; y < h; y++) {
+		uint32_t *d = (uint32_t *)dest;
+
+		for (x = 0; x + 1 < w; x += 2) {
+			uint32_t d0 = d[x], d1 = d[x + 1];
+			uint32_t rb0 = ((s_rb + (d0 & 0x00ff00ffu) * inv) >> 8) & 0x00ff00ffu;
+			uint32_t g0 = (s_g + ((d0 & 0x0000ff00u) >> 8) * inv) & 0x0000ff00u;
+			uint32_t rb1 = ((s_rb + (d1 & 0x00ff00ffu) * inv) >> 8) & 0x00ff00ffu;
+			uint32_t g1 = (s_g + ((d1 & 0x0000ff00u) >> 8) * inv) & 0x0000ff00u;
+
+			d[x] = (d0 & 0xff000000u) | rb0 | g0;
+			d[x + 1] = (d1 & 0xff000000u) | rb1 | g1;
+		}
+		if (x < w) {
+			uint32_t d0 = d[x];
+			uint32_t rb0 = ((s_rb + (d0 & 0x00ff00ffu) * inv) >> 8) & 0x00ff00ffu;
+			uint32_t g0 = (s_g + ((d0 & 0x0000ff00u) >> 8) * inv) & 0x0000ff00u;
+
+			d[x] = (d0 & 0xff000000u) | rb0 | g0;
+		}
+		dest += dsc->dest_stride;
+	}
+	return LV_RESULT_OK;
+}
+
+/* ARGB8888 normal blend (with optional uniform opacity) into 4-byte RGB888 (XRGB8888). */
+static inline lv_result_t n72_blend_argb_to_xrgb(lv_draw_sw_blend_image_dsc_t *dsc, uint32_t px, lv_opa_t opa)
+{
+	int32_t w = dsc->dest_w, h = dsc->dest_h, x, y;
+	uint8_t *dest = dsc->dest_buf;
+	const uint8_t *src = dsc->src_buf;
+
+	if (px != 4)
+		return LV_RESULT_INVALID;
+	if (opa == 0)
+		return LV_RESULT_OK;
+	for (y = 0; y < h; y++) {
+		uint32_t *d = (uint32_t *)dest;
+		const uint32_t *s = (const uint32_t *)src;
+
+		if (opa >= LV_OPA_MAX) {
+			for (x = 0; x < w; x++) {
+				uint32_t sv = s[x], a = sv >> 24, dv;
+
+				if (a == 0)
+					continue;
+				if (a >= LV_OPA_MAX) {
+					d[x] = (d[x] & 0xff000000u) | (sv & 0x00ffffffu);
+					continue;
+				}
+				dv = d[x];
+				d[x] = (dv & 0xff000000u) | n72_mix_rgb_word(sv & 0x00ffffffu, dv, a);
+			}
+		} else {
+			for (x = 0; x < w; x++) {
+				uint32_t sv = s[x], a = (uint32_t)LV_OPA_MIX2(sv >> 24, opa), dv;
+
+				if (a == 0)
+					continue;
+				if (a >= LV_OPA_MAX) {
+					d[x] = (d[x] & 0xff000000u) | (sv & 0x00ffffffu);
+					continue;
+				}
+				dv = d[x];
+				d[x] = (dv & 0xff000000u) | n72_mix_rgb_word(sv & 0x00ffffffu, dv, a);
+			}
+		}
+		dest += dsc->dest_stride;
+		src += dsc->src_stride;
+	}
+	return LV_RESULT_OK;
+}
+
+/* Colour (optionally through a mask and/or uniform opacity) into ARGB8888. */
+static inline lv_result_t n72_blend_color_to_argb(lv_draw_sw_blend_fill_dsc_t *dsc,
+						  const lv_opa_t *mask, lv_opa_t opa)
+{
+	int32_t w = dsc->dest_w, h = dsc->dest_h, x, y;
+	uint8_t *dest = dsc->dest_buf;
+	uint32_t c = lv_color_to_u32(dsc->color) & 0x00ffffffu;
+	uint32_t last_m = 256, last_ba = 256, ra = 255, ratio = 255;
+
+	if (opa == 0)
+		return LV_RESULT_OK;
+	n72_tab_set(c);
+	for (y = 0; y < h; y++) {
+		uint32_t *d = (uint32_t *)dest;
+
+		for (x = 0; x < w; x++) {
+			uint32_t m = mask ? (opa >= LV_OPA_MAX ? (uint32_t)mask[x] : (uint32_t)LV_OPA_MIX2(mask[x], opa))
+					  : (uint32_t)opa;
+			uint32_t dv, ba;
+
+			if (m == 0)
+				continue;
+			if (m >= LV_OPA_MAX) {
+				d[x] = (m << 24) | c;
+				continue;
+			}
+			dv = d[x];
+			ba = dv >> 24;
+			if (ba <= LV_OPA_MIN) {
+				d[x] = (m << 24) | c;
+				continue;
+			}
+			if (m <= LV_OPA_MIN)
+				continue;
+			if (ba == 255u) {
+				d[x] = 0xff000000u | (n72_mix_tab(dv, m) & 0x00ffffffu);
+				continue;
+			}
+			if (m != last_m || ba != last_ba) {
+				last_m = m;
+				last_ba = ba;
+				ra = 255u - (uint32_t)LV_OPA_MIX2(255u - m, 255u - ba);
+				ratio = (m * 255u) / ra;
+			}
+			if (ratio >= LV_OPA_MAX)
+				d[x] = (ra << 24) | c;
+			else if (ratio <= LV_OPA_MIN)
+				d[x] = (ra << 24) | (dv & 0x00ffffffu);
+			else
+				d[x] = (ra << 24) | (n72_mix_tab(dv, ratio) & 0x00ffffffu);
+		}
+		dest += dsc->dest_stride;
+		if (mask)
+			mask += dsc->mask_stride;
+	}
+	return LV_RESULT_OK;
+}
+
+#define LV_DRAW_SW_COLOR_BLEND_TO_RGB888_WITH_OPA(dsc, px)		n72_blend_color_opa_xrgb(dsc, px)
+#define LV_DRAW_SW_COLOR_BLEND_TO_RGB888_WITH_MASK(dsc, px)		n72_blend_color_mask_xrgb(dsc, px, LV_OPA_COVER)
+#define LV_DRAW_SW_COLOR_BLEND_TO_RGB888_MIX_MASK_OPA(dsc, px)		n72_blend_color_mask_xrgb(dsc, px, (dsc)->opa)
+#define LV_DRAW_SW_ARGB8888_BLEND_NORMAL_TO_RGB888(dsc, px)		n72_blend_argb_to_xrgb(dsc, px, LV_OPA_COVER)
+#define LV_DRAW_SW_ARGB8888_BLEND_NORMAL_TO_RGB888_WITH_OPA(dsc, px)	n72_blend_argb_to_xrgb(dsc, px, (dsc)->opa)
+
+#define LV_DRAW_SW_COLOR_BLEND_TO_ARGB8888_WITH_OPA(dsc)		n72_blend_color_to_argb(dsc, NULL, (dsc)->opa)
+#define LV_DRAW_SW_COLOR_BLEND_TO_ARGB8888_WITH_MASK(dsc)		n72_blend_color_to_argb(dsc, (dsc)->mask_buf, LV_OPA_COVER)
+#define LV_DRAW_SW_COLOR_BLEND_TO_ARGB8888_MIX_MASK_OPA(dsc)		n72_blend_color_to_argb(dsc, (dsc)->mask_buf, (dsc)->opa)
 
 #endif
 #endif

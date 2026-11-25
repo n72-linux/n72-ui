@@ -179,10 +179,10 @@ static int wake_irq(void)
  * deep sleep, where the wake comes through the boot loader, that is the
  * only sign of a button there is.
  */
-static bool woke_for_screen(const struct wake_marks *before)
+static bool woke_for_screen(const struct wake_marks *before, bool slept)
 {
 	struct wake_marks now;
-	int irq = wake_irq();
+	int irq = slept ? wake_irq() : -1;
 
 	wake_marks(&now);
 	if (now.home != before->home || now.power != before->power)
@@ -387,7 +387,7 @@ static bool deep_sleep(void)
 	mem_sleep_set("s2idle");
 	if (ok) {
 		deep_retry_gap = DEEP_RETRY_MIN_S;
-	} else {
+	} else if (sleep_errno != EBUSY) {
 		deep_retry_at = boot_s() + deep_retry_gap;
 		fprintf(stderr, "n72-ui: suspend to RAM refused: suspend to idle, again in %ld s\n",
 			(long)deep_retry_gap);
@@ -421,6 +421,7 @@ bool system_sleep(void)
 	for (;;) {
 		struct wake_marks before;
 		bool deep = boot_s() - start >= DEEP_AFTER_S && deep_allowed();
+		bool slept = false, slept_deep = false;
 
 		if (deep && own) {	/* nothing to wake for in deep sleep */
 			wake_alarm("0");
@@ -443,8 +444,10 @@ bool system_sleep(void)
 		if (!wakeup_count_arm()) {
 			ok = true;	/* an event came first: look at it, as after a wake */
 		} else {
-			ok = deep && deep_sleep();
-			if (!ok)	/* not deep, or the PMU refused: suspend to idle */
+			slept_deep = deep && deep_sleep();
+			ok = slept_deep;
+			if (!ok && !(deep && sleep_errno == EBUSY))
+				/* not deep, or the PMU refused: suspend to idle */
 				ok = write_sleep_state("freeze");
 			/*
 			 * Given up at once because a wakeup event came while the
@@ -455,15 +458,16 @@ bool system_sleep(void)
 			 */
 			if (!ok && sleep_errno == EBUSY && ++busy_tries <= 10) {
 				woke_us = mono_us();
-				if (woke_for_screen(&before) || dark_linger()) {
+				if (woke_for_screen(&before, false) || dark_linger()) {
 					ok = true;	/* (a wake like any other: the screen goes on) */
 					break;
 				}
 				continue;
 			}
+			slept = ok;
 		}
 		woke_us = mono_us();
-		if (deep && ok && getenv("N72_WAKE_LOG")) {
+		if (slept_deep && getenv("N72_WAKE_LOG")) {
 			struct wake_marks w;
 
 			wake_marks(&w);
@@ -471,7 +475,7 @@ bool system_sleep(void)
 				w.pmu_int[0], w.pmu_int[1], w.pmu_int[2], w.pmu_n, before.pmu_n,
 				before.home, w.home, before.power, w.power, before.usb, w.usb);
 		}
-		if (!ok || woke_for_screen(&before) || (deep && deep_woke_by_button(&before)))
+		if (!ok || woke_for_screen(&before, slept) || (slept_deep && deep_woke_by_button(&before)))
 			break;
 		if (own) {
 			struct wake_marks now;

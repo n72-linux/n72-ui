@@ -6,7 +6,7 @@
 
 /* A finger-painting toy: each stroke gets the next colour round the wheel. */
 static lv_obj_t *paint_canvas;
-static void *paint_buf;
+static lv_draw_buf_t *paint_buf;
 static lv_point_t paint_last;
 static bool paint_down;
 static uint32_t paint_hue;
@@ -17,6 +17,7 @@ static uint32_t paint_hue;
 static void paint_clear(void)
 {
 	lv_canvas_fill_bg(paint_canvas, M.surface_c, LV_OPA_COVER);
+	lv_draw_buf_flush_cache(paint_buf, NULL);
 }
 
 static void paint_event(lv_event_t *e)
@@ -25,14 +26,15 @@ static void paint_event(lv_event_t *e)
 	lv_indev_t *indev = lv_indev_active();
 	lv_draw_line_dsc_t d;
 	lv_layer_t layer;
-	lv_area_t a;
+	lv_area_t a, dirty, scr_dirty;
 	lv_point_t p;
+	int32_t pad;
 
 	if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
 		paint_down = false;
 		return;
 	}
-	if (!indev || (code != LV_EVENT_PRESSED && code != LV_EVENT_PRESSING))
+	if (!indev || !paint_buf || (code != LV_EVENT_PRESSED && code != LV_EVENT_PRESSING))
 		return;
 	lv_indev_get_point(indev, &p);
 	lv_obj_get_coords(paint_canvas, &a);
@@ -43,7 +45,6 @@ static void paint_event(lv_event_t *e)
 		paint_down = true;
 		paint_hue = (paint_hue + 47) % 360;
 	}
-	lv_canvas_init_layer(paint_canvas, &layer);
 	lv_draw_line_dsc_init(&d);
 	d.color = tone(paint_hue, 75, conf.dark ? 70 : 50);
 	d.width = 10;
@@ -53,9 +54,30 @@ static void paint_event(lv_event_t *e)
 	d.p1.y = paint_last.y;
 	d.p2.x = p.x;
 	d.p2.y = p.y;
-	lv_draw_line(&layer, &d);
-	lv_canvas_finish_layer(paint_canvas, &layer);
+	pad = d.width / 2 + 2;
+	dirty.x1 = LV_MAX(0, LV_MIN(paint_last.x, p.x) - pad);
+	dirty.y1 = LV_MAX(0, LV_MIN(paint_last.y, p.y) - pad);
+	dirty.x2 = LV_MIN((int32_t)paint_buf->header.w - 1, LV_MAX(paint_last.x, p.x) + pad);
+	dirty.y2 = LV_MIN((int32_t)paint_buf->header.h - 1, LV_MAX(paint_last.y, p.y) + pad);
 	paint_last = p;
+	if (dirty.x1 > dirty.x2 || dirty.y1 > dirty.y2)
+		return;
+
+	lv_canvas_init_layer(paint_canvas, &layer);
+	layer._clip_area = dirty;
+	layer.phy_clip_area = dirty;
+	lv_draw_line(&layer, &d);
+	while (layer.draw_task_head) {
+		lv_draw_dispatch_wait_for_request();
+		if (!lv_draw_dispatch_layer(lv_obj_get_display(paint_canvas), &layer)) {
+			lv_draw_wait_for_finish();
+			lv_draw_dispatch_request();
+		}
+	}
+	lv_draw_buf_flush_cache(paint_buf, &dirty);
+	scr_dirty = dirty;
+	lv_area_move(&scr_dirty, a.x1, a.y1);
+	lv_obj_invalidate_area(paint_canvas, &scr_dirty);
 }
 
 static void paint_clear_cb(lv_event_t *e)
@@ -68,8 +90,11 @@ static void paint_clear_cb(lv_event_t *e)
 static void paint_delete_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
-	free(paint_buf);
-	paint_buf = NULL;
+	if (paint_buf) {
+		lv_image_cache_drop(paint_buf);
+		lv_draw_buf_destroy(paint_buf);
+		paint_buf = NULL;
+	}
 }
 
 void open_paint(lv_event_t *e)
@@ -80,14 +105,14 @@ void open_paint(lv_event_t *e)
 	LV_UNUSED(e);
 	body = m3_page("Paint", &scr);
 	lv_obj_remove_flag(body, LV_OBJ_FLAG_SCROLLABLE);
-	paint_buf = malloc(LV_CANVAS_BUF_SIZE(PAINT_W, PAINT_H, 32, LV_DRAW_BUF_STRIDE_ALIGN));
+	paint_buf = lv_draw_buf_create(PAINT_W, PAINT_H, LV_COLOR_FORMAT_XRGB8888, 0);
 	if (!paint_buf) {
 		lv_obj_delete(scr);
 		return;
 	}
 	paint_canvas = lv_canvas_create(body);
 	obj_track(&paint_canvas);
-	lv_canvas_set_buffer(paint_canvas, paint_buf, PAINT_W, PAINT_H, LV_COLOR_FORMAT_XRGB8888);
+	lv_canvas_set_draw_buf(paint_canvas, paint_buf);
 	lv_obj_add_flag(paint_canvas, LV_OBJ_FLAG_CLICKABLE);
 	lv_obj_remove_flag(paint_canvas, LV_OBJ_FLAG_GESTURE_BUBBLE);
 	lv_obj_add_event_cb(paint_canvas, paint_event, LV_EVENT_ALL, NULL);

@@ -490,6 +490,7 @@ void home_geom(void);
 extern struct pg pg;
 extern lv_timer_t *pg_warm_timer;
 void pg_fb0_dirty(void);
+void pg_warm_kick(void);
 bool pg_drag(int phase, int x, int y);
 void pg_warm(lv_timer_t *t);
 void pg_home_gone(void);

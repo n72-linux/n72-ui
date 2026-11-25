@@ -76,8 +76,10 @@ unsigned long home_ver;	/* bumped when anything on home changes */
 
 void bp_changed(lv_obj_t *scr)
 {
-	if (scr && scr == home_scr)
+	if (scr && scr == home_scr) {
 		home_ver++;
+		pg_warm_kick();
+	}
 	for (int i = 0; i < BP_MAX; i++)
 		if (bp[i].scr && bp[i].scr == scr)
 			bp_drop(i);
@@ -1383,27 +1385,58 @@ void pf_label_changed(lv_obj_t *lbl)
 			}
 }
 
-/* A scroll picture of @c: rendered, in GPU memory, flattened onto what is behind. */
+/* A scroll picture of @c: rendered directly onto what is behind, in GPU memory. */
 static lv_draw_buf_t *sc_picture(lv_obj_t *c)
 {
-	lv_draw_buf_t *b, *flat;
+	lv_draw_buf_t *b;
+	lv_display_t *disp = lv_obj_get_display(c), *disp_old;
+	lv_layer_t layer, *layer_old;
+	lv_area_t snapshot_area;
+	int32_t ext, w, h, x, y;
+	uint32_t bg;
 
-	if (lv_obj_get_height(c) + 2 * lv_obj_get_ext_draw_size(c) > SC_MAX_H)
+	lv_obj_update_layout(c);
+	ext = lv_obj_get_ext_draw_size(c);
+	if (lv_obj_get_height(c) + 2 * ext > SC_MAX_H)
 		return NULL;
-	b = lv_snapshot_take(c, LV_COLOR_FORMAT_ARGB8888);
+	b = lv_snapshot_create_draw_buf(c, LV_COLOR_FORMAT_XRGB8888);
 	if (!b)
 		return NULL;
-	lv_draw_buf_flush_cache(b, NULL);	/* the GPU reads it */
-	/*
-	 * Flatten it onto the page colour once: frames then copy opaque
-	 * pictures instead of blending them (a third of the memory traffic,
-	 * and the GPU is memory bound).
-	 */
-	flat = mbx_gpu_flatten(b, sc_bg_of(c));
-	if (flat) {
-		lv_draw_buf_destroy(b);
-		b = flat;
+	bg = 0xff000000u | lv_color_to_u32(sc_bg_of(c));
+	w = (int32_t)b->header.w;
+	h = (int32_t)b->header.h;
+	for (y = 0; y < h; y++) {
+		uint32_t *row = (uint32_t *)(b->data + (size_t)y * b->header.stride);
+
+		for (x = 0; x < w; x++)
+			row[x] = bg;
 	}
+	lv_obj_get_coords(c, &snapshot_area);
+	lv_area_increase(&snapshot_area, ext, ext);
+	lv_memzero(&layer, sizeof(layer));
+	layer.draw_buf = b;
+	layer.buf_area.x1 = snapshot_area.x1;
+	layer.buf_area.y1 = snapshot_area.y1;
+	layer.buf_area.x2 = snapshot_area.x1 + w - 1;
+	layer.buf_area.y2 = snapshot_area.y1 + h - 1;
+	layer.color_format = LV_COLOR_FORMAT_XRGB8888;
+	layer._clip_area = snapshot_area;
+	layer.phy_clip_area = snapshot_area;
+#if LV_DRAW_TRANSFORM_USE_MATRIX
+	lv_matrix_identity(&layer.matrix);
+#endif
+	disp_old = lv_refr_get_disp_refreshing();
+	layer_old = disp->layer_head;
+	disp->layer_head = &layer;
+	lv_refr_set_disp_refreshing(disp);
+	lv_obj_redraw(&layer, c);
+	while (layer.draw_task_head) {
+		lv_draw_dispatch_wait_for_request();
+		lv_draw_dispatch();
+	}
+	disp->layer_head = layer_old;
+	lv_refr_set_disp_refreshing(disp_old);
+	lv_draw_buf_flush_cache(b, NULL);	/* the GPU reads it */
 	return b;
 }
 

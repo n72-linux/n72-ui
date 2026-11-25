@@ -507,6 +507,7 @@ static bool pg_fb0_wallpaper(void)
 void pg_fb0_dirty(void)
 {
 	pg.fb0_ok = false;
+	pg_warm_kick();
 }
 
 /* ------------------------------------------------------------- frames */
@@ -957,6 +958,14 @@ bool pg_drag(int phase, int x, int y)
  * While home is still and lit: the pictures ready before a swipe needs
  * them (taking them is a few tens of ms) and the wallpaper on layer 0.
  */
+void pg_warm_kick(void)
+{
+	if (pg_warm_timer) {
+		lv_timer_resume(pg_warm_timer);
+		lv_timer_reset(pg_warm_timer);
+	}
+}
+
 void pg_warm(lv_timer_t *t)
 {
 	LV_UNUSED(t);
@@ -971,8 +980,11 @@ void pg_warm(lv_timer_t *t)
 			return;
 		pg_pics();
 	}
-	else if (pg.pic_mode == PG_MODE_LAYER0)
+	if (pg.pic_ver == home_ver && pg.pic_mode == PG_MODE_LAYER0 && !pg.fb0_ok)
 		pg_fb0_wallpaper();
+	if (pg_warm_timer && pg.pic_ver == home_ver && pg.pic_mode == pg_mode() &&
+	    pg.pic_w == W && (pg.pic_mode != PG_MODE_LAYER0 || pg.fb0_ok))
+		lv_timer_pause(pg_warm_timer);
 }
 
 /* Home is being built again (a turn, a theme): its pictures go with it. */
