@@ -3175,9 +3175,9 @@ void app_launch(const char *cmd, lv_obj_t *tile)
 		if (!tile)
 			return;
 	}
+	app_scr_make();
 	if (cmd_is_video(cmd))
 		vc_start();
-	app_scr_make();
 	tr_finish();
 	shade_set(false, false);
 

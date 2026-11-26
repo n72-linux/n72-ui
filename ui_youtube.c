@@ -21,6 +21,8 @@
 #include <ctype.h>
 
 #define YT_DIR		"/root/.config/n72-yt"
+#define YT_OFFLINE_DIR	YT_DIR "/offline"
+#define YT_OFFLINE_IDX	YT_OFFLINE_DIR "/index"
 #define YT_SEP		" \xE2\x80\xA2 "		/* " • " */
 #define YT_CACHE	"/tmp/n72-yt"		/* n72-yt's default */
 #define YT_TW		112			/* list thumbnails, 16:9 */
@@ -28,6 +30,8 @@
 #define YT_RECENT_MAX	8
 #define YT_HIST_MAX	30
 #define YT_HIST_SHOWN	12
+#define YT_OFFLINE_MAX	200
+#define YT_OFF_SHOWN	64
 #define YT_ROWS_MAX	200			/* a search stops loading more here */
 #define YT_STALE_MS	(30 * 60 * 1000)	/* stream addresses last ~6 h; renew after this */
 
@@ -37,6 +41,14 @@ struct yt_vid {
 	char chan[96];
 	char len[16];		/* "3:33", "LIVE", "SOON" or "" */
 	char meta[72];		/* "138M views * 6 years ago" */
+};
+
+struct yt_off {
+	struct yt_vid v;
+	char mode[16];		/* "audio", "240p", "360p" */
+	long long bytes;
+	bool has_video;
+	bool has_audio;
 };
 
 /* a list row's image: the thumbnail once loaded */
@@ -172,6 +184,171 @@ static void yt_history_add(const struct yt_vid *v)
 	yt_list_add(YT_DIR "/history", line, YT_HIST_MAX);
 }
 
+static void yt_size_fmt(long long b, char *out, size_t len)
+{
+	if (b < 1024)
+		snprintf(out, len, "%lld B", b);
+	else if (b < 1024LL * 1024)
+		snprintf(out, len, "%.0f kB", b / 1024.0);
+	else if (b < 1024LL * 1024 * 1024)
+		snprintf(out, len, "%.1f MB", b / (1024.0 * 1024));
+	else
+		snprintf(out, len, "%.2f GB", b / (1024.0 * 1024 * 1024));
+}
+
+static void yt_offline_mkdir(const char *id)
+{
+	char dir[256];
+
+	yt_mkdir();
+	mkdir(YT_OFFLINE_DIR, 0755);
+	if (id && yt_id_ok(id)) {
+		snprintf(dir, sizeof(dir), YT_OFFLINE_DIR "/%s", id);
+		mkdir(dir, 0755);
+	}
+}
+
+static void yt_offline_paths(const char *id, char *audio, size_t alen, char *video, size_t vlen)
+{
+	if (audio)
+		snprintf(audio, alen, YT_OFFLINE_DIR "/%s/audio.m4a", id);
+	if (video)
+		snprintf(video, vlen, YT_OFFLINE_DIR "/%s/video.mp4", id);
+}
+
+static bool yt_offline_parse(char *line, struct yt_off *out)
+{
+	char *f[7];
+	char ap[256], vp[256];
+	int k;
+
+	line[strcspn(line, "\r\n")] = 0;
+	k = yt_split(line, f, 7);
+	if (k < 2 || !yt_id_ok(f[0]))
+		return false;
+	memset(out, 0, sizeof(*out));
+	snprintf(out->v.id, sizeof(out->v.id), "%s", f[0]);
+	snprintf(out->v.title, sizeof(out->v.title), "%s", f[1]);
+	snprintf(out->v.chan, sizeof(out->v.chan), "%s", k > 2 ? f[2] : "");
+	snprintf(out->v.len, sizeof(out->v.len), "%s", k > 3 ? f[3] : "");
+	snprintf(out->v.meta, sizeof(out->v.meta), "%s", k > 4 ? f[4] : "");
+	snprintf(out->mode, sizeof(out->mode), "%s", k > 5 && f[5][0] ? f[5] : "audio");
+	out->bytes = k > 6 ? atoll(f[6]) : 0;
+	yt_offline_paths(out->v.id, ap, sizeof(ap), vp, sizeof(vp));
+	out->has_audio = access(ap, R_OK) == 0;
+	out->has_video = access(vp, R_OK) == 0;
+	return out->has_audio;
+}
+
+static bool yt_offline_find(const char *id, struct yt_off *out)
+{
+	FILE *f;
+	char line[512];
+
+	if (!yt_id_ok(id))
+		return false;
+	f = fopen(YT_OFFLINE_IDX, "r");
+	if (!f)
+		return false;
+	while (fgets(line, sizeof(line), f)) {
+		struct yt_off tmp;
+
+		if (yt_offline_parse(line, &tmp) && !strcmp(tmp.v.id, id)) {
+			if (out)
+				*out = tmp;
+			fclose(f);
+			return true;
+		}
+	}
+	fclose(f);
+	return false;
+}
+
+static void yt_offline_add(const struct yt_vid *v, const char *mode, long long bytes)
+{
+	char line[512];
+
+	yt_offline_mkdir(NULL);
+	snprintf(line, sizeof(line), "%s\t%s\t%s\t%s\t%s\t%s\t%lld",
+		 v->id, v->title, v->chan, v->len, v->meta, mode, bytes);
+	yt_list_add(YT_OFFLINE_IDX, line, YT_OFFLINE_MAX);
+}
+
+static void yt_offline_unlink_parts(const char *id)
+{
+	static const char *const parts[] = { "audio.m4a.part", "video.mp4.part", "desc.txt.part" };
+	char dir[256], p[300];
+
+	if (!yt_id_ok(id))
+		return;
+	snprintf(dir, sizeof(dir), YT_OFFLINE_DIR "/%s", id);
+	for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+		snprintf(p, sizeof(p), "%s/%s", dir, parts[i]);
+		unlink(p);
+	}
+	rmdir(dir);	/* succeeds only if nothing saved remains */
+}
+
+static void yt_dl_cancel(void);
+static pid_t yt_dl_active_pid(const char *id);
+
+static void yt_offline_remove(const char *id)
+{
+	static const char *const files[] = {
+		"audio.m4a", "audio.m4a.part", "video.mp4", "video.mp4.part",
+		"desc.txt", "desc.txt.part", "112x63.565", "288x162.565", "217x122.565"
+	};
+	char dir[256], p[300], tmp[PATH_MAX], buf[512];
+	FILE *in, *out;
+	size_t idlen;
+	int kept = 0;
+
+	if (!yt_id_ok(id))
+		return;
+	if (yt_dl_active_pid(id) > 0)
+		yt_dl_cancel();
+	snprintf(dir, sizeof(dir), YT_OFFLINE_DIR "/%s", id);
+	for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+		snprintf(p, sizeof(p), "%s/%s", dir, files[i]);
+		unlink(p);
+	}
+	rmdir(dir);
+
+	snprintf(tmp, sizeof(tmp), "%s.new", YT_OFFLINE_IDX);
+	in = fopen(YT_OFFLINE_IDX, "r");
+	if (!in)
+		return;
+	out = fopen(tmp, "w");
+	if (!out) {
+		fclose(in);
+		return;
+	}
+	idlen = strlen(id);
+	while (fgets(buf, sizeof(buf), in)) {
+		size_t k = strcspn(buf, "\t\r\n");
+
+		if (k == idlen && !strncmp(buf, id, idlen))
+			continue;
+		if (buf[0] == '\n')
+			continue;
+		fputs(buf, out);
+		if (!strchr(buf, '\n'))
+			fputc('\n', out);
+		kept++;
+	}
+	fclose(in);
+	if (fclose(out) == 0) {
+		if (kept)
+			rename(tmp, YT_OFFLINE_IDX);
+		else {
+			unlink(tmp);
+			unlink(YT_OFFLINE_IDX);
+		}
+	} else {
+		unlink(tmp);
+	}
+}
+
 /* ------------------------------------------------------------ formatting */
 
 /* 1836433696 -> "1.8B views" */
@@ -290,8 +467,12 @@ static bool yt_thumb_load(lv_obj_t *img, const char *id, int w, int h)
 
 	if (lv_obj_get_user_data(img))
 		return true;		/* (already) */
-	snprintf(path, sizeof(path), YT_CACHE "/%s-%dx%d.565", id, w, h);
+	snprintf(path, sizeof(path), YT_OFFLINE_DIR "/%s/%dx%d.565", id, w, h);
 	f = fopen(path, "rb");
+	if (!f) {
+		snprintf(path, sizeof(path), YT_CACHE "/%s-%dx%d.565", id, w, h);
+		f = fopen(path, "rb");
+	}
 	if (!f)
 		return false;
 	t = calloc(1, sizeof(*t));
@@ -359,6 +540,42 @@ static lv_obj_t *yt_state(lv_obj_t *parent, const char *icon, const char *head,
 	return c;
 }
 
+/* A section title with a compact "Clear" text button on the right. */
+static lv_obj_t *yt_section_clear(lv_obj_t *parent, const char *title, lv_event_cb_t cb,
+				  lv_obj_t **lbl_out)
+{
+	lv_obj_t *row = lv_obj_create(parent), *btn, *lbl;
+
+	plain(row);
+	lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+	lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_pad_left(row, 8, 0);
+	lv_obj_set_style_pad_right(row, 0, 0);
+	lv_obj_set_style_pad_top(row, 8, 0);
+	lv_obj_set_style_pad_bottom(row, 0, 0);
+	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+			      LV_FLEX_ALIGN_CENTER);
+	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	m3_label(row, title, &lv_font_montserrat_14, M.primary);
+	btn = lv_button_create(row);
+	plain(btn);
+	lv_obj_set_size(btn, LV_SIZE_CONTENT, 28);
+	lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_bg_color(btn, M.on_surface, LV_STATE_PRESSED);
+	lv_obj_set_style_bg_opa(btn, LV_OPA_10, LV_STATE_PRESSED);
+	lv_obj_set_style_pad_hor(btn, 10, 0);
+	lv_obj_set_style_pad_ver(btn, 0, 0);
+	lv_obj_set_ext_click_area(btn, 8);
+	lbl = m3_label(btn, "Clear", &lv_font_montserrat_14, M.primary);
+	lv_obj_center(lbl);
+	lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+	if (lbl_out)
+		*lbl_out = lbl;
+	return row;
+}
+
 static void yt_open_video(const struct yt_vid *v);
 
 /*
@@ -381,10 +598,11 @@ static void yt_free_ud(lv_event_t *e)
 
 /*
  * A video in a list (an M3 list item with a large leading thumbnail): the
- * thumbnail with its length, the title on two lines, the channel, views
- * and age. *img_out: the thumbnail, to load later.
+ * thumbnail with its length, the title on two lines, the channel, and a
+ * supporting line. *img_out: the thumbnail, to load later.
  */
-static lv_obj_t *yt_row(lv_obj_t *parent, const struct yt_vid *v, lv_obj_t **img_out)
+static lv_obj_t *yt_row_meta(lv_obj_t *parent, const struct yt_vid *v, const char *sub2,
+			     lv_obj_t **img_out)
 {
 	lv_obj_t *r = lv_obj_create(parent), *col, *t, *img;
 	struct yt_vid *ud = malloc(sizeof(*ud));
@@ -418,8 +636,8 @@ static lv_obj_t *yt_row(lv_obj_t *parent, const struct yt_vid *v, lv_obj_t **img
 	t = m3_label(col, v->chan, &lv_font_montserrat_12, M.on_surface_v);
 	lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
 	lv_obj_set_width(t, lv_pct(100));
-	if (v->meta[0]) {
-		t = m3_label(col, v->meta, &lv_font_montserrat_12, M.on_surface_v);
+	if (sub2 && sub2[0]) {
+		t = m3_label(col, sub2, &lv_font_montserrat_12, M.on_surface_v);
 		lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
 		lv_obj_set_width(t, lv_pct(100));
 	}
@@ -431,6 +649,11 @@ static lv_obj_t *yt_row(lv_obj_t *parent, const struct yt_vid *v, lv_obj_t **img
 	if (img_out)
 		*img_out = img;
 	return r;
+}
+
+static lv_obj_t *yt_row(lv_obj_t *parent, const struct yt_vid *v, lv_obj_t **img_out)
+{
+	return yt_row_meta(parent, v, v->meta, img_out);
 }
 
 /*
@@ -586,13 +809,13 @@ static void yt_thumbs_want(lv_obj_t *body, lv_obj_t *row, lv_obj_t *img, const c
 /* ------------------------------------------------------------ search */
 
 static struct {
-	lv_obj_t *scr, *body, *ta, *kb, *recent, *tail;
+	lv_obj_t *scr, *body, *ta, *kb, *recent, *tail, *clear_lbl;
 	char query[128];
 	char cont[1024];
 	int rows;
 	unsigned gen;		/* bumped by each new search: older answers are dropped */
-	bool loading;
-	lv_timer_t *more_timer;
+	bool loading, clear_confirm;
+	lv_timer_t *more_timer, *clear_timer;
 } ys;
 
 static void yt_search_run(const char *q);
@@ -641,6 +864,49 @@ static void yt_recent_cb(lv_event_t *e)
 	yt_search_run(q);
 }
 
+static void yt_search_clear_reset(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	ys.clear_timer = NULL;
+	ys.clear_confirm = false;
+	if (ys.clear_lbl) {
+		lv_obj_set_style_text_color(ys.clear_lbl, M.primary, 0);
+		label_set_if_changed(ys.clear_lbl, "Clear");
+	}
+	bp_changed(ys.scr);
+}
+
+static void yt_search_clear_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	if (!ys.clear_confirm) {
+		ys.clear_confirm = true;
+		if (ys.clear_lbl) {
+			lv_obj_set_style_text_color(ys.clear_lbl, M.error, 0);
+			label_set_if_changed(ys.clear_lbl, "Clear all?");
+		}
+		if (ys.clear_timer) {
+			lv_timer_reset(ys.clear_timer);
+		} else {
+			ys.clear_timer = lv_timer_create(yt_search_clear_reset, 4000, NULL);
+			lv_timer_set_repeat_count(ys.clear_timer, 1);
+		}
+		bp_changed(ys.scr);
+		return;
+	}
+	if (ys.clear_timer) {
+		lv_timer_delete(ys.clear_timer);
+		ys.clear_timer = NULL;
+	}
+	ys.clear_confirm = false;
+	unlink(YT_DIR "/searches");
+	if (ys.recent) {
+		lv_obj_delete(ys.recent);
+		ys.recent = NULL;
+	}
+	bp_changed(ys.scr);
+}
+
 /* Recent searches as rows under the field, before any results. */
 static void yt_recent_rows(lv_obj_t *body)
 {
@@ -648,6 +914,8 @@ static void yt_recent_rows(lv_obj_t *body)
 	char line[160];
 	lv_obj_t *c = NULL;
 
+	ys.clear_confirm = false;
+	ys.clear_lbl = NULL;
 	while (f && fgets(line, sizeof(line), f)) {
 		char *ud;
 		lv_obj_t *r;
@@ -665,6 +933,8 @@ static void yt_recent_rows(lv_obj_t *body)
 			lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
 			ys.recent = c;
 			obj_track(&ys.recent);
+			yt_section_clear(c, "Recent searches", yt_search_clear_cb, &ys.clear_lbl);
+			obj_track(&ys.clear_lbl);
 		}
 		r = m3_row_ex(c, LV_SYMBOL_LOOP, M.surface_c_high, M.on_surface_v, ud, NULL,
 			      yt_recent_cb, ud, NULL, false);
@@ -812,6 +1082,12 @@ static void yt_search_run(const char *qtext)
 	ys.cont[0] = 0;
 	ys.loading = true;
 	yt_kb_show(false);
+	if (ys.clear_timer) {
+		lv_timer_delete(ys.clear_timer);
+		ys.clear_timer = NULL;
+	}
+	ys.clear_confirm = false;
+	ys.clear_lbl = NULL;
 	/* the old list, recent searches and any message go */
 	lv_obj_clean(ys.body);
 	ys.tail = NULL;
@@ -829,6 +1105,8 @@ static void yt_search_deleted(lv_event_t *e)
 	LV_UNUSED(e);
 	if (ys.more_timer)
 		lv_timer_delete(ys.more_timer);
+	if (ys.clear_timer)
+		lv_timer_delete(ys.clear_timer);
 	memset(&ys, 0, sizeof(ys));
 }
 
@@ -899,23 +1177,254 @@ static void yt_reopen_search(lv_event_t *e)
 	yt_open_search(yt_re_query[0] ? yt_re_query : NULL);
 }
 
+/* ------------------------------------------------------------ download */
+
+static struct {
+	pid_t pid;
+	int fd, pidfd;
+	lv_timer_t *poll;
+	char line[1024];
+	size_t llen;
+	struct yt_vid v;
+	bool audio_only;
+	int quality, pct;
+	long long done_b, total_b;
+	char err[256], err_id[16];
+	bool ok, canceled;
+	char out_mode[16];
+	long long out_bytes;
+} ydl = { .fd = -1, .pidfd = -1 };
+
+static void yt_dl_ui_sync(void);
+static void yt_video_after_dl(const char *id);
+static void yt_offline_refresh(void);
+static void yt_home_offline(void);
+static void yt_home_history(void);
+
+bool yt_dl_busy(void)
+{
+	return ydl.pid > 0;
+}
+
+static pid_t yt_dl_active_pid(const char *id)
+{
+	return (ydl.pid > 0 && id && !strcmp(ydl.v.id, id)) ? ydl.pid : 0;
+}
+
+static void yt_dl_cancel(void)
+{
+	if (ydl.pid <= 0)
+		return;
+	ydl.canceled = true;
+	kill(-ydl.pid, SIGTERM);
+}
+
+static void yt_dl_parse_line(char *ln)
+{
+	char *f[6];
+	int n = yt_split(ln, f, 6);
+
+	if (!strcmp(f[0], "I") && n >= 5) {
+		if (f[1][0])
+			snprintf(ydl.v.title, sizeof(ydl.v.title), "%s", f[1]);
+		if (f[2][0])
+			snprintf(ydl.v.chan, sizeof(ydl.v.chan), "%s", f[2]);
+		if (atoi(f[4]) > 0)
+			yt_duration(atoi(f[4]), ydl.v.len, sizeof(ydl.v.len));
+	} else if (!strcmp(f[0], "P") && n >= 4) {
+		ydl.pct = LV_CLAMP(0, atoi(f[1]), 100);
+		ydl.done_b = atoll(f[2]);
+		ydl.total_b = atoll(f[3]);
+		yt_dl_ui_sync();
+	} else if (!strcmp(f[0], "O") && n >= 4) {
+		ydl.ok = true;
+		snprintf(ydl.out_mode, sizeof(ydl.out_mode), "%s", f[2]);
+		ydl.out_bytes = atoll(f[3]);
+	} else if (!strcmp(f[0], "E") && n >= 2) {
+		snprintf(ydl.err, sizeof(ydl.err), "%s", f[1]);
+		snprintf(ydl.err_id, sizeof(ydl.err_id), "%s", ydl.v.id);
+	}
+}
+
+static void yt_dl_drain(bool *eof)
+{
+	char buf[512];
+	ssize_t n;
+
+	if (eof)
+		*eof = false;
+	if (ydl.fd < 0)
+		return;
+	while ((n = read(ydl.fd, buf, sizeof(buf))) > 0) {
+		for (ssize_t i = 0; i < n; i++) {
+			char c = buf[i];
+
+			if (c == '\r')
+				continue;
+			if (c == '\n') {
+				ydl.line[ydl.llen] = 0;
+				if (ydl.llen)
+					yt_dl_parse_line(ydl.line);
+				ydl.llen = 0;
+			} else if (ydl.llen + 1 < sizeof(ydl.line)) {
+				ydl.line[ydl.llen++] = c;
+			}
+		}
+	}
+	if (n == 0 && eof)
+		*eof = true;
+}
+
+static void yt_dl_finish(void)
+{
+	char done_id[16];
+	bool ok = ydl.ok && !ydl.canceled;
+
+	yt_dl_drain(NULL);
+	if (ydl.llen) {
+		ydl.line[ydl.llen] = 0;
+		yt_dl_parse_line(ydl.line);
+		ydl.llen = 0;
+	}
+	if (ydl.fd >= 0) {
+		ui_unwatch(ydl.fd);
+		close(ydl.fd);
+		ydl.fd = -1;
+	}
+	if (ydl.pidfd >= 0) {
+		ui_unwatch(ydl.pidfd);
+		close(ydl.pidfd);
+		ydl.pidfd = -1;
+	}
+	if (ydl.poll) {
+		lv_timer_delete(ydl.poll);
+		ydl.poll = NULL;
+	}
+	ydl.pid = 0;
+	snprintf(done_id, sizeof(done_id), "%s", ydl.v.id);
+	if (ok) {
+		yt_offline_add(&ydl.v, ydl.out_mode, ydl.out_bytes);
+		ydl.err[0] = 0;
+		ydl.err_id[0] = 0;
+	} else {
+		yt_offline_unlink_parts(done_id);
+		if (!ydl.canceled && !ydl.err[0]) {
+			snprintf(ydl.err, sizeof(ydl.err), "Download failed");
+			snprintf(ydl.err_id, sizeof(ydl.err_id), "%s", done_id);
+		}
+	}
+	yt_video_after_dl(done_id);
+	yt_offline_refresh();
+	yt_home_offline();
+	yt_home_history();
+}
+
+static void ydl_ev(int fd)
+{
+	int st;
+
+	if (fd == ydl.fd) {
+		bool eof = false;
+
+		yt_dl_drain(&eof);
+		if (eof)
+			ui_unwatch(ydl.fd);
+		return;
+	}
+	if (fd == ydl.pidfd && ydl.pid > 0 && waitpid(ydl.pid, &st, WNOHANG) == ydl.pid)
+		yt_dl_finish();
+}
+
+static void ydl_poll_cb(lv_timer_t *t)
+{
+	int st;
+
+	LV_UNUSED(t);
+	yt_dl_drain(NULL);
+	if (ydl.pid > 0 && waitpid(ydl.pid, &st, WNOHANG) == ydl.pid)
+		yt_dl_finish();
+}
+
+static void yt_dl_start(const struct yt_vid *v, bool audio_only, int quality)
+{
+	char dir[256], qdir[300], cmd[512];
+	char *argv[] = { "sh", "-c", cmd, NULL };
+	posix_spawn_file_actions_t fa;
+	posix_spawnattr_t at;
+	int p[2];
+	pid_t pid;
+
+	if (ydl.pid > 0 || !yt_id_ok(v->id))
+		return;
+	yt_offline_mkdir(v->id);
+	snprintf(dir, sizeof(dir), YT_OFFLINE_DIR "/%s", v->id);
+	shq(dir, qdir, sizeof(qdir));
+	snprintf(cmd, sizeof(cmd), "exec n72-yt download %s -o %s -q %d%s",
+		 v->id, qdir, quality, audio_only ? " -a" : "");
+	if (pipe(p))
+		return;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, p[1], 1);
+	posix_spawn_file_actions_adddup2(&fa, p[1], 2);
+	posix_spawn_file_actions_addclose(&fa, p[0]);
+	posix_spawn_file_actions_addclose(&fa, p[1]);
+	posix_spawnattr_init(&at);
+	posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP);
+	posix_spawnattr_setpgroup(&at, 0);
+	if (posix_spawn(&pid, "/bin/sh", &fa, &at, argv, environ))
+		pid = -1;
+	posix_spawnattr_destroy(&at);
+	posix_spawn_file_actions_destroy(&fa);
+	close(p[1]);
+	if (pid <= 0) {
+		close(p[0]);
+		return;
+	}
+	fcntl(p[0], F_SETFD, FD_CLOEXEC);
+	fcntl(p[0], F_SETFL, O_NONBLOCK);
+	memset(&ydl, 0, sizeof(ydl));
+	ydl.pid = pid;
+	ydl.fd = p[0];
+	ydl.pidfd = -1;
+	ydl.v = *v;
+	ydl.audio_only = audio_only;
+	ydl.quality = quality;
+	if (nwatch <= NWATCH - 2) {
+		ydl.pidfd = (int)syscall(SYS_pidfd_open, pid, 0);
+		if (ydl.pidfd >= 0) {
+			fcntl(ydl.pidfd, F_SETFD, FD_CLOEXEC);
+			ui_watch(ydl.fd, ydl_ev);
+			ui_watch(ydl.pidfd, ydl_ev);
+		}
+	}
+	if (ydl.pidfd < 0)
+		ydl.poll = lv_timer_create(ydl_poll_cb, 200, NULL);
+	yt_video_after_dl(v->id);
+	yt_offline_refresh();
+	yt_home_offline();
+	yt_dl_ui_sync();
+}
+
 /* ------------------------------------------------------------ video */
 
 #define YT_CMD_MAX	8192
 
 static struct {
 	lv_obj_t *scr, *body, *img, *title, *meta, *play, *listen, *status, *desc, *seg[2];
+	lv_obj_t *off_card, *dl_lbl, *dl_bar, *rm_lbl;
 	struct yt_vid v;
 	char title_full[200];
 	char play_cmd[YT_CMD_MAX], listen_cmd[YT_CMD_MAX];
 	unsigned gen;
 	uint32_t resolved_at;
-	bool ready, desc_more;
+	bool ready, desc_more, offline, offline_has_video, rm_confirm;
 	char *desc_text;
 	int tw, th;		/* the thumbnail's size on this page */
+	lv_timer_t *rm_timer;
 } yv;
 
 static void yt_resolve(void);
+static void yt_video_off_sync(void);
 
 static void yt_btn_enable(lv_obj_t *b, bool on)
 {
@@ -973,6 +1482,88 @@ static void yt_desc_cb(lv_event_t *e)
 	yt_desc_show();
 }
 
+static void yt_video_load_desc(void)
+{
+	char path[256];
+	FILE *f;
+	long sz;
+	char *buf;
+
+	if (yv.desc_text || !yv.desc)
+		return;
+	snprintf(path, sizeof(path), YT_OFFLINE_DIR "/%s/desc.txt", yv.v.id);
+	f = fopen(path, "rb");
+	if (!f)
+		return;
+	fseek(f, 0, SEEK_END);
+	sz = ftell(f);
+	if (sz < 0)
+		sz = 0;
+	if (sz > 4096)
+		sz = 4096;
+	rewind(f);
+	buf = malloc((size_t)sz + 1);
+	if (buf) {
+		size_t got = fread(buf, 1, (size_t)sz, f);
+
+		buf[got] = 0;
+		yv.desc_text = buf[0] ? buf : strdup("No description.");
+		if (yv.desc_text != buf)
+			free(buf);
+		yt_desc_show();
+	}
+	fclose(f);
+}
+
+static bool yt_video_apply_offline(void)
+{
+	struct yt_off off;
+	char ap[256], vp[256], qa[320], qv[320], t[300], sz[32], msg[96];
+
+	if (!yt_offline_find(yv.v.id, &off)) {
+		yv.offline = false;
+		yv.offline_has_video = false;
+		return false;
+	}
+	yv.offline = true;
+	yv.offline_has_video = off.has_video;
+	if (!yv.title_full[0] && off.v.title[0])
+		snprintf(yv.title_full, sizeof(yv.title_full), "%s", off.v.title);
+	if (off.v.title[0] && yv.title)
+		label_set_if_changed(yv.title, off.v.title);
+	if (!yv.v.chan[0] && off.v.chan[0])
+		snprintf(yv.v.chan, sizeof(yv.v.chan), "%s", off.v.chan);
+	if (yv.meta) {
+		char m[128];
+
+		snprintf(m, sizeof(m), "%s%s%s", yv.v.chan,
+			 yv.v.chan[0] && yv.v.len[0] ? "\n" : "", yv.v.len);
+		if (m[0])
+			label_set_if_changed(yv.meta, m);
+	}
+	yt_offline_paths(yv.v.id, ap, sizeof(ap), vp, sizeof(vp));
+	shq(yv.title_full[0] ? yv.title_full : yv.v.title, t, sizeof(t));
+	shq(ap, qa, sizeof(qa));
+	snprintf(yv.listen_cmd, sizeof(yv.listen_cmd), "n72-player --title %s %s", t, qa);
+	if (off.has_video) {
+		shq(vp, qv, sizeof(qv));
+		snprintf(yv.play_cmd, sizeof(yv.play_cmd), "n72-player --title %s --audio %s %s",
+			 t, qa, qv);
+	} else {
+		yv.play_cmd[0] = 0;
+	}
+	yv.ready = true;
+	yv.resolved_at = lv_tick_get();
+	yt_btn_enable(yv.play, off.has_video);
+	yt_btn_enable(yv.listen, true);
+	yt_video_load_desc();
+	yt_size_fmt(off.bytes, sz, sizeof(sz));
+	snprintf(msg, sizeof(msg), "Saved offline (%s" YT_SEP "%s)",
+		 !strcmp(off.mode, "audio") ? "Audio" : off.mode, sz);
+	yt_status(msg, false);
+	return true;
+}
+
 static void yt_resolved(const char *out, void *ud)
 {
 	unsigned gen = (unsigned)(uintptr_t)ud;
@@ -1002,6 +1593,8 @@ static void yt_resolved(const char *out, void *ud)
 				yt_duration(atoi(f[4]), len, sizeof(len));
 			if (f[1][0] && yv.title)
 				label_set_if_changed(yv.title, f[1]);
+			if (f[2][0])
+				snprintf(yv.v.chan, sizeof(yv.v.chan), "%s", f[2]);
 			snprintf(meta, sizeof(meta), "%s%s%s%s%s", f[2], f[2][0] ? "\n" : "",
 				 views, views[0] ? YT_SEP : "", len);
 			if (yv.meta)
@@ -1038,6 +1631,12 @@ static void yt_resolved(const char *out, void *ud)
 	if (title[0])
 		snprintf(yv.title_full, sizeof(yv.title_full), "%s", title);
 	if (!a[0] || err[0]) {
+		if (yv.offline) {
+			yv.ready = true;
+			yt_btn_enable(yv.listen, true);
+			yt_btn_enable(yv.play, yv.offline_has_video);
+			return;
+		}
 		yt_status(err[0] ? err : out[0] ? "This video cannot be played here." :
 			  "The YouTube helper (n72-yt) did not answer.", true);
 		yv.ready = false;
@@ -1059,13 +1658,15 @@ static void yt_resolved(const char *out, void *ud)
 		} else {
 			yv.play_cmd[0] = 0;
 		}
-		snprintf(yv.listen_cmd, sizeof(yv.listen_cmd), "n72-player --title %s %s", t, qa);
+		if (!yv.offline)
+			snprintf(yv.listen_cmd, sizeof(yv.listen_cmd), "n72-player --title %s %s", t, qa);
 	}
 	yv.ready = true;
 	yv.resolved_at = lv_tick_get();
 	yt_btn_enable(yv.play, yv.play_cmd[0] != 0);
 	yt_btn_enable(yv.listen, true);
-	yt_status("", false);
+	if (!yv.offline)
+		yt_status("", false);
 }
 
 static void yt_resolve(void)
@@ -1073,10 +1674,14 @@ static void yt_resolve(void)
 	char cmd[128];
 
 	yv.gen = ++yt_gen;
-	yv.ready = false;
-	yt_btn_enable(yv.play, false);
-	yt_btn_enable(yv.listen, false);
-	yt_status("Getting the video...", false);
+	if (!yv.offline) {
+		yv.ready = false;
+		yt_btn_enable(yv.play, false);
+		yt_btn_enable(yv.listen, false);
+		yt_status("Getting the video...", false);
+	} else {
+		yt_btn_enable(yv.play, yv.offline_has_video);
+	}
 	snprintf(cmd, sizeof(cmd), "n72-yt video %s -q %d", yv.v.id, yt_quality);
 	job_run(cmd, yv.body, yt_resolved, (void *)(uintptr_t)yv.gen);
 }
@@ -1087,19 +1692,22 @@ static void yt_play_pre(lv_event_t *e)
 	struct yt_vid h = yv.v;
 	lv_obj_t *b = lv_event_get_current_target(e);
 
-	LV_UNUSED(b);
 	if (!yv.ready)
 		return;
 	if (yv.title_full[0])
 		snprintf(h.title, sizeof(h.title), "%s", yv.title_full);
 	yt_history_add(&h);
+	if (b == yv.listen)
+		vc_set_audio_meta(yv.v.id, yv.v.chan, h.title);
+	else
+		vc_set_audio_meta(NULL, NULL, NULL);
 }
 
 static void yt_video_shown(lv_event_t *e)
 {
 	LV_UNUSED(e);
 	/* back on the page after a long while: the addresses may have expired */
-	if (yv.ready && lv_tick_elaps(yv.resolved_at) > YT_STALE_MS)
+	if (!yv.offline_has_video && yv.ready && lv_tick_elaps(yv.resolved_at) > YT_STALE_MS)
 		yt_resolve();
 }
 
@@ -1118,8 +1726,10 @@ static void yt_seg_cb(lv_event_t *e)
 		lv_obj_set_style_text_color(lv_obj_get_child(yv.seg[i], 0),
 					    on ? M.on_secondary_c : M.on_surface, 0);
 	}
+	yt_video_off_sync();
 	bp_changed(yv.scr);
-	yt_resolve();
+	if (!yv.offline_has_video)
+		yt_resolve();
 }
 
 /* An M3 segmented button: 360p | 240p. */
@@ -1163,6 +1773,8 @@ static lv_obj_t *yt_quality_seg(lv_obj_t *parent)
 static void yt_video_deleted(lv_event_t *e)
 {
 	LV_UNUSED(e);
+	if (yv.rm_timer)
+		lv_timer_delete(yv.rm_timer);
 	free(yv.desc_text);
 	memset(&yv, 0, sizeof(yv));
 }
@@ -1215,6 +1827,193 @@ static void yt_reopen_video(lv_event_t *e)
 	yt_open_video(&yt_re_vid);
 }
 
+static void yt_dl_video_cb(lv_event_t *e)
+{
+	struct yt_vid v = yv.v;
+
+	LV_UNUSED(e);
+	if (yv.title_full[0])
+		snprintf(v.title, sizeof(v.title), "%s", yv.title_full);
+	yt_dl_start(&v, false, yt_quality);
+}
+
+static void yt_dl_audio_cb(lv_event_t *e)
+{
+	struct yt_vid v = yv.v;
+
+	LV_UNUSED(e);
+	if (yv.title_full[0])
+		snprintf(v.title, sizeof(v.title), "%s", yv.title_full);
+	yt_dl_start(&v, true, yt_quality);
+}
+
+static void yt_dl_cancel_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	yt_dl_cancel();
+}
+
+static void yt_video_rm_reset(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	yv.rm_timer = NULL;
+	yv.rm_confirm = false;
+	if (yv.rm_lbl) {
+		lv_obj_set_style_text_color(yv.rm_lbl, M.on_secondary_c, 0);
+		label_set_if_changed(yv.rm_lbl, LV_SYMBOL_TRASH "  Remove");
+	}
+	bp_changed(yv.scr);
+}
+
+static void yt_video_rm_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	if (!yv.rm_confirm) {
+		yv.rm_confirm = true;
+		if (yv.rm_lbl) {
+			lv_obj_set_style_text_color(yv.rm_lbl, M.error, 0);
+			label_set_if_changed(yv.rm_lbl, "Remove?");
+		}
+		if (yv.rm_timer) {
+			lv_timer_reset(yv.rm_timer);
+		} else {
+			yv.rm_timer = lv_timer_create(yt_video_rm_reset, 4000, NULL);
+			lv_timer_set_repeat_count(yv.rm_timer, 1);
+		}
+		bp_changed(yv.scr);
+		return;
+	}
+	if (yv.rm_timer) {
+		lv_timer_delete(yv.rm_timer);
+		yv.rm_timer = NULL;
+	}
+	yv.rm_confirm = false;
+	yt_offline_remove(yv.v.id);
+	yv.offline = false;
+	yv.offline_has_video = false;
+	yv.play_cmd[0] = 0;
+	yv.listen_cmd[0] = 0;
+	yt_video_off_sync();
+	yt_resolve();
+}
+
+static void yt_dl_fmt_prog(char *out, size_t len)
+{
+	char d[24], t[24];
+	char mode[16];
+
+	if (ydl.audio_only)
+		snprintf(mode, sizeof(mode), "audio");
+	else
+		snprintf(mode, sizeof(mode), "%dp", ydl.quality);
+	if (ydl.total_b > 0) {
+		yt_size_fmt(ydl.done_b, d, sizeof(d));
+		yt_size_fmt(ydl.total_b, t, sizeof(t));
+		snprintf(out, len, "Downloading %s... %d%% (%s / %s)", mode, ydl.pct, d, t);
+	} else {
+		snprintf(out, len, "Starting %s download...", mode);
+	}
+}
+
+static lv_obj_t *yt_off_btn(lv_obj_t *parent, const char *txt, bool filled, lv_event_cb_t cb)
+{
+	lv_obj_t *b = m3_button(parent, txt, filled, cb, NULL);
+
+	lv_obj_set_height(b, 42);
+	lv_obj_set_flex_grow(b, 1);
+	lv_obj_set_style_pad_hor(b, 8, 0);
+	lv_obj_set_style_text_font(lv_obj_get_child(b, 0), &lv_font_montserrat_14, 0);
+	return b;
+}
+
+static lv_obj_t *yt_dl_bar_make(lv_obj_t *parent, int pct)
+{
+	lv_obj_t *bar = lv_bar_create(parent);
+
+	lv_obj_set_size(bar, lv_pct(100), 8);
+	lv_bar_set_range(bar, 0, 100);
+	lv_bar_set_value(bar, pct, LV_ANIM_OFF);
+	lv_obj_set_style_radius(bar, 4, LV_PART_MAIN);
+	lv_obj_set_style_bg_color(bar, M.surface_c_highest, LV_PART_MAIN);
+	lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+	lv_obj_set_style_radius(bar, 4, LV_PART_INDICATOR);
+	lv_obj_set_style_bg_color(bar, M.primary, LV_PART_INDICATOR);
+	lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
+	return bar;
+}
+
+static void yt_video_off_sync(void)
+{
+	struct yt_off off;
+	lv_obj_t *row, *b;
+	char buf[96], sz[24];
+
+	if (!yv.off_card)
+		return;
+	if (yv.rm_timer) {
+		lv_timer_delete(yv.rm_timer);
+		yv.rm_timer = NULL;
+	}
+	yv.rm_confirm = false;
+	yv.dl_lbl = NULL;
+	yv.dl_bar = NULL;
+	yv.rm_lbl = NULL;
+	lv_obj_clean(yv.off_card);
+	lv_obj_set_flex_flow(yv.off_card, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_pad_row(yv.off_card, 10, 0);
+
+	if (ydl.pid > 0 && !strcmp(ydl.v.id, yv.v.id)) {
+		yt_dl_fmt_prog(buf, sizeof(buf));
+		yv.dl_lbl = m3_label(yv.off_card, buf, &lv_font_montserrat_14, M.on_surface);
+		obj_track(&yv.dl_lbl);
+		lv_obj_set_width(yv.dl_lbl, lv_pct(100));
+		yv.dl_bar = yt_dl_bar_make(yv.off_card, ydl.pct);
+		obj_track(&yv.dl_bar);
+		b = m3_button(yv.off_card, "Cancel", false, yt_dl_cancel_cb, NULL);
+		lv_obj_set_height(b, 40);
+	} else if (ydl.pid > 0) {
+		snprintf(buf, sizeof(buf), "Another download is running (%d%%)...", ydl.pct);
+		yv.dl_lbl = m3_label(yv.off_card, buf, &lv_font_montserrat_14, M.on_surface_v);
+		obj_track(&yv.dl_lbl);
+		lv_obj_set_width(yv.dl_lbl, lv_pct(100));
+	} else if (yt_offline_find(yv.v.id, &off)) {
+		yt_size_fmt(off.bytes, sz, sizeof(sz));
+		snprintf(buf, sizeof(buf), "Saved offline" YT_SEP "%s" YT_SEP "%s",
+			 !strcmp(off.mode, "audio") ? "Audio" : off.mode, sz);
+		m3_label(yv.off_card, buf, &lv_font_montserrat_14, M.on_surface);
+		row = yt_box(yv.off_card, LV_FLEX_FLOW_ROW, 8);
+		lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+		if (!off.has_video) {
+			snprintf(buf, sizeof(buf), LV_SYMBOL_DOWNLOAD "  Save %dp", yt_quality);
+			yt_off_btn(row, buf, false, yt_dl_video_cb);
+		}
+		b = yt_off_btn(row, LV_SYMBOL_TRASH "  Remove", false, yt_video_rm_cb);
+		yv.rm_lbl = lv_obj_get_child(b, 0);
+		obj_track(&yv.rm_lbl);
+	} else {
+		row = yt_box(yv.off_card, LV_FLEX_FLOW_ROW, 8);
+		lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+		snprintf(buf, sizeof(buf), LV_SYMBOL_DOWNLOAD "  Save %dp", yt_quality);
+		yt_off_btn(row, buf, false, yt_dl_video_cb);
+		yt_off_btn(row, LV_SYMBOL_AUDIO "  Save audio", false, yt_dl_audio_cb);
+		if (ydl.err[0] && !strcmp(ydl.err_id, yv.v.id)) {
+			lv_obj_t *el = m3_label(yv.off_card, ydl.err, &lv_font_montserrat_12, M.error);
+
+			lv_obj_set_width(el, lv_pct(100));
+			lv_label_set_long_mode(el, LV_LABEL_LONG_WRAP);
+		}
+	}
+	bp_changed(yv.scr);
+}
+
+static void yt_video_after_dl(const char *id)
+{
+	if (!yv.scr || !id || strcmp(yv.v.id, id))
+		return;
+	yt_video_apply_offline();
+	yt_video_off_sync();
+}
+
 static void yt_open_video(const struct yt_vid *v)
 {
 	lv_obj_t *c, *row, *side;
@@ -1226,6 +2025,7 @@ static void yt_open_video(const struct yt_vid *v)
 	if (v != &yt_re_vid)
 		yt_re_vid = *v;
 	yv.v = *v;
+	snprintf(yv.title_full, sizeof(yv.title_full), "%s", v->title);
 	yv.body = m3_page("", &yv.scr);
 	obj_track(&yv.scr);
 	obj_track(&yv.body);
@@ -1297,6 +2097,11 @@ static void yt_open_video(const struct yt_vid *v)
 	m3_section(yv.body, "Quality");
 	yt_quality_seg(yv.body);
 
+	m3_section(yv.body, "Offline");
+	yv.off_card = m3_card(yv.body, M.surface_c);
+	obj_track(&yv.off_card);
+	yt_video_off_sync();
+
 	m3_section(yv.body, "Description");
 	c = m3_card(yv.body, M.surface_c);
 	lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
@@ -1307,17 +2112,353 @@ static void yt_open_video(const struct yt_vid *v)
 	lv_label_set_long_mode(yv.desc, LV_LABEL_LONG_WRAP);
 
 	push(yv.scr);
-	yt_resolve();
+	if (yt_video_apply_offline()) {
+		if (!yv.offline_has_video)
+			yt_resolve();
+	} else {
+		yt_resolve();
+	}
+}
+
+/* ------------------------------------------------------------ offline */
+
+static int yt_off_filter;	/* 0 All, 1 Video, 2 Audio (kept across turns) */
+
+static struct {
+	lv_obj_t *scr, *body, *summary, *seg[3];
+	lv_obj_t *dl_card, *dl_lbl, *dl_bar;
+	lv_obj_t *rows[YT_OFF_SHOWN + 1];
+	int nrows;
+	long mtime;
+	lv_obj_t *del_btn, *del_lbl;
+	char del_id[16];
+	lv_timer_t *del_timer;
+} yo;
+
+static void yt_off_del_reset(void)
+{
+	if (yo.del_btn)
+		lv_obj_set_style_bg_opa(yo.del_btn, LV_OPA_TRANSP, 0);
+	if (yo.del_lbl)
+		lv_obj_set_style_text_color(yo.del_lbl, M.on_surface_v, 0);
+	yo.del_btn = NULL;
+	yo.del_lbl = NULL;
+	yo.del_id[0] = 0;
+}
+
+static void yt_off_del_timer_cb(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	yo.del_timer = NULL;
+	yt_off_del_reset();
+	bp_changed(yo.scr);
+}
+
+static void yt_off_del_cb(lv_event_t *e)
+{
+	const char *id = lv_event_get_user_data(e);
+	lv_obj_t *btn = lv_event_get_current_target(e);
+	lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+
+	if (!id || !yt_id_ok(id))
+		return;
+	if (strcmp(yo.del_id, id)) {
+		yt_off_del_reset();
+		snprintf(yo.del_id, sizeof(yo.del_id), "%s", id);
+		yo.del_btn = btn;
+		yo.del_lbl = lbl;
+		obj_track(&yo.del_btn);
+		obj_track(&yo.del_lbl);
+		lv_obj_set_style_bg_color(btn, M.error, 0);
+		lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+		if (lbl)
+			lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+		if (yo.del_timer) {
+			lv_timer_reset(yo.del_timer);
+		} else {
+			yo.del_timer = lv_timer_create(yt_off_del_timer_cb, 4000, NULL);
+			lv_timer_set_repeat_count(yo.del_timer, 1);
+		}
+		bp_changed(yo.scr);
+		return;
+	}
+	if (yo.del_timer) {
+		lv_timer_delete(yo.del_timer);
+		yo.del_timer = NULL;
+	}
+	yt_off_del_reset();
+	yt_offline_remove(id);
+	yt_offline_refresh();
+	yt_home_offline();
+	yt_home_history();
+}
+
+static lv_obj_t *yt_off_row(lv_obj_t *parent, const struct yt_off *o, lv_obj_t **img_out)
+{
+	char sub2[64], sz[24];
+	lv_obj_t *r, *del, *lbl;
+	char *did;
+
+	yt_size_fmt(o->bytes, sz, sizeof(sz));
+	snprintf(sub2, sizeof(sub2), "%s" YT_SEP "%s",
+		 !strcmp(o->mode, "audio") ? "Audio" : o->mode, sz);
+	r = yt_row_meta(parent, &o->v, sub2, img_out);
+	lv_obj_set_flex_align(r, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	del = lv_button_create(r);
+	plain(del);
+	lv_obj_set_size(del, 36, 36);
+	lv_obj_set_style_radius(del, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_bg_color(del, M.error, 0);
+	lv_obj_set_style_bg_opa(del, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_bg_color(del, M.on_surface, LV_STATE_PRESSED);
+	lv_obj_set_style_bg_opa(del, LV_OPA_10, LV_STATE_PRESSED);
+	lv_obj_set_ext_click_area(del, 6);
+	lbl = m3_label(del, LV_SYMBOL_TRASH, &lv_font_montserrat_16, M.on_surface_v);
+	lv_obj_center(lbl);
+	did = strdup(o->v.id);
+	if (did) {
+		lv_obj_add_event_cb(del, yt_off_del_cb, LV_EVENT_CLICKED, did);
+		lv_obj_add_event_cb(del, yt_free_ud, LV_EVENT_DELETE, did);
+	}
+	return r;
+}
+
+static lv_obj_t *yt_dl_card_make(lv_obj_t *parent, lv_obj_t **lbl_out, lv_obj_t **bar_out)
+{
+	lv_obj_t *c = m3_card(parent, M.surface_c), *top, *btn, *lbl, *bar;
+	char ptxt[96];
+
+	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_pad_row(c, 8, 0);
+	top = yt_box(c, LV_FLEX_FLOW_ROW, 8);
+	lv_obj_set_size(top, lv_pct(100), LV_SIZE_CONTENT);
+	lv_obj_set_flex_align(top, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	yt_dl_fmt_prog(ptxt, sizeof(ptxt));
+	lbl = m3_label(top, ptxt, &lv_font_montserrat_14, M.on_surface);
+	lv_obj_set_flex_grow(lbl, 1);
+	lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
+	btn = lv_button_create(top);
+	plain(btn);
+	lv_obj_set_size(btn, 32, 32);
+	lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_bg_color(btn, M.on_surface, LV_STATE_PRESSED);
+	lv_obj_set_style_bg_opa(btn, LV_OPA_10, LV_STATE_PRESSED);
+	lv_obj_center(m3_label(btn, LV_SYMBOL_CLOSE, &lv_font_montserrat_14, M.on_surface_v));
+	lv_obj_add_event_cb(btn, yt_dl_cancel_cb, LV_EVENT_CLICKED, NULL);
+	bar = yt_dl_bar_make(c, ydl.pct);
+	if (lbl_out)
+		*lbl_out = lbl;
+	if (bar_out)
+		*bar_out = bar;
+	return c;
+}
+
+static void yt_off_seg_cb(lv_event_t *e)
+{
+	int f = (int)(intptr_t)lv_event_get_user_data(e);
+
+	if (f == yt_off_filter)
+		return;
+	yt_off_filter = f;
+	for (int i = 0; i < 3; i++) {
+		bool on = i == f;
+
+		lv_obj_set_style_bg_color(yo.seg[i], on ? M.secondary_c : M.surface, 0);
+		lv_obj_set_style_text_color(lv_obj_get_child(yo.seg[i], 0),
+					    on ? M.on_secondary_c : M.on_surface, 0);
+	}
+	yt_offline_refresh();
+}
+
+static lv_obj_t *yt_off_seg(lv_obj_t *parent)
+{
+	static const char *const names[3] = { "All", "Video", "Audio" };
+	lv_obj_t *row = lv_obj_create(parent);
+
+	plain(row);
+	lv_obj_set_size(row, lv_pct(100), 40);
+	lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_pad_column(row, 0, 0);
+	lv_obj_set_style_radius(row, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_border_width(row, 1, 0);
+	lv_obj_set_style_border_color(row, M.outline, 0);
+	lv_obj_set_style_pad_all(row, 3, 0);
+	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+	for (int i = 0; i < 3; i++) {
+		bool on = i == yt_off_filter;
+		lv_obj_t *b = lv_obj_create(row), *l;
+
+		plain(b);
+		lv_obj_set_height(b, lv_pct(100));
+		lv_obj_set_flex_grow(b, 1);
+		lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
+		lv_obj_set_style_bg_color(b, on ? M.secondary_c : M.surface, 0);
+		lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+		lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+		l = m3_label(b, names[i], &lv_font_montserrat_14,
+			     on ? M.on_secondary_c : M.on_surface);
+		lv_obj_center(l);
+		lv_obj_add_event_cb(b, yt_off_seg_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+		yo.seg[i] = b;
+		obj_track(&yo.seg[i]);
+	}
+	return row;
+}
+
+static long yt_mtime(const char *path);
+
+static void yt_offline_refresh(void)
+{
+	FILE *f;
+	char line[512], sum[96], sz[24], freesz[24] = "";
+	struct yt_off items[YT_OFF_SHOWN];
+	struct statvfs sv;
+	long long total_b = 0;
+	int n = 0, shown = 0;
+
+	if (!yo.body)
+		return;
+	if (yo.del_timer) {
+		lv_timer_delete(yo.del_timer);
+		yo.del_timer = NULL;
+	}
+	yt_off_del_reset();
+	if (yo.dl_card)
+		lv_obj_delete(yo.dl_card);
+	yo.dl_card = NULL;
+	yo.dl_lbl = NULL;
+	yo.dl_bar = NULL;
+	for (int i = 0; i < yo.nrows; i++)
+		if (yo.rows[i])
+			lv_obj_delete(yo.rows[i]);
+	yo.nrows = 0;
+	yo.mtime = yt_mtime(YT_OFFLINE_IDX);
+
+	f = fopen(YT_OFFLINE_IDX, "r");
+	while (f && n < YT_OFF_SHOWN && fgets(line, sizeof(line), f)) {
+		if (yt_offline_parse(line, &items[n])) {
+			total_b += items[n].bytes;
+			n++;
+		}
+	}
+	if (f)
+		fclose(f);
+
+	if (!statvfs(YT_OFFLINE_DIR, &sv) || !statvfs("/root", &sv)) {
+		yt_size_fmt((long long)sv.f_bavail * sv.f_frsize, freesz, sizeof(freesz));
+	}
+	if (n > 0) {
+		yt_size_fmt(total_b, sz, sizeof(sz));
+		if (freesz[0])
+			snprintf(sum, sizeof(sum), "%d saved" YT_SEP "%s" YT_SEP "%s free",
+				 n, sz, freesz);
+		else
+			snprintf(sum, sizeof(sum), "%d saved" YT_SEP "%s", n, sz);
+	} else if (freesz[0]) {
+		snprintf(sum, sizeof(sum), "No saved items" YT_SEP "%s free", freesz);
+	} else {
+		snprintf(sum, sizeof(sum), "No saved items");
+	}
+	if (yo.summary)
+		label_set_if_changed(yo.summary, sum);
+
+	if (ydl.pid > 0) {
+		yo.dl_card = yt_dl_card_make(yo.body, &yo.dl_lbl, &yo.dl_bar);
+		obj_track(&yo.dl_card);
+		obj_track(&yo.dl_lbl);
+		obj_track(&yo.dl_bar);
+	}
+
+	for (int i = 0; i < n; i++) {
+		lv_obj_t *row, *img;
+
+		if (yt_off_filter == 1 && !items[i].has_video)
+			continue;
+		if (yt_off_filter == 2 && items[i].has_video)
+			continue;
+		row = yt_off_row(yo.body, &items[i], &img);
+		yo.rows[yo.nrows] = row;
+		obj_track(&yo.rows[yo.nrows++]);
+		yt_thumbs_want(yo.body, row, img, items[i].v.id);
+		shown++;
+	}
+
+	if (!shown && ydl.pid <= 0) {
+		const char *icon = n == 0 ? LV_SYMBOL_DOWNLOAD :
+				   yt_off_filter == 1 ? LV_SYMBOL_VIDEO : LV_SYMBOL_AUDIO;
+		const char *head = n == 0 ? "Nothing saved offline" :
+				   yt_off_filter == 1 ? "No saved videos" :
+				   "No audio-only downloads";
+		const char *msg = n == 0 ? "Open any video and tap Save to watch or listen without Wi-Fi." :
+				  yt_off_filter == 1 ? "Download a video in 240p or 360p to watch offline." :
+				  "Tap Save audio on a video to listen offline.";
+
+		yo.rows[0] = yt_state(yo.body, icon, head, msg, NULL, NULL);
+		obj_track(&yo.rows[yo.nrows++]);
+	}
+	bp_changed(yo.scr);
+	yt_thumbs_fetch();
+}
+
+static void yt_offline_shown(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	if (yt_mtime(YT_OFFLINE_IDX) != yo.mtime || (ydl.pid > 0) != (yo.dl_bar != NULL))
+		yt_offline_refresh();
+}
+
+static void yt_offline_deleted(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	if (yo.del_timer)
+		lv_timer_delete(yo.del_timer);
+	memset(&yo, 0, sizeof(yo));
+}
+
+static void yt_open_offline_cb(lv_event_t *e);
+
+static void yt_open_offline(void)
+{
+	if (yo.scr)
+		return;
+	nav_mark(yt_open_offline_cb, NULL);
+	yo.body = m3_page("Offline", &yo.scr);
+	obj_track(&yo.scr);
+	obj_track(&yo.body);
+	lv_obj_add_event_cb(yo.scr, yt_offline_deleted, LV_EVENT_DELETE, NULL);
+	lv_obj_add_event_cb(yo.scr, yt_offline_shown, LV_EVENT_SCREEN_LOADED, NULL);
+
+	yo.summary = m3_label(yo.body, "", &lv_font_montserrat_14, M.on_surface_v);
+	obj_track(&yo.summary);
+	lv_obj_set_width(yo.summary, lv_pct(100));
+	lv_obj_set_style_pad_left(yo.summary, 8, 0);
+
+	yt_off_seg(yo.body);
+	yt_offline_refresh();
+	push(yo.scr);
+}
+
+static void yt_open_offline_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	yt_open_offline();
 }
 
 /* ------------------------------------------------------------ home */
 
 static struct {
-	lv_obj_t *scr, *body, *chips;
+	lv_obj_t *scr, *body, *chips, *hist_clear_lbl, *chips_clear_lbl;
+	lv_obj_t *off_card, *off_sub;
 	long chips_mtime;
+	long off_mtime;
+	bool off_dl_shown;
 	lv_obj_t *hist[YT_HIST_SHOWN + 1];	/* its section title and rows, on the body */
 	int nhist;
 	long hist_mtime;
+	bool hist_confirm, chips_confirm;
+	lv_timer_t *confirm_timer;
 } yh;
 
 static void yt_bar_cb(lv_event_t *e)
@@ -1369,16 +2510,85 @@ static long yt_mtime(const char *path)
 
 #define yt_hist_mtime()	yt_mtime(YT_DIR "/history")
 
+static void yt_home_chips(void);
+static void yt_home_history(void);
+
+static void yt_home_confirm_reset(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	yh.confirm_timer = NULL;
+	yh.hist_confirm = false;
+	yh.chips_confirm = false;
+	if (yh.hist_clear_lbl) {
+		lv_obj_set_style_text_color(yh.hist_clear_lbl, M.primary, 0);
+		label_set_if_changed(yh.hist_clear_lbl, "Clear");
+	}
+	if (yh.chips_clear_lbl) {
+		lv_obj_set_style_text_color(yh.chips_clear_lbl, M.primary, 0);
+		label_set_if_changed(yh.chips_clear_lbl, "Clear");
+	}
+	bp_changed(yh.scr);
+}
+
+static void yt_home_confirm_arm(void)
+{
+	if (yh.confirm_timer) {
+		lv_timer_reset(yh.confirm_timer);
+	} else {
+		yh.confirm_timer = lv_timer_create(yt_home_confirm_reset, 4000, NULL);
+		lv_timer_set_repeat_count(yh.confirm_timer, 1);
+	}
+}
+
+static void yt_clear_searches_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	if (!yh.chips_confirm) {
+		yh.chips_confirm = true;
+		if (yh.chips_clear_lbl) {
+			lv_obj_set_style_text_color(yh.chips_clear_lbl, M.error, 0);
+			label_set_if_changed(yh.chips_clear_lbl, "Clear all?");
+		}
+		yt_home_confirm_arm();
+		bp_changed(yh.scr);
+		return;
+	}
+	yh.chips_confirm = false;
+	unlink(YT_DIR "/searches");
+	yt_home_chips();
+}
+
+static void yt_clear_hist_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	if (!yh.hist_confirm) {
+		yh.hist_confirm = true;
+		if (yh.hist_clear_lbl) {
+			lv_obj_set_style_text_color(yh.hist_clear_lbl, M.error, 0);
+			label_set_if_changed(yh.hist_clear_lbl, "Clear all?");
+		}
+		yt_home_confirm_arm();
+		bp_changed(yh.scr);
+		return;
+	}
+	yh.hist_confirm = false;
+	unlink(YT_DIR "/history");
+	yt_home_history();
+}
+
 /* Recent searches as chips, under the search bar (rebuilt when they change). */
 static void yt_home_chips(void)
 {
 	FILE *f;
 	char line[160];
+	lv_obj_t *wrap = NULL;
 	int n = 0;
 
 	if (yh.chips)
 		lv_obj_delete(yh.chips);
 	yh.chips = NULL;
+	yh.chips_confirm = false;
+	yh.chips_clear_lbl = NULL;
 	yh.chips_mtime = yt_mtime(YT_DIR "/searches");
 	f = fopen(YT_DIR "/searches", "r");
 	while (f && n < 6 && fgets(line, sizeof(line), f)) {
@@ -1392,19 +2602,124 @@ static void yt_home_chips(void)
 			plain(yh.chips);
 			lv_obj_remove_style_all(yh.chips);
 			lv_obj_set_size(yh.chips, lv_pct(100), LV_SIZE_CONTENT);
-			lv_obj_set_flex_flow(yh.chips, LV_FLEX_FLOW_ROW_WRAP);
-			lv_obj_set_style_pad_column(yh.chips, 8, 0);
-			lv_obj_set_style_pad_row(yh.chips, 8, 0);
+			lv_obj_set_flex_flow(yh.chips, LV_FLEX_FLOW_COLUMN);
+			lv_obj_set_style_pad_row(yh.chips, 6, 0);
 			lv_obj_remove_flag(yh.chips, LV_OBJ_FLAG_SCROLLABLE);
-			lv_obj_move_to_index(yh.chips, 1);	/* right under the search bar */
+			lv_obj_move_to_index(yh.chips, yh.off_card ? 2 : 1);
 			obj_track(&yh.chips);
+			yt_section_clear(yh.chips, "Recent searches", yt_clear_searches_cb,
+					 &yh.chips_clear_lbl);
+			obj_track(&yh.chips_clear_lbl);
+			wrap = lv_obj_create(yh.chips);
+			plain(wrap);
+			lv_obj_remove_style_all(wrap);
+			lv_obj_set_size(wrap, lv_pct(100), LV_SIZE_CONTENT);
+			lv_obj_set_flex_flow(wrap, LV_FLEX_FLOW_ROW_WRAP);
+			lv_obj_set_style_pad_column(wrap, 8, 0);
+			lv_obj_set_style_pad_row(wrap, 8, 0);
+			lv_obj_remove_flag(wrap, LV_OBJ_FLAG_SCROLLABLE);
 		}
-		lv_obj_add_event_cb(yt_chip(yh.chips, ud, yt_chip_cb, ud), yt_free_ud,
+		lv_obj_add_event_cb(yt_chip(wrap, ud, yt_chip_cb, ud), yt_free_ud,
 				    LV_EVENT_DELETE, ud);
 		n++;
 	}
 	if (f)
 		fclose(f);
+	bp_changed(yh.scr);
+}
+
+static void yt_dl_ui_sync(void)
+{
+	char buf[96];
+
+	if (ydl.pid <= 0)
+		return;
+	yt_dl_fmt_prog(buf, sizeof(buf));
+	if (yv.scr && yv.dl_lbl) {
+		if (!strcmp(yv.v.id, ydl.v.id)) {
+			label_set_if_changed(yv.dl_lbl, buf);
+			if (yv.dl_bar)
+				lv_bar_set_value(yv.dl_bar, ydl.pct, LV_ANIM_OFF);
+		} else {
+			char obuf[64];
+
+			snprintf(obuf, sizeof(obuf), "Another download is running (%d%%)...",
+				 ydl.pct);
+			label_set_if_changed(yv.dl_lbl, obuf);
+		}
+		bp_changed(yv.scr);
+	}
+	if (yo.scr && yo.dl_lbl) {
+		label_set_if_changed(yo.dl_lbl, buf);
+		if (yo.dl_bar)
+			lv_bar_set_value(yo.dl_bar, ydl.pct, LV_ANIM_OFF);
+		bp_changed(yo.scr);
+	}
+	if (yh.scr && yh.off_sub) {
+		label_set_if_changed(yh.off_sub, buf);
+		bp_changed(yh.scr);
+	}
+}
+
+static void yt_home_offline(void)
+{
+	FILE *f;
+	char line[512], sub[96], cnt[48], sz[24];
+	struct yt_off tmp;
+	long long total_b = 0;
+	int n_vid = 0, n_aud = 0;
+
+	if (!yh.body)
+		return;
+	if (yh.off_card)
+		lv_obj_delete(yh.off_card);
+	yh.off_card = NULL;
+	yh.off_sub = NULL;
+	yh.off_mtime = yt_mtime(YT_OFFLINE_IDX);
+	yh.off_dl_shown = ydl.pid > 0;
+
+	f = fopen(YT_OFFLINE_IDX, "r");
+	while (f && fgets(line, sizeof(line), f)) {
+		if (!yt_offline_parse(line, &tmp))
+			continue;
+		if (tmp.has_video)
+			n_vid++;
+		else
+			n_aud++;
+		total_b += tmp.bytes;
+	}
+	if (f)
+		fclose(f);
+
+	if (n_vid + n_aud == 0 && ydl.pid <= 0 && wifi_up) {
+		bp_changed(yh.scr);
+		return;
+	}
+
+	if (ydl.pid > 0) {
+		yt_dl_fmt_prog(sub, sizeof(sub));
+	} else if (n_vid + n_aud > 0) {
+		yt_size_fmt(total_b, sz, sizeof(sz));
+		if (n_vid && n_aud)
+			snprintf(cnt, sizeof(cnt), "%d video%s, %d audio",
+				 n_vid, n_vid == 1 ? "" : "s", n_aud);
+		else if (n_vid)
+			snprintf(cnt, sizeof(cnt), "%d video%s", n_vid, n_vid == 1 ? "" : "s");
+		else
+			snprintf(cnt, sizeof(cnt), "%d audio", n_aud);
+		snprintf(sub, sizeof(sub), "%s%s" YT_SEP "%s",
+			 !wifi_up ? "No Wi-Fi" YT_SEP : "", cnt, sz);
+	} else {
+		snprintf(sub, sizeof(sub), "No Wi-Fi" YT_SEP "Nothing saved yet");
+	}
+
+	yh.off_card = m3_card(yh.body, M.surface_c);
+	lv_obj_set_style_pad_all(yh.off_card, 4, 0);
+	lv_obj_move_to_index(yh.off_card, 1);
+	obj_track(&yh.off_card);
+	m3_row_ex(yh.off_card, LV_SYMBOL_DOWNLOAD, M.primary_c, M.on_primary_c,
+		  "Offline", sub, yt_open_offline_cb, NULL, &yh.off_sub, true);
+	obj_track(&yh.off_sub);
 	bp_changed(yh.scr);
 }
 
@@ -1425,6 +2740,8 @@ static void yt_home_history(void)
 		if (yh.hist[i])
 			lv_obj_delete(yh.hist[i]);	/* (its tracker clears the slot) */
 	yh.nhist = 0;
+	yh.hist_confirm = false;
+	yh.hist_clear_lbl = NULL;
 	yh.hist_mtime = yt_hist_mtime();
 	f = fopen(YT_DIR "/history", "r");
 	while (f && n < YT_HIST_SHOWN && fgets(line, sizeof(line), f)) {
@@ -1444,8 +2761,9 @@ static void yt_home_history(void)
 		snprintf(v.len, sizeof(v.len), "%s", k > 3 ? fl[3] : "");
 		snprintf(v.meta, sizeof(v.meta), "%s", k > 4 ? fl[4] : "");
 		if (!yh.nhist) {
-			m3_section(yh.body, "Watched");
-			yh.hist[yh.nhist] = lv_obj_get_child(yh.body, -1);
+			yh.hist[yh.nhist] = yt_section_clear(yh.body, "Watched",
+							     yt_clear_hist_cb, &yh.hist_clear_lbl);
+			obj_track(&yh.hist_clear_lbl);
 			obj_track(&yh.hist[yh.nhist++]);
 		}
 		row = yt_row(yh.body, &v, &img);
@@ -1456,7 +2774,7 @@ static void yt_home_history(void)
 	}
 	if (f)
 		fclose(f);
-	if (!yh.nhist) {
+	if (!yh.nhist && !yh.off_card) {
 		yh.hist[0] = yt_state(yh.body, LV_SYMBOL_VIDEO, "Find something to watch",
 				      "Search above. Videos play in 360p with sound on the "
 				      "speaker, earphones or Bluetooth.", NULL, NULL);
@@ -1469,9 +2787,11 @@ static void yt_home_history(void)
 static void yt_home_shown(lv_event_t *e)
 {
 	LV_UNUSED(e);
-	/* searched or watched while away: those parts again */
+	/* searched, downloaded, or watched while away: those parts again */
 	if (yt_mtime(YT_DIR "/searches") != yh.chips_mtime)
 		yt_home_chips();
+	if (yt_mtime(YT_OFFLINE_IDX) != yh.off_mtime || (ydl.pid > 0) != yh.off_dl_shown)
+		yt_home_offline();
 	if (yt_hist_mtime() != yh.hist_mtime)
 		yt_home_history();
 }
@@ -1479,12 +2799,14 @@ static void yt_home_shown(lv_event_t *e)
 static void yt_home_deleted(lv_event_t *e)
 {
 	LV_UNUSED(e);
+	if (yh.confirm_timer)
+		lv_timer_delete(yh.confirm_timer);
 	memset(&yh, 0, sizeof(yh));
 }
 
 static void open_youtube(lv_event_t *e)
 {
-	lv_obj_t *bar;
+	lv_obj_t *bar, *top, *btn;
 
 	LV_UNUSED(e);
 	if (yh.scr)
@@ -1496,6 +2818,18 @@ static void open_youtube(lv_event_t *e)
 	obj_track(&yh.body);
 	lv_obj_add_event_cb(yh.scr, yt_home_deleted, LV_EVENT_DELETE, NULL);
 	lv_obj_add_event_cb(yh.scr, yt_home_shown, LV_EVENT_SCREEN_LOADED, NULL);
+
+	top = lv_obj_get_child(yh.scr, 0);
+	btn = lv_button_create(top);
+	plain(btn);
+	lv_obj_set_size(btn, 48, 48);
+	lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_bg_color(btn, M.on_surface, LV_STATE_PRESSED);
+	lv_obj_set_style_bg_opa(btn, LV_OPA_20, LV_STATE_PRESSED);
+	lv_obj_align(btn, LV_ALIGN_RIGHT_MID, 0, 0);
+	lv_obj_add_event_cb(btn, yt_open_offline_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_center(m3_label(btn, LV_SYMBOL_DOWNLOAD, &lv_font_montserrat_20, M.on_surface));
 
 	/* an M3 search bar: a full pill that opens the search page */
 	bar = lv_obj_create(yh.body);
@@ -1515,6 +2849,7 @@ static void open_youtube(lv_event_t *e)
 	yt_search_icon(bar, M.on_surface);
 	m3_label(bar, "Search YouTube", &lv_font_montserrat_16, M.on_surface_v);
 
+	yt_home_offline();
 	yt_home_chips();
 	yt_home_history();
 	push(yh.scr);

@@ -576,7 +576,7 @@ void screen_off_or_sleep(void)
 	 * was in the controller before the layers were back.
 	 */
 	screen_set(false);
-	if (audio_playing()) {
+	if (audio_playing() || yt_dl_busy()) {
 		screen_off_for_sound = true;
 		screen_set(false);
 		if (playback_timer)
@@ -596,7 +596,7 @@ void playback_check(lv_timer_t *t)
 		lv_timer_pause(t);
 		return;
 	}
-	if (audio_playing()) {
+	if (audio_playing() || yt_dl_busy()) {
 		quiet = 0;
 		return;
 	}
