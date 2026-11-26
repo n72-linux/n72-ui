@@ -369,7 +369,7 @@ static lv_obj_t *qs_tile(lv_obj_t *parent, const char *icon, const char *title,
 	plain(t);
 	int32_t tw = (W - 2 * STATUS_PAD - 8 * (QS_COLS - 1)) / QS_COLS;	/* 8 apart */
 
-	lv_obj_set_size(t, tw, 64);
+	lv_obj_set_size(t, tw, SHADE_TILE_H);
 	lv_obj_set_style_radius(t, 20, 0);
 	lv_obj_set_style_bg_opa(t, LV_OPA_COVER, 0);
 	lv_obj_set_style_pad_hor(t, 14, 0);
@@ -378,7 +378,7 @@ static lv_obj_t *qs_tile(lv_obj_t *parent, const char *icon, const char *title,
 	lv_obj_set_flex_flow(t, LV_FLEX_FLOW_ROW);
 	lv_obj_set_flex_align(t, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_column(t, 10, 0);
-	m3_label(t, icon, &lv_font_montserrat_20, M.on_surface);
+	m3_label(t, icon, icon_font(icon, false), M.on_surface);
 	col = lv_obj_create(t);
 	plain(col);
 	lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
@@ -797,15 +797,13 @@ void shade_set(bool open, bool anim)
 	}
 }
 
-/* Swipe down anywhere on home opens the shade, swipe up closes it. */
+/* Swipe up closes an open shade on home (opening is drag-down from the status bar). */
 void home_gesture_cb(lv_event_t *e)
 {
 	lv_dir_t d = lv_indev_get_gesture_dir(lv_indev_active());
 
 	LV_UNUSED(e);
-	if (d == LV_DIR_BOTTOM)
-		shade_set(true, true);
-	else if (d == LV_DIR_TOP)
+	if (d == LV_DIR_TOP && shade_open)
 		shade_set(false, true);
 }
 
@@ -908,9 +906,19 @@ static void qs_rot_cb(lv_event_t *e)
 	rot_conf_changed();
 }
 
+static void qs_sleep_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	shade_set(false, false);
+	screen_off_or_sleep();
+}
+
 void build_shade(void)
 {
-	lv_obj_t *row, *h;
+	lv_obj_t *row, *h, *qs_sleep, *sleep_sub;
+	bool land = W > H;
+	int32_t tiles_y = land ? 62 : 70;
+	int32_t bright_gap = land ? 10 : 12;
 
 	scrim = lv_obj_create(home_scr);
 	plain(scrim);
@@ -939,33 +947,33 @@ void build_shade(void)
 	lv_obj_set_style_bg_color(h, M.surface_c, 0);
 	lv_obj_remove_flag(h, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 
-	clock_lbl = m3_label(shade, "", &lv_font_montserrat_48, M.on_surface);
-	lv_obj_align(clock_lbl, LV_ALIGN_TOP_LEFT, STATUS_PAD + 2, 24);	/* (+ the glyphs' side bearing) */
+	clock_lbl = m3_label(shade, "", &lv_font_montserrat_24, M.on_surface);
+	lv_obj_align(clock_lbl, LV_ALIGN_TOP_LEFT, STATUS_PAD, land ? 10 : 14);
 	{
 		/* Settings: a round tonal button at the top right */
 		lv_obj_t *b = lv_button_create(shade);
 
 		plain(b);
-		lv_obj_set_size(b, 48, 48);
+		lv_obj_set_size(b, 40, 40);
 		lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
 		lv_obj_set_style_bg_color(b, M.surface_c_highest, 0);
-		lv_obj_align(b, LV_ALIGN_TOP_RIGHT, -16, 30);
+		lv_obj_align(b, LV_ALIGN_TOP_RIGHT, -STATUS_PAD, land ? 12 : 16);
 		lv_obj_add_event_cb(b, qs_settings_cb, LV_EVENT_CLICKED, NULL);
 		lv_obj_center(m3_label(b, LV_SYMBOL_SETTINGS, &lv_font_montserrat_20, M.on_surface));
 		qs_settings_btn = b;
 	}
-	date_lbl = m3_label(shade, "", &lv_font_montserrat_16, M.primary);
-	lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, STATUS_PAD + 4, 84);
+	date_lbl = m3_label(shade, "", &lv_font_montserrat_14, M.primary);
+	lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, STATUS_PAD + 1, land ? 38 : 43);
 
 	/* the tiles: a grid, QS_COLS a row, 8 apart */
 	{
-		int rows = (3 + QS_COLS - 1) / QS_COLS;
-		int32_t th = rows * 64 + (rows - 1) * 8;
+		int rows = (4 + QS_COLS - 1) / QS_COLS;
+		int32_t th = rows * SHADE_TILE_H + (rows - 1) * 8;
 
 		row = lv_obj_create(shade);
 		plain(row);
 		lv_obj_set_size(row, W - 2 * STATUS_PAD, th);
-		lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 128);
+		lv_obj_align(row, LV_ALIGN_TOP_MID, 0, tiles_y);
 		lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
 		lv_obj_set_style_pad_all(row, 0, 0);
 		lv_obj_set_style_pad_column(row, 8, 0);
@@ -977,10 +985,14 @@ void build_shade(void)
 		qs_bt = qs_tile(row, LV_SYMBOL_BLUETOOTH, "Bluetooth", &qs_bt_sub, qs_open_bt);
 		qs_rot = qs_tile(row, LV_SYMBOL_REFRESH, "Auto-rotate", &qs_rot_sub, qs_rot_cb);
 		qs_rot_sync();
-		/* the slider 12 below; the handle 52 below it (the background
+		qs_sleep = qs_tile(row, N72_SYMBOL_SLEEP, "Sleep", &sleep_sub, qs_sleep_cb);
+		lv_label_set_text(sleep_sub, "Screen off");
+		qs_style(qs_sleep, false);
+		lv_obj_set_style_bg_color(qs_sleep, M.surface_c_highest, LV_STATE_PRESSED);
+		/* the slider below; the handle at the bottom (the background
 		 * player's card, when there is one, between: shade_relayout) */
-		shade_base_h = 128 + th + 12 + 56 + 52;
-		shade_card_y = 128 + th + 8;
+		shade_base_h = tiles_y + th + bright_gap + SHADE_BRIGHT_H + SHADE_FOOT_H;
+		shade_card_y = tiles_y + th + 8;
 		shade_h = shade_base_h;
 		lv_obj_set_height(shade, shade_h);
 		lv_obj_set_y(shade, -shade_h);
@@ -988,8 +1000,8 @@ void build_shade(void)
 
 	row = shade_bright_row = lv_obj_create(shade);
 	plain(row);
-	lv_obj_set_size(row, W - 2 * STATUS_PAD, 56);
-	lv_obj_align(row, LV_ALIGN_TOP_MID, 0, shade_h - 52 - 56);
+	lv_obj_set_size(row, W - 2 * STATUS_PAD, SHADE_BRIGHT_H);
+	lv_obj_align(row, LV_ALIGN_TOP_MID, 0, shade_h - SHADE_FOOT_H - SHADE_BRIGHT_H);
 	lv_obj_set_style_bg_color(row, M.surface_c_highest, 0);
 	lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
 	lv_obj_set_style_radius(row, LV_RADIUS_CIRCLE, 0);
@@ -1012,7 +1024,7 @@ void build_shade(void)
 	lv_obj_set_size(h, 36, 4);
 	lv_obj_set_style_radius(h, 2, 0);
 	lv_obj_set_style_bg_color(h, M.outline, 0);
-	lv_obj_align(h, LV_ALIGN_BOTTOM_MID, 0, -14);
+	lv_obj_align(h, LV_ALIGN_BOTTOM_MID, 0, land ? -12 : -14);
 	/* (padding taller than the handle would make it scroll, with a scrollbar) */
 	lv_obj_set_style_pad_all(h, 0, 0);
 	lv_obj_remove_flag(h, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
@@ -2093,7 +2105,8 @@ bool ui_drag(int phase, int x, int y)
 			return false;
 		if (shade_open && !in_obj(home_bright, x, y))
 			sd.cand = -1;
-		else if (!shade_open && (home || (app_bar_shown && y < APP_BAR_H)))
+		else if (!shade_open && ((home && in_obj(home_bar, x, y)) ||
+					   (app_bar_shown && y < APP_BAR_H)))
 			sd.cand = 1;
 		else if (page && !shade_open && y < APP_EDGE_H)
 			sd.cand = 2;	/* the page's top edge: brings the bar */
@@ -3215,7 +3228,7 @@ static void app_tile_cmd(lv_obj_t *parent, const char *name, const char *cmd,
 		{ "terminal", LV_SYMBOL_KEYBOARD }, { "gps", LV_SYMBOL_GPS },
 		{ "charge", LV_SYMBOL_CHARGE }, { "home", LV_SYMBOL_HOME },
 		{ "folder", LV_SYMBOL_DIRECTORY }, { "game", N72_SYMBOL_GAMEPAD },
-		{ "web", LV_SYMBOL_WIFI },
+		{ "web", N72_SYMBOL_WEB },
 	};
 	uint32_t before = lv_obj_get_child_count(parent);
 	const char *sym = LV_SYMBOL_PLAY;

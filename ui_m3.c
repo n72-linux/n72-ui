@@ -372,9 +372,9 @@ lv_obj_t *slider_value(lv_obj_t *parent)
  */
 #include "n72_icons.c"
 
-static const lv_font_t *icon_font(const char *icon, bool big)
+const lv_font_t *icon_font(const char *icon, bool big)
 {
-	if (icon && !strcmp(icon, N72_SYMBOL_GAMEPAD))
+	if (icon && (unsigned char)icon[0] == 0xEE && (unsigned char)icon[1] == 0x80)
 		return big ? &n72_icon_24 : &n72_icon_20;
 	return big ? &lv_font_montserrat_24 : &lv_font_montserrat_20;
 }

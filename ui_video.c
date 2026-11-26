@@ -474,12 +474,14 @@ static void vc_build(void)
 	row = lv_obj_create(vc.ui);
 	lv_obj_remove_style_all(row);
 	lv_obj_set_size(row, W - 2 * STATUS_PAD, 64);
+	lv_obj_set_style_pad_hor(row, 8, 0);
 	lv_obj_align(row, LV_ALIGN_BOTTOM_MID, 0, -8);
 	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_add_flag(row, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
 	vc.pos = m3_label(row, "0:00", &lv_font_montserrat_12, lv_color_white());
-	lv_obj_align(vc.pos, LV_ALIGN_TOP_LEFT, 4, 4);
+	lv_obj_align(vc.pos, LV_ALIGN_TOP_LEFT, 0, 4);
 	vc.dur = m3_label(row, "", &lv_font_montserrat_12, lv_color_hex(0xd0d0d0));
-	lv_obj_align(vc.dur, LV_ALIGN_TOP_RIGHT, -4, 4);
+	lv_obj_align(vc.dur, LV_ALIGN_TOP_RIGHT, 0, 4);
 	o = vc.slider = lv_slider_create(row);
 	lv_obj_set_size(o, lv_pct(100), 4);
 	lv_obj_align(o, LV_ALIGN_BOTTOM_MID, 0, -18);
@@ -959,7 +961,7 @@ static void shade_relayout(void)
 		return;
 	shade_h = h;
 	lv_obj_set_height(shade, shade_h);
-	lv_obj_align(shade_bright_row, LV_ALIGN_TOP_MID, 0, shade_h - 52 - 56);
+	lv_obj_align(shade_bright_row, LV_ALIGN_TOP_MID, 0, shade_h - SHADE_FOOT_H - SHADE_BRIGHT_H);
 	if (!shade_open && !sd.on && !sd.scr)
 		lv_obj_set_y(shade, -shade_h);
 	shade_pic_dirty = true;

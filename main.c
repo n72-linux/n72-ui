@@ -1347,40 +1347,20 @@ static void keys_poll(lv_timer_t *t)
 	LV_UNUSED(t);
 	if (keys_fd < 0)
 		return;
-	static uint64_t home_down_us;
-
 	while (read(keys_fd, &ev, sizeof(ev)) == sizeof(ev)) {
-		if (ev.type != EV_KEY)
+		if (ev.type != EV_KEY || ev.value != 1)
 			continue;
-		/*
-		 * Home acts on release: held for a second or more it opens the
-		 * log view, which needs no touch (touch may be what is broken).
-		 */
-		if (ev.code == KEY_HOMEPAGE) {
-			if (ev.value == 1)
-				home_down_us = mono_us();
-			if (ev.value != 0)
-				continue;
-		} else if (ev.value != 1) {
-			continue;
-		}
 		lv_display_trigger_activity(NULL);
-		if ((ev.code == KEY_HOMEPAGE || ev.code == KEY_POWER) && screen_lit_check()) {
-			home_down_us = 0;
+		if ((ev.code == KEY_HOMEPAGE || ev.code == KEY_POWER) && screen_lit_check())
 			continue;	/* (the press that brought the picture back) */
-		}
 		switch (ev.code) {
 		case KEY_HOMEPAGE:
 			if (screen_off) {
 				screen_off_for_sound = false;
 				screen_set(true);
-			} else if (home_down_us && mono_us() - home_down_us >= 1000000) {
-				go_home();
-				open_logs(NULL);
 			} else if (!gp_home()) {	/* (a game: its pause panel) */
 				go_home();
 			}
-			home_down_us = 0;
 			break;
 		case KEY_POWER:
 			/* a late report of the press that woke us */

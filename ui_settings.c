@@ -185,7 +185,7 @@ void open_power(lv_event_t *e)
 	body = m3_card(body, M.surface_c);
 	lv_obj_set_style_pad_all(body, 4, 0);
 	lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
-	m3_row(body, LV_SYMBOL_EYE_CLOSE, "Sleep now", "Power or Home wakes it",
+	m3_row(body, N72_SYMBOL_SLEEP, "Sleep now", "Power or Home wakes it",
 	       power_do, (void *)3, NULL);
 	m3_row(body, LV_SYMBOL_REFRESH, "Restart", "Back to the boot loader",
 	       power_do, (void *)2, NULL);
@@ -880,6 +880,8 @@ void open_settings(lv_event_t *e)
 
 	LV_UNUSED(e);
 	body = m3_page("Settings", &scr);
+
+	/* Connectivity */
 	c = m3_card(body, M.surface_c);
 	lv_obj_set_style_pad_all(c, 4, 0);
 	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
@@ -891,6 +893,7 @@ void open_settings(lv_event_t *e)
 	       open_bt, NULL, &set_bt_sub);
 	obj_track(&set_bt_sub);
 
+	/* Appearance & Sound */
 	c = m3_card(body, M.surface_c);
 	lv_obj_set_style_pad_all(c, 4, 0);
 	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
@@ -903,13 +906,13 @@ void open_settings(lv_event_t *e)
 	snd_summary(sub, sizeof(sub));
 	m3_row(c, LV_SYMBOL_VOLUME_MAX, "Sound", sub, open_sound, NULL, &set_snd_sub);
 	obj_track(&set_snd_sub);
-	m3_row(c, LV_SYMBOL_POWER, "Power", "Sleep, restart, power off", open_power, NULL, NULL);
-	m3_row(c, LV_SYMBOL_BELL, "Date & Time", dt_zone_name(), open_datetime, NULL, NULL);
-	m3_row(c, LV_SYMBOL_GPS, "Weather", conf.wx_set ? conf.wx_name : "Off", open_weather, NULL, NULL);
 
+	/* General, Storage & Apps */
 	c = m3_card(body, M.surface_c);
 	lv_obj_set_style_pad_all(c, 4, 0);
 	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+	m3_row(c, LV_SYMBOL_BELL, "Date & Time", dt_zone_name(), open_datetime, NULL, NULL);
+	m3_row(c, LV_SYMBOL_GPS, "Weather", conf.wx_set ? conf.wx_name : "Off", open_weather, NULL, NULL);
 	{
 		struct statvfs v;
 
@@ -919,13 +922,19 @@ void open_settings(lv_event_t *e)
 			snprintf(sub, sizeof(sub), "Space used and free");
 		m3_row(c, LV_SYMBOL_SD_CARD, "Storage", sub, open_storage, NULL, NULL);
 	}
-	m3_row(c, LV_SYMBOL_EYE_OPEN, "About", "Device, memory, battery",
-	       open_about, NULL, NULL);
-	m3_row(c, LV_SYMBOL_FILE, "Logs", "Kernel messages", open_logs, NULL, NULL);
 	if (!access(IOS_TILES, X_OK) || !access(touchhle_dir(), F_OK)) {
 		apps_summary(sub, sizeof(sub));
 		m3_row(c, LV_SYMBOL_LIST, "App manager", sub, open_apps, NULL, &set_apps_sub);
 		obj_track(&set_apps_sub);
 	}
+
+	/* System & Power */
+	c = m3_card(body, M.surface_c);
+	lv_obj_set_style_pad_all(c, 4, 0);
+	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+	m3_row(c, LV_SYMBOL_POWER, "Power", "Sleep, restart, power off", open_power, NULL, NULL);
+	m3_row(c, LV_SYMBOL_EYE_OPEN, "About", "Device, memory, battery",
+	       open_about, NULL, NULL);
+	m3_row(c, LV_SYMBOL_FILE, "Logs", "Kernel messages", open_logs, NULL, NULL);
 	push(scr);
 }

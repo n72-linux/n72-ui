@@ -987,6 +987,8 @@ bool pg_drag(int phase, int x, int y)
 			return false;
 		if (home_dock && in_obj(home_dock, x, y))
 			return false;	/* (the dock stays: no swipe from it, as iOS) */
+		if (home_bar && in_obj(home_bar, x, y))
+			return false;	/* (the status bar pulls the shade, not the pages) */
 		pg.cand = true;
 		pg.x0 = x;
 		pg.y0 = y;

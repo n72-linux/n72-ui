@@ -11,7 +11,7 @@ A touch launcher for Linux on the iPod touch 2G (N72AP), built on
   (`/usr/share/n72-ui/apps/NAME.app`).
 ![Home screen](screenshot-home.png)
 
-- Buttons: Home returns to the launcher (held for a second it opens Logs; in
+- Buttons: Home returns to the launcher (in
   a game it opens the pause panel), Power turns the screen off or puts the
   system to sleep and wakes it, the volume keys change the sound volume.
 

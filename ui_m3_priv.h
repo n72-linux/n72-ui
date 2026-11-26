@@ -63,7 +63,10 @@ bool video_playing(void);
 void app_dormant_wake(bool full);
 void app_dormant_sync(void);
 
-#define QS_COLS (W > H ? 3 : 2)	/* quick-settings tiles a row */
+#define QS_COLS		2	/* quick-settings tiles a row */
+#define SHADE_TILE_H	(W > H ? 52 : 64)
+#define SHADE_BRIGHT_H	(W > H ? 48 : 56)
+#define SHADE_FOOT_H	(W > H ? 28 : 36)
 
 struct np {
 	lv_obj_t *card, *title, *sub, *play_sym;
@@ -115,6 +118,8 @@ struct M {
 };
 
 #define N72_SYMBOL_GAMEPAD	"\xEE\x80\x80"	/* U+E000 */
+#define N72_SYMBOL_WEB		"\xEE\x80\x81"	/* U+E001 */
+#define N72_SYMBOL_SLEEP	"\xEE\x80\x82"	/* U+E002 */
 
 struct tr {
 	lv_obj_t *scr, *bg, *fg;	/* transition screen and its two pictures */
@@ -309,7 +314,9 @@ lv_obj_t *m3_card(lv_obj_t *parent, lv_color_t bg);
 lv_obj_t *m3_label(lv_obj_t *parent, const char *text, const lv_font_t *font, lv_color_t color);
 lv_obj_t *row_slider(lv_obj_t *parent, bool last);
 lv_obj_t *slider_value(lv_obj_t *parent);
+extern const lv_font_t n72_icon_20;
 extern const lv_font_t n72_icon_24;
+const lv_font_t *icon_font(const char *icon, bool big);
 lv_obj_t *m3_badge(lv_obj_t *parent, const char *icon, lv_color_t bg, lv_color_t fg, int size);
 lv_obj_t *ios_switch(lv_obj_t *sw);
 lv_obj_t *m3_row_ex(lv_obj_t *parent, const char *icon, lv_color_t bg, lv_color_t fg, const char *title, const char *sub, lv_event_cb_t cb, void *ud, lv_obj_t **sub_lbl, bool chevron);

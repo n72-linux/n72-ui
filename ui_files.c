@@ -405,15 +405,14 @@ void build_home(void)
 	lv_obj_add_event_cb(home_scr, home_gesture_cb, LV_EVENT_GESTURE, NULL);
 	home_geom();	/* (the dock's side: the rest is the bar's, the pages', the dots') */
 
-	/* status bar: time, Wi-Fi and Bluetooth, battery; a tap opens the shade */
+	/* status bar: time, Wi-Fi and Bluetooth, battery; drag down opens the shade */
 	bar = lv_obj_create(home_scr);
 	plain(bar);
 	lv_obj_set_size(bar, PW, 40);
 	lv_obj_set_pos(bar, PX, 0);
 	lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
 	lv_obj_set_style_radius(bar, 0, 0);
-	lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-	lv_obj_add_event_cb(bar, shade_tap_cb, LV_EVENT_CLICKED, (void *)1);
+	lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 	status_row(bar, &status_time, &status_wifi, &status_bt, &batt_lbl);
 	/* a note before Wi-Fi while something plays in the background */
 	status_np = m3_label(bar, LV_SYMBOL_AUDIO, &lv_font_montserrat_14, M.on_surface_v);
@@ -467,8 +466,7 @@ void build_home(void)
 			lv_obj_set_style_bg_opa(c, home_wp ? LV_OPA_80 : LV_OPA_COVER, 0);
 		}
 		lv_obj_set_style_pad_all(c, 0, 0);
-		lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_add_event_cb(c, shade_tap_cb, LV_EVENT_CLICKED, (void *)1);
+		lv_obj_remove_flag(c, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 		home_clock = m3_label(c, "", &lv_font_montserrat_48, M.on_surface);
 		lv_obj_align(home_clock, LV_ALIGN_TOP_LEFT, 18, 8);
 		home_date = m3_label(c, "", &lv_font_montserrat_16, M.primary);

@@ -9,9 +9,9 @@ clock_font.h
     SIL Open Font License 1.1: LICENSES/OFL-1.1.txt
 
 n72_icons.c
-    One glyph drawn from "gamepad-variant" of Material Design Icons 7.4.47
-    by Pictogrammers (https://pictogrammers.com), converted by
-    tools/svg2glyph.py.
+    Glyphs drawn from Material Design Icons by Pictogrammers
+    (https://pictogrammers.com), converted by tools/svg2glyph.py
+    from tools/icons/*.svg.
     Apache License 2.0: LICENSES/Apache-2.0.txt
 
 tz_table.h
