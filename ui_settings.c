@@ -166,11 +166,6 @@ static void power_do(lv_event_t *e)
 {
 	intptr_t what = (intptr_t)lv_event_get_user_data(e);
 
-	if (what == 3) {
-		go_home();
-		screen_off_or_sleep();
-		return;
-	}
 	sync();
 	reboot(what == 1 ? RB_POWER_OFF : RB_AUTOBOOT);
 }
@@ -185,8 +180,6 @@ void open_power(lv_event_t *e)
 	body = m3_card(body, M.surface_c);
 	lv_obj_set_style_pad_all(body, 4, 0);
 	lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
-	m3_row(body, N72_SYMBOL_SLEEP, "Sleep now", "Power or Home wakes it",
-	       power_do, (void *)3, NULL);
 	m3_row(body, LV_SYMBOL_REFRESH, "Restart", "Back to the boot loader",
 	       power_do, (void *)2, NULL);
 	m3_row(body, LV_SYMBOL_POWER, "Power off", "Hold Power to turn on",
@@ -932,7 +925,7 @@ void open_settings(lv_event_t *e)
 	c = m3_card(body, M.surface_c);
 	lv_obj_set_style_pad_all(c, 4, 0);
 	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
-	m3_row(c, LV_SYMBOL_POWER, "Power", "Sleep, restart, power off", open_power, NULL, NULL);
+	m3_row(c, LV_SYMBOL_POWER, "Power", "Restart, power off", open_power, NULL, NULL);
 	m3_row(c, LV_SYMBOL_EYE_OPEN, "About", "Device, memory, battery",
 	       open_about, NULL, NULL);
 	m3_row(c, LV_SYMBOL_FILE, "Logs", "Kernel messages", open_logs, NULL, NULL);

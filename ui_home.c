@@ -872,11 +872,17 @@ lv_obj_t *settings_tile;
 
 static void qs_to_page(void (*open)(lv_event_t *));
 
-/* The gear at the top right of the shade: the shade goes up off Settings. */
+/* The gear and power buttons at the top right of the shade. */
 static void qs_settings_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
 	qs_to_page(open_settings);
+}
+
+static void qs_power_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	qs_to_page(open_power);
 }
 
 lv_obj_t *qs_rot, *qs_rot_sub;
@@ -950,9 +956,18 @@ void build_shade(void)
 	clock_lbl = m3_label(shade, "", &lv_font_montserrat_24, M.on_surface);
 	lv_obj_align(clock_lbl, LV_ALIGN_TOP_LEFT, STATUS_PAD, land ? 10 : 14);
 	{
-		/* Settings: a round tonal button at the top right */
+		/* Power options and Settings: round tonal buttons at the top right */
 		lv_obj_t *b = lv_button_create(shade);
 
+		plain(b);
+		lv_obj_set_size(b, 40, 40);
+		lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
+		lv_obj_set_style_bg_color(b, M.surface_c_highest, 0);
+		lv_obj_align(b, LV_ALIGN_TOP_RIGHT, -(STATUS_PAD + 40 + 8), land ? 12 : 16);
+		lv_obj_add_event_cb(b, qs_power_cb, LV_EVENT_CLICKED, NULL);
+		lv_obj_center(m3_label(b, LV_SYMBOL_POWER, &lv_font_montserrat_20, M.on_surface));
+
+		b = lv_button_create(shade);
 		plain(b);
 		lv_obj_set_size(b, 40, 40);
 		lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
@@ -963,6 +978,8 @@ void build_shade(void)
 		qs_settings_btn = b;
 	}
 	date_lbl = m3_label(shade, "", &lv_font_montserrat_14, M.primary);
+	lv_label_set_long_mode(date_lbl, LV_LABEL_LONG_DOT);
+	lv_obj_set_width(date_lbl, W - 2 * STATUS_PAD - 40 - 8 - 40 - 12);
 	lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, STATUS_PAD + 1, land ? 38 : 43);
 
 	/* the tiles: a grid, QS_COLS a row, 8 apart */
@@ -2611,10 +2628,15 @@ static void qs_to_page(void (*open)(lv_event_t *))
 {
 	lv_draw_buf_t *bg, *fg;
 	bool over_app = app_pid > 0 && lv_screen_active() == app_scr;
+	bool on_pg = on_page();
 
 	if (!shade_open || sd.on || sd.scr || za.phase || locked || !settings_tile ||
-	    (!over_app && lv_screen_active() != home_scr))
+	    (!over_app && !on_pg && lv_screen_active() != home_scr))
 		return;
+	if (on_pg && nav_n > 0 && nav_re[nav_n - 1].open == open) {
+		shade_set(false, true);
+		return;
+	}
 	if (over_app)
 		app_dormant_wake(true);
 	push_quiet = true;
@@ -2634,7 +2656,8 @@ static void qs_to_page(void (*open)(lv_event_t *))
 		}
 		page_over_app = true;
 	}
-	za.page_tile = settings_tile;
+	if (!on_pg)
+		za.page_tile = open == open_settings ? settings_tile : NULL;
 	if (!bg || !fg) {
 		tr_free(&bg);
 		shade_set(false, false);
