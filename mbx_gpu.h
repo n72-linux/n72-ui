@@ -90,6 +90,10 @@ bool mbx_gpu_is_suspended(void);
 #define N72_EXT_OVL_PATH  "/run/n72-retro-overlay.bin"
 #define N72_EXT_OVL_SOCK  "/run/n72-retro-overlay.sock"
 
+#define N72_EXT_OVL_FMT_ARGB8888 0x34325241u	/* DRM_FORMAT_ARGB8888 */
+#define N72_EXT_OVL_FMT_ARGB1555 0x35315241u	/* DRM_FORMAT_ARGB1555 */
+#define N72_EXT_OVL_FMT_ARGB4444 0x32315241u	/* DRM_FORMAT_ARGB4444 */
+
 struct n72_ext_ovl_hdr {
 	uint32_t magic;
 	uint32_t gen;
@@ -98,7 +102,7 @@ struct n72_ext_ovl_hdr {
 	uint32_t stride;
 	uint32_t rot;		/* 0, 90, 270 */
 	uint32_t enabled;
-	uint32_t reserved;
+	uint32_t format;	/* 0 = ARGB8888, or N72_EXT_OVL_FMT_* */
 };
 
 bool mbx_gpu_sync_ext_overlay(void);

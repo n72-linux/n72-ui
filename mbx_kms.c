@@ -136,7 +136,10 @@ static bool kms_layer_want = true;
 static bool gpu_suspended;
 static bool ext_ovl_active;
 static uint32_t ext_ovl_gen;
+static uint32_t ext_ovl_fmt;
 static int ext_ovl_rot;
+static uint32_t kms_ext_fb, kms_ext_fmt;
+static int kms_ext_rot;
 static bool kms_can_window;
 static uint32_t kms_src_y, kms_win_y, kms_win_h;
 static uint32_t buf_src_y[NSCAN], buf_win_y[NSCAN], buf_win_h[NSCAN];
@@ -1037,15 +1040,15 @@ static void shell_active_y_bounds(uint32_t *out_y, uint32_t *out_h)
 	}
 }
 
-/* The flip to buffer @r, waited for: true once it is on the screen. */
-static bool kms_flip(int r, int rot, uint32_t sy, uint32_t wy, uint32_t wh)
+/* The flip to DRM framebuffer @fb_id, waited for: true once it is on the screen. */
+static bool kms_flip_fb(uint32_t fb_id, int rot, uint32_t sy, uint32_t wy, uint32_t wh)
 {
 	uint64_t want = ROT_BITS(rot);
 	uint32_t fsy = rot ? 0 : sy;
 	uint32_t fwy = (rot || !wh) ? 0 : wy;
 	uint32_t fwh = (rot || !wh) ? fb.height : wh;
 	struct drm_mode_crtc_page_flip pf = {
-		.crtc_id = kms_crtc, .fb_id = rot ? kms_fb_l[r] : kms_fb[r],
+		.crtc_id = kms_crtc, .fb_id = fb_id,
 		.flags = DRM_MODE_PAGE_FLIP_EVENT, .user_data = ++kms_seq,
 	};
 	bool need_rot, need_win;
@@ -1219,6 +1222,43 @@ wait:
 	if (handoff_n)
 		kms_drop_handoff();	/* (the old picture is off the layer now) */
 	return true;
+}
+
+static bool kms_flip(int r, int rot, uint32_t sy, uint32_t wy, uint32_t wh)
+{
+	return kms_flip_fb(rot ? kms_fb_l[r] : kms_fb[r], rot, sy, wy, wh);
+}
+
+static void kms_release_ext_fb(void)
+{
+	if (kms_fd >= 0 && kms_ext_fb) {
+		ioctl(kms_fd, DRM_IOCTL_MODE_RMFB, &kms_ext_fb);
+		kms_ext_fb = 0;
+		kms_ext_fmt = 0;
+		kms_ext_rot = 0;
+	}
+}
+
+static uint32_t kms_get_ext_fb(uint32_t fmt, int rot, uint32_t w, uint32_t h, uint32_t pitch)
+{
+	struct drm_mode_fb_cmd2 f = { 0 };
+
+	if (!kms_handle[0])
+		return 0;
+	if (kms_ext_fb && kms_ext_fmt == fmt && kms_ext_rot == rot)
+		return kms_ext_fb;
+	kms_release_ext_fb();
+	f.width = w;
+	f.height = h;
+	f.pixel_format = fmt;
+	f.handles[0] = kms_handle[0];
+	f.pitches[0] = pitch;
+	if (ioctl(kms_fd, DRM_IOCTL_MODE_ADDFB2, &f))
+		return 0;
+	kms_ext_fb = f.fb_id;
+	kms_ext_fmt = fmt;
+	kms_ext_rot = rot;
+	return kms_ext_fb;
 }
 
 static bool kms_import_scan(int fd, int i)
@@ -1885,6 +1925,8 @@ void mbx_gpu_set_layer_enabled(bool on)
 			pthread_mutex_unlock(&flip_mx);
 			ext_ovl_active = false;
 			ext_ovl_gen = 0;
+			ext_ovl_fmt = 0;
+			kms_release_ext_fb();
 		}
 		kms_layer_want = true;
 		return;
@@ -1909,6 +1951,8 @@ void mbx_gpu_set_layer_enabled(bool on)
 	pthread_mutex_unlock(&flip_mx);
 	ext_ovl_active = false;
 	ext_ovl_gen = 0;
+	ext_ovl_fmt = 0;
+	kms_release_ext_fb();
 }
 
 void mbx_gpu_suspend(void)
@@ -2022,12 +2066,14 @@ static void ext_ovl_disable_layer(void)
 	pthread_mutex_unlock(&flip_mx);
 	ext_ovl_active = false;
 	ext_ovl_gen = 0;
+	ext_ovl_fmt = 0;
+	kms_release_ext_fb();
 }
 
 bool mbx_gpu_sync_ext_overlay(void)
 {
 	struct n72_ext_ovl_hdr hdr;
-	uint32_t exp_w, exp_h, dst_stride, y;
+	uint32_t exp_w, exp_h, dst_stride, y, fmt, cpp, fb_id;
 	uint8_t *buf;
 	ssize_t nr, off = 0, need;
 	int fd;
@@ -2050,28 +2096,43 @@ bool mbx_gpu_sync_ext_overlay(void)
 		ext_ovl_disable_layer();
 		return false;
 	}
-	if (hdr.rot && (!kms_can_turn || !kms_fb_l[0])) {
+	if (hdr.rot && !kms_can_turn) {
 		close(fd);
 		ext_ovl_disable_layer();
 		return false;
 	}
-	if (!hdr.rot && !kms_fb[0]) {
+	fmt = hdr.format ? hdr.format : N72_EXT_OVL_FMT_ARGB8888;
+	if (fmt == N72_EXT_OVL_FMT_ARGB8888) {
+		cpp = 4;
+		if ((hdr.rot && !kms_fb_l[0]) || (!hdr.rot && !kms_fb[0])) {
+			close(fd);
+			ext_ovl_disable_layer();
+			return false;
+		}
+	} else if (fmt == N72_EXT_OVL_FMT_ARGB1555 || fmt == N72_EXT_OVL_FMT_ARGB4444) {
+		cpp = 2;
+	} else {
 		close(fd);
 		ext_ovl_disable_layer();
 		return false;
 	}
 	exp_w = hdr.rot ? fb.height : fb.width;
 	exp_h = hdr.rot ? fb.width : fb.height;
-	if (hdr.width != exp_w || hdr.height != exp_h || hdr.stride != exp_w * 4) {
+	if (hdr.width != exp_w || hdr.height != exp_h || hdr.stride != exp_w * cpp) {
 		close(fd);
 		ext_ovl_disable_layer();
 		return false;
 	}
-	if (ext_ovl_active && hdr.gen == ext_ovl_gen && ext_ovl_rot == (int)hdr.rot) {
+	if (ext_ovl_active && hdr.gen == ext_ovl_gen &&
+	    ext_ovl_rot == (int)hdr.rot && ext_ovl_fmt == fmt) {
 		close(fd);
 		return true;
 	}
-	dst_stride = hdr.rot ? buf_width_to_stride(fb.height, LV_COLOR_FORMAT_XRGB8888) : fb.stride;
+	if (cpp == 4) {
+		dst_stride = hdr.rot ? buf_width_to_stride(fb.height, LV_COLOR_FORMAT_XRGB8888) : fb.stride;
+	} else {
+		dst_stride = exp_w * 2;
+	}
 	if ((uint64_t)dst_stride * exp_h > (uint64_t)fb.stride * fb.height) {
 		close(fd);
 		ext_ovl_disable_layer();
@@ -2097,6 +2158,16 @@ bool mbx_gpu_sync_ext_overlay(void)
 	close(fd);
 
 	flip_wait();
+	if (cpp == 4) {
+		kms_release_ext_fb();
+		fb_id = hdr.rot ? kms_fb_l[0] : kms_fb[0];
+	} else {
+		fb_id = kms_get_ext_fb(fmt, (int)hdr.rot, exp_w, exp_h, dst_stride);
+		if (!fb_id) {
+			free(buf);
+			return false;
+		}
+	}
 	if (dst_stride == hdr.stride) {
 		memcpy(scan[0], buf, (size_t)need);
 	} else {
@@ -2107,7 +2178,7 @@ bool mbx_gpu_sync_ext_overlay(void)
 	free(buf);
 	sync_range(scan[0], dst_stride * exp_h, MBX_SYNC_CLEAN);
 
-	if (!kms_flip(0, (int)hdr.rot, 0, 0, 0))
+	if (!kms_flip_fb(fb_id, (int)hdr.rot, 0, 0, 0))
 		return false;
 	pthread_mutex_lock(&flip_mx);
 	st_front = 0;
@@ -2116,6 +2187,7 @@ bool mbx_gpu_sync_ext_overlay(void)
 	pthread_mutex_unlock(&flip_mx);
 	ext_ovl_active = true;
 	ext_ovl_gen = hdr.gen;
+	ext_ovl_fmt = fmt;
 	ext_ovl_rot = (int)hdr.rot;
 	return true;
 }
@@ -2125,6 +2197,7 @@ void mbx_gpu_clear_ext_overlay(void)
 	unlink(N72_EXT_OVL_PATH);
 	ext_ovl_active = false;
 	ext_ovl_gen = 0;
+	ext_ovl_fmt = 0;
 	ext_ovl_rot = 0;
 }
 
