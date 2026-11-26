@@ -12,9 +12,60 @@ static lv_obj_t *night_slider;
 static lv_obj_t *night_val;
 static lv_timer_t *night_apply_timer;
 
+#define CLCD_MIE_PATH	"/sys/devices/platform/display-subsystem/mie"
+
 void display_night_apply(void)
 {
 	mbx_gpu_set_warmth(conf.night_shift ? conf.night_warmth : 0);
+}
+
+void display_mie_apply(void)
+{
+	FILE *f;
+
+	if (access(CLCD_MIE_PATH, W_OK) != 0)
+		return;
+	f = fopen(CLCD_MIE_PATH, "w");
+	if (f) {
+		fprintf(f, "%d\n", conf.mie_mode);
+		fclose(f);
+	}
+}
+
+static void mie_cb(lv_event_t *e)
+{
+	uint32_t sel = lv_buttonmatrix_get_selected_button(lv_event_get_target(e));
+
+	if (sel > 2 || (int)sel == conf.mie_mode)
+		return;
+	conf.mie_mode = (int)sel;
+	display_mie_apply();
+	conf_save();
+}
+
+static lv_obj_t *segmented_matrix(lv_obj_t *parent, const char *const *map, uint32_t active,
+				    lv_event_cb_t cb)
+{
+	lv_obj_t *bm = lv_buttonmatrix_create(parent);
+
+	lv_buttonmatrix_set_map(bm, map);
+	lv_buttonmatrix_set_one_checked(bm, true);
+	lv_buttonmatrix_set_button_ctrl_all(bm, LV_BUTTONMATRIX_CTRL_CHECKABLE);
+	lv_buttonmatrix_set_button_ctrl(bm, active, LV_BUTTONMATRIX_CTRL_CHECKED);
+	lv_obj_set_size(bm, lv_pct(100), 52);
+	plain(bm);
+	lv_obj_set_style_bg_opa(bm, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_pad_all(bm, 0, 0);
+	lv_obj_set_style_radius(bm, LV_RADIUS_CIRCLE, LV_PART_ITEMS);
+	lv_obj_set_style_bg_color(bm, M.surface_c_high, LV_PART_ITEMS);
+	lv_obj_set_style_bg_color(bm, M.secondary_c, LV_PART_ITEMS | LV_STATE_CHECKED);
+	lv_obj_set_style_text_color(bm, M.on_surface, LV_PART_ITEMS);
+	lv_obj_set_style_text_color(bm, M.on_secondary_c, LV_PART_ITEMS | LV_STATE_CHECKED);
+	/* the default theme gives the buttons a shadow (a halo on light) */
+	lv_obj_set_style_shadow_width(bm, 0, LV_PART_ITEMS);
+	lv_obj_set_style_outline_width(bm, 0, LV_PART_ITEMS);
+	lv_obj_add_event_cb(bm, cb, LV_EVENT_VALUE_CHANGED, NULL);
+	return bm;
 }
 
 static void night_apply_cb(lv_timer_t *t)
@@ -156,7 +207,8 @@ void open_display(lv_event_t *e)
 {
 	nav_mark(open_display, NULL);
 	static const char *const theme_map[] = { "Dark", "Light", "" };
-	lv_obj_t *scr, *body, *c, *s, *bm, *row, *dd;
+	static const char *const mie_map[] = { "Off", "Video", "Always", "" };
+	lv_obj_t *scr, *body, *c, *s, *row, *dd;
 	unsigned int i;
 
 	LV_UNUSED(e);
@@ -236,25 +288,14 @@ void open_display(lv_event_t *e)
 		lv_label_set_text_fmt(night_val, "%d%%", conf.night_warmth);
 	}
 
+	if (access(CLCD_MIE_PATH, W_OK) == 0) {
+		m3_section(body, "Adaptive contrast");
+		segmented_matrix(body, mie_map, (uint32_t)conf.mie_mode, mie_cb);
+		m3_note(body, "Adjusts contrast and backlight for dark scenes. Video enables it only during playback.");
+	}
+
 	m3_section(body, "Theme");
-	bm = lv_buttonmatrix_create(body);
-	lv_buttonmatrix_set_map(bm, theme_map);
-	lv_buttonmatrix_set_one_checked(bm, true);
-	lv_buttonmatrix_set_button_ctrl_all(bm, LV_BUTTONMATRIX_CTRL_CHECKABLE);
-	lv_buttonmatrix_set_button_ctrl(bm, conf.dark ? 0 : 1, LV_BUTTONMATRIX_CTRL_CHECKED);
-	lv_obj_set_size(bm, lv_pct(100), 52);
-	plain(bm);
-	lv_obj_set_style_bg_opa(bm, LV_OPA_TRANSP, 0);
-	lv_obj_set_style_pad_all(bm, 0, 0);
-	lv_obj_set_style_radius(bm, LV_RADIUS_CIRCLE, LV_PART_ITEMS);
-	lv_obj_set_style_bg_color(bm, M.surface_c_high, LV_PART_ITEMS);
-	lv_obj_set_style_bg_color(bm, M.secondary_c, LV_PART_ITEMS | LV_STATE_CHECKED);
-	lv_obj_set_style_text_color(bm, M.on_surface, LV_PART_ITEMS);
-	lv_obj_set_style_text_color(bm, M.on_secondary_c, LV_PART_ITEMS | LV_STATE_CHECKED);
-	/* the default theme gives the buttons a shadow (a halo on light) */
-	lv_obj_set_style_shadow_width(bm, 0, LV_PART_ITEMS);
-	lv_obj_set_style_outline_width(bm, 0, LV_PART_ITEMS);
-	lv_obj_add_event_cb(bm, theme_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	segmented_matrix(body, theme_map, conf.dark ? 0 : 1, theme_cb);
 
 	m3_section(body, "Colour");
 	row = lv_obj_create(body);
