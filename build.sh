@@ -39,8 +39,10 @@ DBG=
 # measured with clang). NOLTO=1: without, for comparing (n72-ui-build*-nolto/).
 LTO=-flto=auto
 [ "$NOLTO" = 1 ] && LTO=
-# OPT: the optimisation level (-O2; -O3 to compare)
-OPT=${OPT:--O2}
+# OPT: the optimisation level (-O3 default with -flto=auto -fno-stack-protector; -O2 to compare).
+# GCC 16 inherits Alpine's -fstack-protector-strong (~7% slower row/canvas text).
+OPT=${OPT:--O3}
+SSP=-fno-stack-protector
 # Profile-guided build (pgo/README):
 #   PGO_GEN=1 [PGO_RT=libclang_rt.profile-armhf.a]  instrumented (n72-ui-build*-pgogen/)
 #   otherwise the profile is used when it is there (NOPGO=1: not):
@@ -79,14 +81,14 @@ elif [ "$KIND" = clang ] && [ -f "$UI/pgo/n72ui.profdata" ]; then
 elif [ "$KIND" = gcc ] && ls "$UI"/pgo/gcc/*.gcda >/dev/null 2>&1; then
 	GCCUSE=1
 fi
-# (comparison builds beside the usual one: n72-ui-build-O3, -nopgo)
-[ "$OPT" != -O2 ] && OUT="$OUT-${OPT#-}"
+# (comparison builds beside the usual one: n72-ui-build-O2, -nopgo)
+[ "$OPT" != -O3 ] && OUT="$OUT-${OPT#-}"
 [ "$NOPGO" = 1 ] && OUT="$OUT-nopgo"
 [ "$NOLTO" = 1 ] && OUT="$OUT-nolto"
 # (gcc's profile flags name the output folder, which is final only here)
 [ -n "$GCCGEN" ] && PGOC="-fprofile-generate=$PGO_DIR -fprofile-prefix-path=$OUT -fprofile-update=prefer-atomic -DN72_PGO_GEN"
 [ -n "$GCCUSE" ] && PGOC="-fprofile-use=$UI/pgo/gcc -fprofile-prefix-path=$OUT -fprofile-correction -Wno-error=coverage-mismatch"
-CFLAGS="$PG $LTO $OPT $PGOC $DBG -g -idirafter $KHDR -mcpu=arm1176jzf-s -mfpu=vfpv2 -mfloat-abi=hard -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src -I$GLES/include"
+CFLAGS="$PG $LTO $OPT $SSP $PGOC $DBG -g -idirafter $KHDR -mcpu=arm1176jzf-s -mfpu=vfpv2 -mfloat-abi=hard -ffunction-sections -fdata-sections -DLV_CONF_INCLUDE_SIMPLE -I$UI -I$ROOT/lvgl-src -I$GLES/include"
 mkdir -p "$OUT/obj"
 # objects from another compiler or other flags (the old armel build) are not reused
 if [ "$(cat "$OUT/obj/.flags" 2>/dev/null)" != "$CC $CFLAGS" ]; then
@@ -117,7 +119,7 @@ done
 UIOBJS=$(for s in $UISRCS; do echo obj/$s.o; done)
 # (with LTO the instrumentation and the profile go in at compile time; the
 # link only adds the runtime, or the layout by the profile)
-$CC $PG $LTO $OPT -static -Wl,--gc-sections $PGOL -o "$OUT/n72-ui" $UIOBJS $OBJS $GLESLIB -lm -lpthread
+$CC $PG $LTO $OPT $SSP -static -Wl,--gc-sections $PGOL -o "$OUT/n72-ui" $UIOBJS $OBJS $GLESLIB -lm -lpthread
 cp "$OUT/n72-ui" "$OUT/n72-ui.debug"	# unstripped, for crash reports (addr2line)
 [ -n "$PG" ] || ${CROSS}strip "$OUT/n72-ui"
 ls -l "$OUT/n72-ui"
