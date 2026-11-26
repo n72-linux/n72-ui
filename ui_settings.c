@@ -5,12 +5,48 @@
 /* ------------------------------------------------------------ Display */
 
 static lv_obj_t *bright_val;
+static lv_obj_t *bright_slider;
+static lv_obj_t *auto_bright_sw;
+
+void ui_bright_sync_widgets(int pct)
+{
+	char buf[16];
+
+	if (home_bright) {
+		lv_slider_set_value(home_bright, pct, LV_ANIM_OFF);
+		shade_changed(home_bright);
+	}
+	if (bright_slider)
+		lv_slider_set_value(bright_slider, pct, LV_ANIM_OFF);
+	if (bright_val) {
+		snprintf(buf, sizeof(buf), "%d%%", pct);
+		label_set_if_changed(bright_val, buf);
+	}
+}
+
+void ui_auto_bright_off(void)
+{
+	if (!conf.auto_bright)
+		return;
+	conf.auto_bright = false;
+	if (auto_bright_sw)
+		lv_obj_remove_state(auto_bright_sw, LV_STATE_CHECKED);
+	auto_bright_sync();
+}
+
+static void auto_bright_cb(lv_event_t *e)
+{
+	conf.auto_bright = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+	auto_bright_sync();
+	conf_save();
+}
 
 static void bright_cb(lv_event_t *e)
 {
 	int v = lv_slider_get_value(lv_event_get_target(e));
 	char buf[16];
 
+	ui_auto_bright_off();
 	backlight_set(v);
 	conf.bright = v;
 	conf_save_later();
@@ -77,12 +113,29 @@ void open_display(lv_event_t *e)
 	lv_obj_set_style_pad_column(c, 12, 0);
 	m3_label(c, LV_SYMBOL_IMAGE, &lv_font_montserrat_20, M.on_surface_v);
 	s = row_slider(c, false);
+	bright_slider = s;
+	obj_track(&bright_slider);
 	lv_slider_set_range(s, 5, 100);
 	lv_slider_set_value(s, backlight_get(), LV_ANIM_OFF);
 	lv_obj_add_event_cb(s, bright_cb, LV_EVENT_VALUE_CHANGED, NULL);
 	bright_val = slider_value(c);
 	obj_track(&bright_val);
 	lv_label_set_text_fmt(bright_val, "%d%%", backlight_get());
+
+	if (als_present()) {
+		c = m3_card(body, M.surface_c);
+		lv_obj_set_height(c, LV_SIZE_CONTENT);
+		lv_obj_set_style_min_height(c, 64, 0);
+		s = m3_label(c, "Auto-brightness", &lv_font_montserrat_14, M.on_surface);
+		lv_obj_align(s, LV_ALIGN_LEFT_MID, 0, 0);
+		s = ios_switch(lv_switch_create(c));
+		auto_bright_sw = s;
+		obj_track(&auto_bright_sw);
+		lv_obj_align(s, LV_ALIGN_RIGHT_MID, 0, 0);
+		if (conf.auto_bright)
+			lv_obj_add_state(s, LV_STATE_CHECKED);
+		lv_obj_add_event_cb(s, auto_bright_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	}
 
 	m3_section(body, "Theme");
 	bm = lv_buttonmatrix_create(body);

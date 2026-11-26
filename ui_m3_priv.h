@@ -37,6 +37,7 @@ struct n72_conf {
 	int autorot;		/* Auto-rotate (quick settings): ROT_AUTO or ROT_LOCKED */
 	int rotlock;		/* with it off: the turn it was left in, 0, 90 or 270 */
 	int bright;		/* brightness %, 0 = as it is */
+	bool auto_bright;	/* automatic brightness from ambient light sensor */
 	int wifi, bt;		/* left on (1) or off (0); -1 not set */
 	bool wp_accent;		/* the colours from the home wallpaper (wallpaper.c) */
 	char dock[200];		/* the dock's icons, names joined by '|' (dock.c) */
@@ -566,6 +567,8 @@ void bt_auto_tick(lv_timer_t *t);
 
 /* ui_settings.c */
 void open_display(lv_event_t *e);
+void ui_bright_sync_widgets(int pct);
+void ui_auto_bright_off(void);
 void open_power(lv_event_t *e);
 void open_about(lv_event_t *e);
 extern lv_obj_t *vol_hud;

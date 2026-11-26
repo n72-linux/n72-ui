@@ -92,6 +92,8 @@ extern lv_indev_t *touch_indev;
 extern int tty_fd;
 int backlight_get(void);
 void backlight_set(int pct);
+bool als_present(void);
+void auto_bright_sync(void);
 extern char rt_node[64];
 lv_timer_t *awake_timer(lv_timer_cb_t cb, uint32_t ms, void *ud);
 void awake_timer_delete(lv_timer_t *t);

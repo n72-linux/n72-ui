@@ -710,8 +710,11 @@ void home_wake(void)
 
 static void home_bright_cb(lv_event_t *e)
 {
-	backlight_set(lv_slider_get_value(lv_event_get_target(e)));
-	conf.bright = lv_slider_get_value(lv_event_get_target(e));
+	int v = lv_slider_get_value(lv_event_get_target(e));
+
+	ui_auto_bright_off();
+	backlight_set(v);
+	conf.bright = v;
 	conf_save_later();
 	shade_changed(home_bright);
 }

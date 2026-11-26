@@ -24,6 +24,7 @@
  * n72-ui --bench times full-screen redraws and exits.
  */
 #include "main_priv.h"
+#include <math.h>
 #include "lvgl/src/misc/lv_anim_private.h"	/* (ios_motion.h reads act_time) */
 #include "ios_motion.h"
 
@@ -571,7 +572,7 @@ void ui_lock(void);
  * picture, the accelerometer, the idle timeout, ...): paused while it is
  * dark, so a dark screen (sound playing, or on USB power) wakes nothing.
  */
-#define NAWAKE 12
+#define NAWAKE 16
 static lv_timer_t *awake_t[NAWAKE];
 static int nawake;
 
@@ -627,6 +628,7 @@ void screen_set(bool on)
 	if (screen_off == on)
 		awake_set(on);		/* (on a change only) */
 	screen_off = !on;
+	auto_bright_sync();
 	if (!on)
 		rot_motion_off();	/* the accelerometer may power down */
 	if (fade && !on)
@@ -750,6 +752,56 @@ void ui_unwatch(int fd)
 }
 
 #include "ui_m3_priv.h"
+
+/* ------------------------------------------------------------ auto-brightness */
+
+#define ALS_DIR "/sys/bus/i2c/devices/1-0044"
+
+static lv_timer_t *als_timer;
+
+bool als_present(void)
+{
+	return access(ALS_DIR "/lux", R_OK) == 0 &&
+	       access(ALS_DIR "/power_state", W_OK) == 0;
+}
+
+static void als_tick(lv_timer_t *t)
+{
+	int lux, target, cur, next;
+
+	LV_UNUSED(t);
+	if (!conf.auto_bright || screen_off)
+		return;
+	lux = read_int(ALS_DIR "/lux", -1);
+	if (lux < 0)
+		return;
+	target = 12 + (int)(88.0 * log1p((double)lux) / log1p(3000.0) + 0.5);
+	target = LV_CLAMP(12, target, 100);
+	cur = backlight_get();
+	if (abs(target - cur) < 6)
+		return;
+	next = cur + LV_CLAMP(-6, target - cur, 6);
+	backlight_set(next);
+	ui_bright_sync_widgets(next);
+}
+
+void auto_bright_sync(void)
+{
+	bool want = conf.auto_bright && !screen_off && als_present();
+
+	if (want) {
+		write_int(ALS_DIR "/power_state", 1);
+		if (!als_timer)
+			als_timer = awake_timer(als_tick, 1000, NULL);
+	} else {
+		if (als_timer) {
+			awake_timer_delete(als_timer);
+			als_timer = NULL;
+		}
+		if (als_present())
+			write_int(ALS_DIR "/power_state", 0);
+	}
+}
 
 /*
  * The touch router. With an application running, the touch screen serves
