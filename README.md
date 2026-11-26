@@ -92,16 +92,16 @@ at 4.5 MHz, ~0.2 ms per frame) touch reports arrive at ~60 Hz instead of ~42.
 ## Build
 
 LVGL goes in `../lvgl-src/lvgl`: v9.2.2 with our patches on top (the working
-tree's is v9.2.2 plus seven commits marked `(n72)`). The GPU part links
+tree's is v9.2.2 plus eight commits marked `(n72)`). The GPU part links
 `../n72-gles` (`build/libn72mbxmem.a`; `build-clang/` for clang). From the workspace root, on the Mac (the cross gcc of
 `n72-alpine/toolchain`, GCC 16.2, see its README, into `build/n72-ui/`;
 `N72_CC=clang` for clang, the build `pgo/n72ui.profdata` applies to, into
 `build/n72-ui-clang/`):
 
     sh n72-ui/build.sh
-    N72_DEBUG=1 sh n72-ui/build.sh   # with --bench and timing diagnostics
+    N72_DEBUG=1 sh n72-ui/build.sh   # with --bench and timing diagnostics (into build/n72-ui-debug/)
 
-The static binary is `n72-ui` in that folder (`n72-ui.debug` beside it is the
+The static binary is `n72-ui` in the corresponding build folder (`n72-ui.debug` beside it is the
 unstripped copy). `n72-alpine/build.sh` packs it as the `n72-ui` package
 (`/usr/bin/n72-ui`) for the Alpine root; the OpenRC service `n72-ui`
 (`n72-alpine/pkg/n72-ui/files/etc/init.d/n72-ui`) starts it at boot, restarts
@@ -143,7 +143,7 @@ line to skip it.
 
 ## Kernel
 
-Runs on the n72 branch of [kailashrs/linux](https://github.com/kailashrs/linux/tree/n72)
+Runs on the n72 branch of [n72-linux/linux](https://github.com/n72-linux/linux/tree/n72)
 (n72-clcd display (KMS; `/dev/fb0` for the console layer), Zephyr2 touchscreen,
 gpio-keys).
 

@@ -15,13 +15,14 @@ render time per frame while scrolling ~5% lower (Logs 7.8 -> 7.4 ms, Files
 6.85 -> 6.19 ms; frame rates unchanged (the scrolls wait for the display,
 55-64 fps either way); --bench and text checksums identical. -O3 with the
 profile: canvas text 5.79 ms, the rest no better and a 45 KB larger
-binary, so -O2 stays.
+binary, so -O2 stays for clang+PGO (whereas the default GCC 16 build
+defaults to OPT=-O3 with -flto=auto -fno-stack-protector).
 
 A function changed since the profile is built as without one (clang checks
 a hash per function); make a new one after larger changes:
 
   1. N72_CC=clang PGO_GEN=1 sh n72-ui/build.sh
-     (n72-ui-build-clang-pgogen/; the runtime is n72-gles/pgo-rt/libclang_rt.profile-armhf.a)
+     (build/n72-ui-clang-pgogen/; the runtime is n72-gles/pgo-rt/libclang_rt.profile-armhf.a)
   2. On the device: that binary as /root/n72-ui-pgogen, the training script
      (pgo/train.sh: harness runs with
      LLVM_PROFILE_FILE=/root/pgo/ui-%p.profraw; the counters are written
@@ -42,7 +43,7 @@ To see what a build finds: compile a file with -Wbackend-plugin -mllvm
 
 gcc (the compiler the rule asks for; no gcc profile exists yet): the same
 steps with the default compiler. PGO_GEN=1 sh n72-ui/build.sh gives
-n72-ui-build-pgogen/; on the device it writes /tmp/n72ui-pgo/obj#NAME.gcda
+build/n72-ui-pgogen/; on the device it writes /tmp/n72ui-pgo/obj#NAME.gcda
 at exit (PGO_DIR); those files go in pgo/gcc/. The names are relative to
 the output folder (build.sh), so the profiled build finds them from any
 folder: checked 2026-11-23, the 131 names in the instrumented binary are
