@@ -7,6 +7,62 @@
 static lv_obj_t *bright_val;
 static lv_obj_t *bright_slider;
 static lv_obj_t *auto_bright_sw;
+static lv_obj_t *night_sw;
+static lv_obj_t *night_slider;
+static lv_obj_t *night_val;
+static lv_timer_t *night_apply_timer;
+
+void display_night_apply(void)
+{
+	mbx_gpu_set_warmth(conf.night_shift ? conf.night_warmth : 0);
+}
+
+static void night_apply_cb(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	night_apply_timer = NULL;
+	display_night_apply();
+}
+
+static void night_sw_cb(lv_event_t *e)
+{
+	conf.night_shift = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+	if (night_apply_timer) {
+		lv_timer_delete(night_apply_timer);
+		night_apply_timer = NULL;
+	}
+	display_night_apply();
+	conf_save();
+}
+
+static void night_warmth_cb(lv_event_t *e)
+{
+	int v = lv_slider_get_value(lv_event_get_target(e));
+	char buf[16];
+
+	conf.night_warmth = v;
+	snprintf(buf, sizeof(buf), "%d%%", v);
+	label_set_if_changed(night_val, buf);
+	if (!conf.night_shift) {
+		conf.night_shift = true;
+		if (night_sw)
+			lv_obj_add_state(night_sw, LV_STATE_CHECKED);
+	}
+	if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+		if (night_apply_timer) {
+			lv_timer_delete(night_apply_timer);
+			night_apply_timer = NULL;
+		}
+		display_night_apply();
+		conf_save();
+		return;
+	}
+	if (!night_apply_timer) {
+		night_apply_timer = lv_timer_create(night_apply_cb, 60, NULL);
+		lv_timer_set_repeat_count(night_apply_timer, 1);
+	}
+	conf_save_later();
+}
 
 void ui_bright_sync_widgets(int pct)
 {
@@ -135,6 +191,49 @@ void open_display(lv_event_t *e)
 		if (conf.auto_bright)
 			lv_obj_add_state(s, LV_STATE_CHECKED);
 		lv_obj_add_event_cb(s, auto_bright_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	}
+
+	if (mbx_gpu_gamma_supported()) {
+		m3_section(body, "Night Shift");
+		c = m3_card(body, M.surface_c);
+		lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+		lv_obj_set_style_pad_row(c, 12, 0);
+		row = lv_obj_create(c);
+		plain(row);
+		lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+		lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+		lv_obj_set_style_pad_all(row, 0, 0);
+		lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+		s = m3_label(row, "Warm color tint", &lv_font_montserrat_14, M.on_surface);
+		lv_obj_align(s, LV_ALIGN_LEFT_MID, 0, 0);
+		s = ios_switch(lv_switch_create(row));
+		night_sw = s;
+		obj_track(&night_sw);
+		lv_obj_align(s, LV_ALIGN_RIGHT_MID, 0, 0);
+		if (conf.night_shift)
+			lv_obj_add_state(s, LV_STATE_CHECKED);
+		lv_obj_add_event_cb(s, night_sw_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+		row = lv_obj_create(c);
+		plain(row);
+		lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+		lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+		lv_obj_set_style_pad_all(row, 0, 0);
+		lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+		lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+		lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+		lv_obj_set_style_pad_column(row, 12, 0);
+		m3_label(row, "Warmth", &lv_font_montserrat_12, M.on_surface_v);
+		s = row_slider(row, false);
+		night_slider = s;
+		obj_track(&night_slider);
+		lv_slider_set_range(s, 10, 100);
+		lv_slider_set_value(s, conf.night_warmth, LV_ANIM_OFF);
+		lv_obj_add_event_cb(s, night_warmth_cb, LV_EVENT_VALUE_CHANGED, NULL);
+		lv_obj_add_event_cb(s, night_warmth_cb, LV_EVENT_RELEASED, NULL);
+		night_val = slider_value(row);
+		obj_track(&night_val);
+		lv_label_set_text_fmt(night_val, "%d%%", conf.night_warmth);
 	}
 
 	m3_section(body, "Theme");

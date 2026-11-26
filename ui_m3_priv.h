@@ -38,6 +38,8 @@ struct n72_conf {
 	int rotlock;		/* with it off: the turn it was left in, 0, 90 or 270 */
 	int bright;		/* brightness %, 0 = as it is */
 	bool auto_bright;	/* automatic brightness from ambient light sensor */
+	bool night_shift;	/* warm hardware gamma LUT */
+	int night_warmth;	/* Night Shift warmth %, 10..100 */
 	int wifi, bt;		/* left on (1) or off (0); -1 not set */
 	bool wp_accent;		/* the colours from the home wallpaper (wallpaper.c) */
 	char dock[200];		/* the dock's icons, names joined by '|' (dock.c) */
@@ -570,6 +572,7 @@ void bt_auto_tick(lv_timer_t *t);
 
 /* ui_settings.c */
 void open_display(lv_event_t *e);
+void display_night_apply(void);
 void ui_bright_sync_widgets(int pct);
 void ui_auto_bright_off(void);
 void open_power(lv_event_t *e);

@@ -698,6 +698,7 @@ static uint32_t kms_fb_l[NSCAN];
 static uint32_t kms_plane, kms_prop_rot, kms_prop_fb, kms_prop_sw, kms_prop_sh;
 static uint32_t kms_prop_cx, kms_prop_cy, kms_prop_cw, kms_prop_ch, kms_prop_sx, kms_prop_sy;
 static uint32_t kms_prop_plane_crtc, kms_prop_active, kms_prop_mode_id, kms_prop_conn_crtc;
+static uint32_t kms_prop_gamma_lut, kms_gamma_size;
 static uint32_t kms_mode_blob;
 static uint64_t kms_rot_cur;		/* the plane's rotation (DRM_MODE_ROTATE_*) */
 
@@ -1331,6 +1332,13 @@ static bool kms_setup(bool shell_layer)
 	kms_crtc = crtcs[0];
 	kms_conn = conns[0];
 	kms_mode = modes[0];
+	{
+		struct drm_mode_crtc c = { .crtc_id = kms_crtc };
+
+		if (!ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &c))
+			kms_gamma_size = c.gamma_size;
+		kms_prop_gamma_lut = kms_obj_prop(fd, kms_crtc, DRM_MODE_OBJECT_CRTC, "GAMMA_LUT");
+	}
 	/* probe plane & rotation before importing framebuffers so kms_import_scan creates kms_fb_l[] */
 	if (kms_find_plane(fd)) {
 		uint32_t ls = buf_width_to_stride(fb.height, LV_COLOR_FORMAT_XRGB8888);
@@ -1399,6 +1407,66 @@ fail:
 	if (fd >= 0)
 		close(fd);
 	return false;
+}
+
+bool mbx_gpu_gamma_supported(void)
+{
+	return kms_fd >= 0 && kms_prop_gamma_lut != 0 && kms_gamma_size == 256;
+}
+
+bool mbx_gpu_set_warmth(int pct)
+{
+	uint32_t objs[1], counts[1], props[1], blob = 0;
+	uint64_t vals[1];
+	struct drm_mode_atomic a = { 0 };
+	int ret;
+
+	if (!mbx_gpu_gamma_supported())
+		return false;
+	if (pct < 0)
+		pct = 0;
+	if (pct > 100)
+		pct = 100;
+	flip_wait();
+	if (pct > 0) {
+		struct drm_color_lut lut[256];
+		struct drm_mode_create_blob cb = {
+			.data = (uintptr_t)lut,
+			.length = sizeof(lut),
+		};
+		double t = pct / 100.0;
+		double gg = 1.0 - 0.14 * t;
+		double bg = 1.0 - 0.42 * t;
+		int i;
+
+		for (i = 0; i < 256; i++) {
+			uint16_t v = (uint16_t)(i * 65535 / 255);
+
+			lut[i].red = v;
+			lut[i].green = (uint16_t)(v * gg + 0.5);
+			lut[i].blue = (uint16_t)(v * bg + 0.5);
+			lut[i].reserved = 0;
+		}
+		if (ioctl(kms_fd, DRM_IOCTL_MODE_CREATEPROPBLOB, &cb))
+			return false;
+		blob = cb.blob_id;
+	}
+	objs[0] = kms_crtc;
+	counts[0] = 1;
+	props[0] = kms_prop_gamma_lut;
+	vals[0] = blob;
+	a.count_objs = 1;
+	a.objs_ptr = (uintptr_t)objs;
+	a.count_props_ptr = (uintptr_t)counts;
+	a.props_ptr = (uintptr_t)props;
+	a.prop_values_ptr = (uintptr_t)vals;
+	ret = ioctl(kms_fd, DRM_IOCTL_MODE_ATOMIC, &a);
+	if (blob) {
+		struct drm_mode_destroy_blob db = { .blob_id = blob };
+
+		ioctl(kms_fd, DRM_IOCTL_MODE_DESTROYPROPBLOB, &db);
+	}
+	return ret == 0;
 }
 
 static uint8_t *alloc_scan_buf(uint32_t size, int i)

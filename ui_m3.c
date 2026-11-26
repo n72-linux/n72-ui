@@ -61,7 +61,7 @@ void np_lock_sync(void);
 #define CONF_OLD "/tmp/n72-ui.conf"
 
 
-struct n72_conf conf = { true, 0, 120, 60, true, true, 0, 0, 0, false, -1, -1, false, "", false, "", false, "", false, "", 0, 0, false, false };
+struct n72_conf conf = { true, 0, 120, 60, true, true, 0, 0, 0, false, false, 50, -1, -1, false, "", false, "", false, "", false, "", 0, 0, false, false };
 
 /*
  * Auto-rotate on: the screen turns with the iPod. Off: it stays as it was
@@ -124,6 +124,10 @@ void conf_load(void)
 			conf.bright = v;
 		else if (sscanf(line, "autobright=%d", &v) == 1)
 			conf.auto_bright = !!v;
+		else if (sscanf(line, "night=%d", &v) == 1)
+			conf.night_shift = !!v;
+		else if (sscanf(line, "warmth=%d", &v) == 1 && v >= 10 && v <= 100)
+			conf.night_warmth = v;
 		else if (sscanf(line, "wifi=%d", &v) == 1)
 			conf.wifi = !!v;
 		else if (sscanf(line, "bt=%d", &v) == 1)
@@ -166,9 +170,10 @@ void conf_save(void)
 	if (!f)
 		return;
 	fprintf(f, "dark=%d\naccent=%d\nidle=%d\nvol=%d\nspk=%d\nplug=%d\nrot=%d\nrotlock=%d\n"
-		"bright=%d\nautobright=%d\nwifi=%d\nbt=%d\nwpaccent=%d\n", conf.dark, conf.accent,
-		conf.idle_s, conf.vol, conf.spk, conf.wake_plug, conf.autorot, conf.rotlock,
-		conf.bright, conf.auto_bright, conf.wifi, conf.bt, conf.wp_accent);
+		"bright=%d\nautobright=%d\nnight=%d\nwarmth=%d\nwifi=%d\nbt=%d\nwpaccent=%d\n",
+		conf.dark, conf.accent, conf.idle_s, conf.vol, conf.spk, conf.wake_plug,
+		conf.autorot, conf.rotlock, conf.bright, conf.auto_bright, conf.night_shift,
+		conf.night_warmth, conf.wifi, conf.bt, conf.wp_accent);
 	if (conf.dock_set)	/* (only once changed: the file is as it was till then) */
 		fprintf(f, "dock=%s\n", conf.dock);
 	if (conf.order_set)

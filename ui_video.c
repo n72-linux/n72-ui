@@ -1540,6 +1540,7 @@ void ui_apply_saved(void)
 	if (conf.bright >= 5)
 		backlight_set(conf.bright);
 	auto_bright_sync();
+	display_night_apply();
 	if (conf.wifi == 0 && have_tool("n72-wifi") && wifi_powered())
 		job_run("n72-wifi off", NULL, NULL, NULL);
 	if (conf.bt == 0 && have_tool("bluetoothctl"))
