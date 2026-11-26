@@ -642,6 +642,7 @@ static void plug_changed(void)
 		return;
 	}
 	last_plug = plug;
+	battery_crit_check();
 	if (screen_off && conf.wake_plug) {	/* Settings > Display */
 		screen_off_for_sound = false;
 		screen_set(true);
@@ -672,8 +673,10 @@ static void uevent_ev(int fd)
 	}
 	if (usb)
 		plug_changed();
-	if (psy)
+	if (psy) {
 		status_kick(true, false);	/* the battery text: bolt, level */
+		battery_crit_check();
+	}
 }
 
 void uevent_init(void)

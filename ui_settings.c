@@ -448,6 +448,7 @@ static void about_update(lv_timer_t *t)
 	struct sysinfo si;
 	FILE *f;
 	int cap, mv, ilim;
+	enum batt_lvl blvl;
 
 	LV_UNUSED(t);
 	if (!uname(&u))
@@ -474,8 +475,10 @@ static void about_update(lv_timer_t *t)
 	cap = read_sysfs_int("/sys/class/power_supply/battery/capacity", -1);
 	mv = read_sysfs_int("/sys/class/power_supply/battery/voltage_now", 0) / 1000;
 	ilim = read_sysfs_int("/sys/class/power_supply/usb/input_current_limit", 0) / 1000;
-	snprintf(buf, sizeof(buf), "%d%%, %d.%02d V%s", cap, mv / 1000, mv % 1000 / 10,
-		 usb_powered() ? "" : ", on battery");
+	blvl = battery_cap_level();
+	snprintf(buf, sizeof(buf), "%d%%%s, %d.%02d V%s", cap,
+		 blvl == BATT_CRITICAL ? " (Critical)" : blvl == BATT_LOW ? " (Low)" : "",
+		 mv / 1000, mv % 1000 / 10, usb_powered() ? "" : ", on battery");
 	if (usb_powered())
 		snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "\nUSB power, %d mA limit", ilim);
 	label_set_if_changed(about_val[4], buf);

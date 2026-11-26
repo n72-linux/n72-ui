@@ -52,6 +52,9 @@ struct n72_conf {
 };
 
 /* ui_m3.c and the files of the user interface, used by main.c and sleep.c */
+enum batt_lvl { BATT_NORMAL, BATT_LOW, BATT_CRITICAL };
+enum batt_lvl battery_cap_level(void);
+void battery_crit_check(void);
 extern struct n72_conf conf;
 extern pid_t app_pid;
 extern bool locked;

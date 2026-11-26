@@ -40,6 +40,110 @@ static void battery_text(char *buf, size_t len)
 		 cap, icon);
 }
 
+enum batt_lvl battery_cap_level(void)
+{
+	char buf[24] = "";
+	FILE *f = fopen("/sys/class/power_supply/battery/capacity_level", "r");
+
+	if (!f)
+		return BATT_NORMAL;
+	if (!fgets(buf, sizeof(buf), f))
+		buf[0] = 0;
+	fclose(f);
+	buf[strcspn(buf, "\r\n")] = 0;
+	if (!strcmp(buf, "Critical"))
+		return BATT_CRITICAL;
+	if (!strcmp(buf, "Low"))
+		return BATT_LOW;
+	return BATT_NORMAL;
+}
+
+static bool battery_warn(void)
+{
+	return !usb_powered() && battery_cap_level() != BATT_NORMAL;
+}
+
+static void battery_style_label(lv_obj_t *lbl, lv_color_t normal_col, bool warn)
+{
+	lv_color_t c;
+
+	if (!lbl || !lv_obj_is_valid(lbl))
+		return;
+	c = warn ? M.error : normal_col;
+	if (!lv_color_eq(lv_obj_get_style_text_color(lbl, 0), c))
+		lv_obj_set_style_text_color(lbl, c, 0);
+}
+
+static lv_obj_t *crit_banner, *crit_lbl;
+static lv_timer_t *crit_timer;
+static int crit_secs;
+
+static void battery_crit_stop(void)
+{
+	if (crit_timer) {
+		lv_timer_delete(crit_timer);
+		crit_timer = NULL;
+	}
+	if (crit_banner && lv_obj_is_valid(crit_banner))
+		lv_obj_delete(crit_banner);
+	crit_banner = NULL;
+	crit_lbl = NULL;
+}
+
+static void battery_crit_tick(lv_timer_t *t)
+{
+	char msg[80];
+
+	LV_UNUSED(t);
+	if (usb_powered() || battery_cap_level() != BATT_CRITICAL) {
+		battery_crit_stop();
+		return;
+	}
+	if (--crit_secs <= 0) {
+		battery_crit_stop();
+		sync();
+		reboot(RB_POWER_OFF);
+		return;
+	}
+	if (crit_lbl && lv_obj_is_valid(crit_lbl)) {
+		snprintf(msg, sizeof(msg),
+			 LV_SYMBOL_WARNING "  Battery critically low — shutting down in %d s",
+			 crit_secs);
+		label_set_if_changed(crit_lbl, msg);
+	}
+}
+
+void battery_crit_check(void)
+{
+	const char *no_off = getenv("N72_NO_CRIT_OFF");
+
+	if (usb_powered() || battery_cap_level() != BATT_CRITICAL ||
+	    (no_off && strcmp(no_off, "0") != 0)) {
+		battery_crit_stop();
+		return;
+	}
+	if (crit_timer)
+		return;
+	crit_secs = 10;
+	crit_banner = lv_obj_create(lv_layer_top());
+	plain(crit_banner);
+	obj_track(&crit_banner);
+	lv_obj_set_size(crit_banner, LV_MIN(W - 32, 288), LV_SIZE_CONTENT);
+	lv_obj_align(crit_banner, LV_ALIGN_TOP_MID, 0, 48);
+	lv_obj_set_style_radius(crit_banner, 18, 0);
+	lv_obj_set_style_bg_color(crit_banner, M.error, 0);
+	lv_obj_set_style_bg_opa(crit_banner, LV_OPA_COVER, 0);
+	lv_obj_set_style_pad_all(crit_banner, 14, 0);
+	lv_obj_remove_flag(crit_banner, LV_OBJ_FLAG_SCROLLABLE);
+	crit_lbl = m3_label(crit_banner,
+			    LV_SYMBOL_WARNING "  Battery critically low — shutting down in 10 s",
+			    &lv_font_montserrat_14, lv_color_black());
+	obj_track(&crit_lbl);
+	lv_obj_set_width(crit_lbl, lv_pct(100));
+	lv_label_set_long_mode(crit_lbl, LV_LABEL_LONG_WRAP);
+	crit_timer = lv_timer_create(battery_crit_tick, 1000, NULL);
+}
+
 lv_timer_t *home_timer;
 bool app_dormant;
 static bool dormant_status_dirty;
@@ -206,11 +310,16 @@ static int rtnl_fd = -1;
 static void status_batt_update(void)
 {
 	char buf[64];
+	bool warn = battery_warn();
 
 	battery_text(buf, sizeof(buf));
 	label_set_if_changed(batt_lbl, buf);
-	if (home_batt)
+	battery_style_label(batt_lbl, home_wp ? WP_TEXT : M.on_surface_v, warn);
+	if (home_batt) {
 		label_set_if_changed(home_batt, buf);
+		battery_style_label(home_batt, M.on_surface_v, warn);
+	}
+	battery_crit_check();
 	app_bar_update();
 }
 
@@ -348,8 +457,16 @@ void home_update(lv_timer_t *t)
 	}
 	battery_text(buf, sizeof(buf));
 	label_set_if_changed(batt_lbl, buf);
-	if (home_batt)
-		label_set_if_changed(home_batt, buf);
+	{
+		bool warn = battery_warn();
+
+		battery_style_label(batt_lbl, home_wp ? WP_TEXT : M.on_surface_v, warn);
+		if (home_batt) {
+			label_set_if_changed(home_batt, buf);
+			battery_style_label(home_batt, M.on_surface_v, warn);
+		}
+	}
+	battery_crit_check();
 	net_ui_sync();
 }
 
@@ -1303,6 +1420,7 @@ void app_bar_update(void)
 		return;
 	label_set_if_changed(app_bar_time, lv_label_get_text(status_time));
 	label_set_if_changed(app_bar_batt, lv_label_get_text(batt_lbl));
+	battery_style_label(app_bar_batt, M.on_surface_v, battery_warn());
 	/* showing as its picture: the bar itself if that is old now; hidden:
 	 * the picture for the next slide, while nothing moves */
 	psl_check(app_bar);
@@ -1819,8 +1937,10 @@ void lock_update(void)
 	label_set_if_changed(lock_date, buf);
 	battery_text(buf, sizeof(buf));
 	label_set_if_changed(lock_batt, strstr(buf, LV_SYMBOL_CHARGE) ? buf : "");
-	if (lock_bar_batt && batt_lbl)
+	if (lock_bar_batt && batt_lbl) {
 		label_set_if_changed(lock_bar_batt, lv_label_get_text(batt_lbl));
+		battery_style_label(lock_bar_batt, lv_color_hex(0xe8e0f0), battery_warn());
+	}
 	np_lock_sync();
 }
 
