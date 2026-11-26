@@ -94,9 +94,9 @@ at 4.5 MHz, ~0.2 ms per frame) touch reports arrive at ~60 Hz instead of ~42.
 LVGL goes in `../lvgl-src/lvgl`: v9.2.2 with our patches on top (the working
 tree's is v9.2.2 plus seven commits marked `(n72)`). The GPU part links
 `../n72-gles` (`build/libn72mbxmem.a`; `build-clang/` for clang). From the workspace root, on the Mac (the cross gcc of
-`n72-alpine/toolchain`, GCC 16.2, see its README, into `../n72-ui-build/`;
+`n72-alpine/toolchain`, GCC 16.2, see its README, into `build/n72-ui/`;
 `N72_CC=clang` for clang, the build `pgo/n72ui.profdata` applies to, into
-`../n72-ui-build-clang/`):
+`build/n72-ui-clang/`):
 
     sh n72-ui/build.sh
     N72_DEBUG=1 sh n72-ui/build.sh   # with --bench and timing diagnostics

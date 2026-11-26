@@ -1,11 +1,10 @@
 #!/bin/sh
 # Cross-build n72-ui statically for the iPod touch 2G (ARM1176; Alpine armhf:
 # VFP, hard float, musl) on the Mac:
-#   sh n72-ui/build.sh                 the cross gcc (n72-alpine/toolchain) -> n72-ui-build/
-#   N72_CC=clang sh n72-ui/build.sh    Homebrew clang + lld -> n72-ui-build-clang/ (the build
+#   sh n72-ui/build.sh                 the cross gcc (n72-alpine/toolchain) -> build/n72-ui/
+#   N72_CC=clang sh n72-ui/build.sh    Homebrew clang + lld -> build/n72-ui-clang/ (the build
 #                                      pgo/n72ui.profdata, a clang profile, applies to)
-# Kernel uapi headers: KHDR, linux-build-mac/usr/include (`sh n72-alpine/toolchain/kernel.sh headers`)
-# or the last container build's linux-build-alpine/usr/include.
+# Kernel uapi headers: KHDR, build/linux/usr/include (`sh n72-alpine/toolchain/kernel.sh headers`).
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 UI=$(cd "$(dirname "$0")" && pwd)
@@ -13,7 +12,7 @@ UI=$(cd "$(dirname "$0")" && pwd)
 GLES=${GLES:-$ROOT/n72-gles}
 GLES=$(cd "$GLES" && pwd)	# (the build changes directory further down: no relative paths)
 LVGL="$ROOT/lvgl-src/lvgl"
-OUT="$ROOT/$(basename "$UI")-build"
+OUT=${N72_OUT:-$ROOT/build/n72-ui}
 CROSS=${CROSS:-armv6-alpine-linux-musleabihf-}
 command -v "${CROSS}gcc" >/dev/null || . "$ROOT/n72-alpine/toolchain/env.sh"
 N72_CC=${N72_CC:-gcc}
@@ -25,8 +24,8 @@ case "$($CC --version 2>/dev/null)" in *clang*) KIND=clang ;; *) KIND=gcc ;; esa
 # for gcc, build-clang/ for N72_CC=clang)
 GLESLIB=$GLES/build/libn72mbxmem.a
 [ "$N72_CC" = clang ] && [ -f "$GLES/build-clang/libn72mbxmem.a" ] && GLESLIB=$GLES/build-clang/libn72mbxmem.a
-KHDR=${KHDR:-$ROOT/linux-build-mac/usr/include}
-[ -f "$KHDR/linux/types.h" ] || KHDR=$ROOT/linux-build-alpine/usr/include
+KHDR=${KHDR:-$ROOT/build/linux/usr/include}
+[ -f "$KHDR/linux/types.h" ] || KHDR=$ROOT/build/linux-alpine/usr/include
 KHDR=$(cd "$KHDR" && pwd)
 [ -z "$PGO_RT" ] || case $PGO_RT in /*) ;; *) PGO_RT=$PWD/$PGO_RT ;; esac
 PG=
