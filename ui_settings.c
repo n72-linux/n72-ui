@@ -796,7 +796,7 @@ void open_sound(lv_event_t *e)
 	if (conf.spk)
 		lv_obj_add_state(sw, LV_STATE_CHECKED);
 	lv_obj_add_event_cb(sw, snd_spk_cb, LV_EVENT_VALUE_CHANGED, NULL);
-	m3_note(body, "The volume keys change the volume everywhere (in Logs they scroll).");
+	m3_note(body, "The volume keys change the volume everywhere.");
 	if (have_tool("n72tone"))
 		m3_button(body, "Test sound", false, snd_test_cb, NULL);
 	snd_refresh_ui();

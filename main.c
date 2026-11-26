@@ -1375,12 +1375,10 @@ static void keys_poll(lv_timer_t *t)
 			break;
 		/* the volume works with the screen off too (sound playing) */
 		case KEY_VOLUMEUP:
-			if (screen_off || !logs_scroll(1))
-				volume_step(1);
+			volume_step(1);
 			break;
 		case KEY_VOLUMEDOWN:
-			if (screen_off || !logs_scroll(-1))
-				volume_step(-1);
+			volume_step(-1);
 			break;
 		}
 	}

@@ -596,7 +596,6 @@ void open_ipa_install(const char *path);
 void open_settings(lv_event_t *e);
 
 /* ui_logs.c */
-bool logs_scroll(int dir);
 void open_logs(lv_event_t *e);
 void ui_reopen(void);
 

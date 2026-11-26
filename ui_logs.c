@@ -257,14 +257,6 @@ static void logs_update(lv_timer_t *t)
 		logs_show();
 }
 
-bool logs_scroll(int dir)
-{
-	if (!logs_box)
-		return false;
-	lv_obj_scroll_by(logs_box, 0, dir * 160, LV_ANIM_OFF);
-	return true;
-}
-
 static void logs_delete_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
