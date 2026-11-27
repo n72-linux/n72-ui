@@ -9,12 +9,13 @@ lv_obj_t *home_card, *home_clock, *home_date, *home_batt, *home_net;	/* the widg
 lv_obj_t *qs_wifi_sub, *qs_bt_sub, *qs_wifi, *qs_bt;
 lv_obj_t *set_wifi_sub, *set_bt_sub;	/* on the Settings page */
 
-static void battery_text(char *buf, size_t len)
+/* Battery icon + charge + percentage for the bar; @usb avoids re-reading sysfs. */
+static void battery_text_usb(char *buf, size_t len, bool usb)
 {
-	char st[16] = "";
-	const char *icon;
-	FILE *f;
 	int cap = read_sysfs_int("/sys/class/power_supply/battery/capacity", -1);
+	const char *icon;
+	char st[24] = "";
+	FILE *f;
 
 	if (cap < 0) {
 		buf[0] = 0;
@@ -35,9 +36,13 @@ static void battery_text(char *buf, size_t len)
 	 * looked as on battery.
 	 */
 	snprintf(buf, len, "%s%d%%  %s",
-		 !strncmp(st, "Charging", 8) ||
-		 read_sysfs_int("/sys/class/power_supply/usb/online", 0) == 1 ? LV_SYMBOL_CHARGE " " : "",
+		 (!strncmp(st, "Charging", 8) || usb) ? LV_SYMBOL_CHARGE " " : "",
 		 cap, icon);
+}
+
+static void battery_text(char *buf, size_t len)
+{
+	battery_text_usb(buf, len, usb_powered());
 }
 
 enum batt_lvl battery_cap_level(void)
@@ -58,9 +63,14 @@ enum batt_lvl battery_cap_level(void)
 	return BATT_NORMAL;
 }
 
+static bool batt_warn_cached;
+
 static bool battery_warn(void)
 {
-	return !usb_powered() && battery_cap_level() != BATT_NORMAL;
+	bool warn = !usb_powered() && battery_cap_level() != BATT_NORMAL;
+
+	batt_warn_cached = warn;
+	return warn;
 }
 
 static void battery_style_label(lv_obj_t *lbl, lv_color_t normal_col, bool warn)
@@ -113,7 +123,7 @@ static void battery_crit_tick(lv_timer_t *t)
 	}
 }
 
-void battery_crit_check(void)
+static void battery_crit_check_state(enum batt_lvl blvl, bool usb)
 {
 #ifdef N72_DEBUG
 	const char *no_off = getenv("N72_NO_CRIT_OFF");
@@ -123,7 +133,7 @@ void battery_crit_check(void)
 		return;
 	}
 #endif
-	if (usb_powered() || battery_cap_level() != BATT_CRITICAL) {
+	if (usb || blvl != BATT_CRITICAL) {
 		battery_crit_stop();
 		return;
 	}
@@ -147,6 +157,15 @@ void battery_crit_check(void)
 	lv_obj_set_width(crit_lbl, lv_pct(100));
 	lv_label_set_long_mode(crit_lbl, LV_LABEL_LONG_WRAP);
 	crit_timer = lv_timer_create(battery_crit_tick, 1000, NULL);
+}
+
+void battery_crit_check(void)
+{
+	bool usb = usb_powered();
+	enum batt_lvl blvl = battery_cap_level();
+
+	batt_warn_cached = !usb && blvl != BATT_NORMAL;
+	battery_crit_check_state(blvl, usb);
 }
 
 lv_timer_t *home_timer;
@@ -315,16 +334,19 @@ static int rtnl_fd = -1;
 static void status_batt_update(void)
 {
 	char buf[64];
-	bool warn = battery_warn();
+	bool usb = usb_powered();
+	enum batt_lvl blvl = battery_cap_level();
+	bool warn = !usb && blvl != BATT_NORMAL;
 
-	battery_text(buf, sizeof(buf));
+	batt_warn_cached = warn;
+	battery_text_usb(buf, sizeof(buf), usb);
 	label_set_if_changed(batt_lbl, buf);
 	battery_style_label(batt_lbl, home_wp ? WP_TEXT : M.on_surface_v, warn);
 	if (home_batt) {
 		label_set_if_changed(home_batt, buf);
 		battery_style_label(home_batt, M.on_surface_v, warn);
 	}
-	battery_crit_check();
+	battery_crit_check_state(blvl, usb);
 	app_bar_update();
 }
 
@@ -460,18 +482,21 @@ void home_update(lv_timer_t *t)
 		snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
 		label_set_if_changed(home_clock, buf);
 	}
-	battery_text(buf, sizeof(buf));
-	label_set_if_changed(batt_lbl, buf);
 	{
-		bool warn = battery_warn();
+		bool usb = usb_powered();
+		enum batt_lvl blvl = battery_cap_level();
+		bool warn = !usb && blvl != BATT_NORMAL;
 
+		batt_warn_cached = warn;
+		battery_text_usb(buf, sizeof(buf), usb);
+		label_set_if_changed(batt_lbl, buf);
 		battery_style_label(batt_lbl, home_wp ? WP_TEXT : M.on_surface_v, warn);
 		if (home_batt) {
 			label_set_if_changed(home_batt, buf);
 			battery_style_label(home_batt, M.on_surface_v, warn);
 		}
+		battery_crit_check_state(blvl, usb);
 	}
-	battery_crit_check();
 	net_ui_sync();
 }
 
@@ -1458,7 +1483,7 @@ void app_bar_update(void)
 		return;
 	label_set_if_changed(app_bar_time, lv_label_get_text(status_time));
 	label_set_if_changed(app_bar_batt, lv_label_get_text(batt_lbl));
-	battery_style_label(app_bar_batt, M.on_surface_v, battery_warn());
+	battery_style_label(app_bar_batt, M.on_surface_v, batt_warn_cached);
 	/* showing as its picture: the bar itself if that is old now; hidden:
 	 * the picture for the next slide, while nothing moves */
 	psl_check(app_bar);

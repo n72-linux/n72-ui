@@ -20,11 +20,8 @@ void display_night_apply(void)
 
 void display_mie_apply(void)
 {
-	FILE *f;
+	FILE *f = fopen(CLCD_MIE_PATH, "w");
 
-	if (access(CLCD_MIE_PATH, W_OK) != 0)
-		return;
-	f = fopen(CLCD_MIE_PATH, "w");
 	if (f) {
 		fprintf(f, "%d\n", conf.mie_mode);
 		fclose(f);
@@ -91,6 +88,7 @@ static void night_sw_cb(lv_event_t *e)
 static void night_warmth_cb(lv_event_t *e)
 {
 	int v = lv_slider_get_value(lv_event_get_target(e));
+	bool turned_on = false;
 	char buf[16];
 
 	conf.night_warmth = v;
@@ -98,13 +96,16 @@ static void night_warmth_cb(lv_event_t *e)
 	label_set_if_changed(night_val, buf);
 	if (!conf.night_shift) {
 		conf.night_shift = true;
+		turned_on = true;
 		ui_night_sync_widgets();
 	}
-	qs_night_sync();
 	pf_label_changed(lv_event_get_target(e));
 	if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+		qs_night_sync();
 		display_night_apply();
 		conf_save();
+	} else if (turned_on) {
+		qs_night_sync();
 	}
 }
 
