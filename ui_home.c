@@ -115,10 +115,15 @@ static void battery_crit_tick(lv_timer_t *t)
 
 void battery_crit_check(void)
 {
+#ifdef N72_DEBUG
 	const char *no_off = getenv("N72_NO_CRIT_OFF");
 
-	if (usb_powered() || battery_cap_level() != BATT_CRITICAL ||
-	    (no_off && strcmp(no_off, "0") != 0)) {
+	if (no_off && strcmp(no_off, "0") != 0) {
+		battery_crit_stop();
+		return;
+	}
+#endif
+	if (usb_powered() || battery_cap_level() != BATT_CRITICAL) {
 		battery_crit_stop();
 		return;
 	}
