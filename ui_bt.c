@@ -637,9 +637,11 @@ void bt_auto_tick(lv_timer_t *t)
 	    !have_tool("bluetoothctl"))
 		return;
 	bt_auto_busy = true;
+#ifdef N72_DEBUG
 	if (getenv("N72_STATUS_LOG"))
 		fprintf(stderr, "n72-ui: connect automatically: a try (next in %u s)\n",
 			(unsigned)bt_auto_gap / 1000);
+#endif
 	bt_auto_gap = LV_MIN(bt_auto_gap * 2, BT_AUTO_MAX_MS);	/* (a find sets it back) */
 	/* paired, and not connected to anything else of ours ("C " lines: connected) */
 	if (job_run("c=$(bluetoothctl devices Connected | grep Device); "

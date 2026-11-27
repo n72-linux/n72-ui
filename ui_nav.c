@@ -826,8 +826,10 @@ static void sc_settle(lv_timer_t *t)
 		return;			/* still moving, or recently: look again */
 	lv_timer_delete(t);
 	sc.timer = NULL;
+#ifdef N72_DEBUG
 	if (getenv("N72_SC_KEEP"))
 		return;			/* test: pictures stay (compare with N72_NO_SCROLL_CACHE) */
+#endif
 	if (sc.owner == body)
 		sc_restore(true);
 }
@@ -1833,9 +1835,9 @@ void pf_init(void)
 	if (getenv("N72_FPS"))
 		for (lv_indev_t *in = lv_indev_get_next(NULL); in; in = lv_indev_get_next(in))
 			lv_indev_add_event_cb(in, ui_release_cb, LV_EVENT_RELEASED, NULL);
-#endif
 	if (getenv("N72_NO_SCROLL_CACHE") || getenv("N72_NO_PREFETCH"))
 		return;
+#endif
 	lv_display_add_event_cb(lv_display_get_default(), pf_invalidated,
 				LV_EVENT_INVALIDATE_AREA, NULL);
 	pf_timer = lv_timer_create(pf_tick, 80, NULL);
@@ -1844,12 +1846,14 @@ void pf_init(void)
 static void sc_event(lv_event_t *e)
 {
 	lv_obj_t *body = lv_event_get_current_target(e);
+#ifdef N72_DEBUG
 	static int off = -1;
 
 	if (off < 0)
 		off = getenv("N72_NO_SCROLL_CACHE") != NULL;	/* (for measurements) */
 	if (off)
 		return;
+#endif
 
 	switch (lv_event_get_code(e)) {
 	case LV_EVENT_SCROLL:

@@ -136,16 +136,16 @@ line to skip it.
 | `N72_IDLE_SLEEP` | Seconds without input before the screen goes off or the system sleeps (`0`: never); overrides the setting |
 | `N72_APPS_DIR` | Folder of tile manifests (default `/usr/share/n72-ui/apps`; test hook) |
 | `N72_UI_OPEN` | Internal: the page to reopen after a restart from a settings change |
-| `N72_STATUS_LOG` | Logs status events (battery, Wi-Fi, clock set) and Bluetooth auto-connect tries |
-| `N72_NO_SCROLL_CACHE` / `N72_NO_PREFETCH` | Set: no scroll pictures / prefetch (for measurements) |
-| `N72_SC_KEEP` | Set: scroll pictures are kept after the scroll (test) |
+| `N72_STATUS_LOG` | With `N72_DEBUG=1`: logs status events (battery, Wi-Fi, clock set) and Bluetooth auto-connect tries |
+| `N72_NO_SCROLL_CACHE` / `N72_NO_PREFETCH` | With `N72_DEBUG=1`: set for no scroll pictures / prefetch (measurements) |
+| `N72_SC_KEEP` | With `N72_DEBUG=1`: keep scroll pictures after the scroll (test) |
 | `N72_SLEEP` | `freeze`: never deep sleep; `0`: no system sleep (the screen only blanks) |
 | `N72_TOUCH_RAW` | Touch frames as the panel gives them (no holding of a lifting finger) (debug) |
 | `N72_ROT` | `90` or `270`: start turned (test hook) |
 | `N72_DRAGS` | With `N72_DEBUG=1`: `wait:x0,y0,x1,y1,ms ...` replays drags through a virtual pointer |
 | `N72_BENCH_SHOT` | With `N72_DEBUG=1` + `--bench`: leaves the last frame up 2 s for a screenshot |
 | `N72_FRAMES` | With `N72_DEBUG=1`: logs every frame (time, interval, render time) |
-| `N72_WAKE_LOG` | Logs the wake sources after each deep sleep (debug) |
+| `N72_WAKE_LOG` | With `N72_DEBUG=1`: logs the wake sources after each deep sleep |
 | `N72_NOFLIP` | With `N72_DEBUG=1`: single draw buffer copied to the framebuffer |
 | `N72_NO_TRIM` | With `N72_DEBUG=1`: disables look-ahead background fill trimming |
 | `N72_GPU_ADBG` | With `N72_DEBUG=1`: logs every task the GPU draws |

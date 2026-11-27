@@ -354,9 +354,11 @@ static void status_ev_run(lv_timer_t *t)
 {
 	LV_UNUSED(t);
 	status_ev_timer = NULL;
+#ifdef N72_DEBUG
 	if (getenv("N72_STATUS_LOG"))
 		fprintf(stderr, "n72-ui: status event: battery %d, Wi-Fi %d%s\n", status_batt_dirty,
 			status_net_dirty, screen_off ? " (dark: on wake)" : "");
+#endif
 	if (screen_off || app_dormant)
 		return;
 	if (status_batt_dirty) {
@@ -832,8 +834,10 @@ static void clockset_ev(int fd)
 	if (read(fd, &n, sizeof(n)) < 0 && errno != ECANCELED && errno != EAGAIN)
 		return;
 	clockset_arm();
+#ifdef N72_DEBUG
 	if (getenv("N72_STATUS_LOG"))
 		fprintf(stderr, "n72-ui: status event: clock set\n");
+#endif
 	if (home_timer)
 		lv_timer_ready(home_timer);	/* (dark: paused, the wake runs it) */
 }

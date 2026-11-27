@@ -478,6 +478,7 @@ bool system_sleep(void)
 			slept = ok;
 		}
 		woke_us = mono_us();
+#ifdef N72_DEBUG
 		if (slept_deep && getenv("N72_WAKE_LOG")) {
 			struct wake_marks w;
 
@@ -486,6 +487,7 @@ bool system_sleep(void)
 				w.pmu_int[0], w.pmu_int[1], w.pmu_int[2], w.pmu_n, before.pmu_n,
 				before.home, w.home, before.power, w.power, before.usb, w.usb);
 		}
+#endif
 		if (!ok || woke_for_screen(&before, slept) || (slept_deep && deep_woke_by_button(&before)))
 			break;
 		if (usb_sdp()) {
