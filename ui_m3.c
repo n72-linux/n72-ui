@@ -77,6 +77,7 @@ struct wp wp = { .hue = -1 };
 void wp_load(void);
 bool wp_put(lv_obj_t *scr, int kind);
 bool home_wp;		/* home is built over a wallpaper */
+bool lock_wp;		/* lock screen is built over a wallpaper */
 lv_draw_buf_t *wp_pic(int kind);
 lv_draw_buf_t *wp_upright(int kind);
 bool wp_hold(lv_obj_t *img, lv_draw_buf_t *b);

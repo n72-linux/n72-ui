@@ -183,6 +183,7 @@ static void ui_rebuild_overlays_free(void)
 		lv_obj_delete(lock_scr);
 		for (i = 0; i < (int)(sizeof(lk) / sizeof(lk[0])); i++)
 			*lk[i] = NULL;
+		lock_wp = false;
 	}
 	{
 		lv_obj_t **gone[] = {

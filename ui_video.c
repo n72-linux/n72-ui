@@ -1187,6 +1187,10 @@ void np_build(lv_obj_t *parent, int32_t y)
 	np_sync();
 }
 
+#define NPL_H		104
+#define NPL_BOTTOM	100
+#define NPL_R		24
+
 /*
  * On the lock screen, while something plays (in the background, or the
  * player in front under the lock): what it is, where it is, and back,
@@ -1196,14 +1200,15 @@ void np_build(lv_obj_t *parent, int32_t y)
 void np_lock_build(lv_obj_t *scr)
 {
 	lv_obj_t *c, *row;
+	int32_t cw = W - 2 * STATUS_PAD, cy = H - NPL_BOTTOM - NPL_H;
 
 	c = npl.card = lv_obj_create(scr);
 	plain(c);
-	lv_obj_set_size(c, W - 2 * STATUS_PAD, 104);
-	lv_obj_align(c, LV_ALIGN_BOTTOM_MID, 0, -100);
+	lv_obj_set_size(c, cw, NPL_H);
+	lv_obj_set_pos(c, STATUS_PAD, cy);
 	lv_obj_set_style_bg_color(c, lv_color_black(), 0);
 	lv_obj_set_style_bg_opa(c, LV_OPA_50, 0);
-	lv_obj_set_style_radius(c, 20, 0);
+	lv_obj_set_style_radius(c, NPL_R, 0);
 	lv_obj_set_style_pad_hor(c, 14, 0);
 	lv_obj_set_style_pad_top(c, 10, 0);
 	lv_obj_set_style_pad_bottom(c, 6, 0);
@@ -1252,14 +1257,19 @@ void np_lock_sync(void)
 
 	if (!npl.card || !lv_obj_is_valid(npl.card))
 		return;
+	if (on && lock_wp)
+		wp_glass_attach(npl.card, WP_LOCK, STATUS_PAD, H - NPL_BOTTOM - NPL_H,
+				W - 2 * STATUS_PAD, NPL_H, NPL_R);
 	if (lv_obj_has_flag(npl.card, LV_OBJ_FLAG_HIDDEN) == on) {
 		if (on)
 			lv_obj_remove_flag(npl.card, LV_OBJ_FLAG_HIDDEN);
 		else
 			lv_obj_add_flag(npl.card, LV_OBJ_FLAG_HIDDEN);
 	}
-	if (!on)
+	if (!on) {
+		wp_glass_detach(npl.card);
 		return;
+	}
 	label_set_if_changed(npl.title, vc.name[0] ? vc.name : "Playing");
 	label_set_if_changed(npl.play_sym, vc.playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
 	if (!locked || screen_off)

@@ -460,7 +460,7 @@ void build_home(void)
 		lv_obj_set_size(c, PW - 32, PG_CARD_H);
 		lv_obj_set_pos(c, 16, 4);
 		/* over a wallpaper the card blurs what lies behind it */
-		if (!home_wp || !wp_glass_attach(c, PX + 16, PG_TOP + 4, PW - 32, PG_CARD_H, 24)) {
+		if (!home_wp || !wp_glass_attach(c, WP_HOME, PX + 16, PG_TOP + 4, PW - 32, PG_CARD_H, 24)) {
 			lv_obj_set_style_radius(c, 24, 0);
 			lv_obj_set_style_bg_color(c, M.surface_c_high, 0);
 			lv_obj_set_style_bg_opa(c, home_wp ? LV_OPA_80 : LV_OPA_COVER, 0);

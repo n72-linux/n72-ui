@@ -59,18 +59,21 @@ static void dock_tile_style(lv_obj_t *t, bool docked)
 /* the docked icons spread evenly along the dock */
 static void dock_layout(void)
 {
-	int n, i, len, gap;
+	int n, i, len, rem, across;
 	bool side;
 
 	if (!home_dock)
 		return;
 	n = (int)lv_obj_get_child_count(home_dock);
+	if (!n)
+		return;
 	side = dock_side() != DOCK_BOTTOM;
-	len = side ? H - 2 * STATUS_PAD : W - 2 * STATUS_PAD;	/* (as dock_build() made it: no layout yet) */
-	gap = n ? (len - n * DOCK_ICON) / (n + 1) : 0;
+	len = (side ? H : W) - 2 * DOCK_M;	/* (as dock_build() made it: no layout yet) */
+	rem = LV_MAX(0, len - n * DOCK_ICON);
+	across = (DOCK_T - DOCK_ICON) / 2;
 	for (i = 0; i < n; i++) {
 		lv_obj_t *t = lv_obj_get_child(home_dock, i);
-		int32_t along = gap + i * (DOCK_ICON + gap), across = (DOCK_T - DOCK_ICON) / 2;
+		int32_t along = i * DOCK_ICON + ((i + 1) * rem + (n + 1) / 2) / (n + 1);
 
 		if (side)
 			lv_obj_set_pos(t, across, along);
@@ -204,21 +207,21 @@ void dock_build(void)
 
 	plain(d);
 	if (side == DOCK_BOTTOM) {
-		dw = W - 2 * STATUS_PAD;
+		dw = W - 2 * DOCK_M;
 		dh = DOCK_T;
-		dx = STATUS_PAD;
+		dx = DOCK_M;
 		dy = H - DOCK_M - DOCK_T;
 	} else {
 		/* the same place in the hand: a column at the side */
 		dw = DOCK_T;
-		dh = H - 2 * STATUS_PAD;
+		dh = H - 2 * DOCK_M;
 		dx = side == DOCK_LEFT ? DOCK_M : W - DOCK_M - DOCK_T;
-		dy = STATUS_PAD;
+		dy = DOCK_M;
 	}
 	lv_obj_set_size(d, dw, dh);
 	lv_obj_set_pos(d, dx, dy);
 	/* the card's shape and colour */
-	if (!home_wp || !wp_glass_attach(d, dx, dy, dw, dh, 24)) {
+	if (!home_wp || !wp_glass_attach(d, WP_HOME, dx, dy, dw, dh, 24)) {
 		lv_obj_set_style_radius(d, 24, 0);
 		lv_obj_set_style_bg_color(d, M.surface_c_high, 0);
 		lv_obj_set_style_bg_opa(d, home_wp ? LV_OPA_80 : LV_OPA_COVER, 0);

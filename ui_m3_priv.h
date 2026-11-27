@@ -309,6 +309,7 @@ extern struct npl npl;
 extern const struct accents accents[6];
 extern struct wp wp;
 extern bool home_wp;
+extern bool lock_wp;
 void conf_load(void);
 void conf_save(void);
 void conf_save_later(void);
@@ -601,7 +602,8 @@ void wp_load(void);
 lv_draw_buf_t *wp_upright(int kind);
 lv_draw_buf_t *wp_pic(int kind);
 bool wp_put(lv_obj_t *scr, int kind);
-bool wp_glass_attach(lv_obj_t *obj, int32_t sx, int32_t sy, int32_t w, int32_t h, int32_t radius);
+bool wp_glass_attach(lv_obj_t *obj, int kind, int32_t sx, int32_t sy, int32_t w, int32_t h, int32_t radius);
+void wp_glass_detach(lv_obj_t *obj);
 const uint32_t *wp_glass_card_strip(int32_t *out_w, int32_t *out_h);
 void wp_glass_compose_card(lv_draw_buf_t *dst, const uint32_t *strip, int32_t strip_w,
 			   const lv_draw_buf_t *fg, const uint16_t *fg_x0, const uint16_t *fg_x1,

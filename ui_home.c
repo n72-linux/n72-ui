@@ -2023,7 +2023,7 @@ static void lock_build(void)
 	lv_obj_set_style_bg_color(lock_scr, lv_color_mix(M.primary_c, lv_color_black(), 150), 0);
 	lv_obj_set_style_bg_grad_color(lock_scr, lv_color_black(), 0);
 	lv_obj_set_style_bg_grad_dir(lock_scr, LV_GRAD_DIR_VER, 0);
-	wp_put(lock_scr, WP_LOCK);	/* (a picture, if one is set, over the gradient) */
+	lock_wp = wp_put(lock_scr, WP_LOCK);	/* (a picture, if one is set, over the gradient) */
 
 	/* the status bar, as home's: its time hidden (the clock below shows it) */
 	o = lv_obj_create(lock_scr);
