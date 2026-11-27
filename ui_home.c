@@ -479,13 +479,12 @@ void ui_reopen(void);
 
 /* A quick-settings tile: rounded rectangle, icon, title and state line. */
 static lv_obj_t *qs_tile(lv_obj_t *parent, const char *icon, const char *title,
-			 lv_obj_t **sub, lv_event_cb_t cb, bool wide)
+			 lv_obj_t **sub, lv_event_cb_t cb)
 {
 	lv_obj_t *t = lv_obj_create(parent), *col;
 
 	plain(t);
-	int32_t tw = wide ? (W - 2 * STATUS_PAD)
-			  : (W - 2 * STATUS_PAD - 8 * (QS_COLS - 1)) / QS_COLS;	/* 8 apart */
+	int32_t tw = (W - 2 * STATUS_PAD - 8 * (QS_COLS - 1)) / QS_COLS;	/* 8 apart */
 
 	lv_obj_set_size(t, tw, SHADE_TILE_H);
 	lv_obj_set_style_radius(t, 20, 0);
@@ -1147,17 +1146,16 @@ void build_shade(void)
 		lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 		lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW_WRAP);
 		lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-		qs_wifi = qs_tile(row, LV_SYMBOL_WIFI, "Wi-Fi", &qs_wifi_sub, qs_open_wifi, false);
-		qs_bt = qs_tile(row, LV_SYMBOL_BLUETOOTH, "Bluetooth", &qs_bt_sub, qs_open_bt, false);
-		qs_rot = qs_tile(row, LV_SYMBOL_REFRESH, "Auto-rotate", &qs_rot_sub, qs_rot_cb, false);
+		qs_wifi = qs_tile(row, LV_SYMBOL_WIFI, "Wi-Fi", &qs_wifi_sub, qs_open_wifi);
+		qs_bt = qs_tile(row, LV_SYMBOL_BLUETOOTH, "Bluetooth", &qs_bt_sub, qs_open_bt);
+		qs_rot = qs_tile(row, LV_SYMBOL_REFRESH, "Auto-rotate", &qs_rot_sub, qs_rot_cb);
 		qs_rot_sync();
 		if (has_night) {
 			qs_night = qs_tile(row, LV_SYMBOL_TINT, "Night Shift", &qs_night_sub,
-					   qs_night_cb, false);
+					   qs_night_cb);
 			qs_night_sync();
 		}
-		qs_sleep = qs_tile(row, N72_SYMBOL_SLEEP, "Sleep", &sleep_sub, qs_sleep_cb,
-				   (ntiles % QS_COLS) == 1);
+		qs_sleep = qs_tile(row, N72_SYMBOL_SLEEP, "Sleep", &sleep_sub, qs_sleep_cb);
 		lv_label_set_text(sleep_sub, "Screen off");
 		qs_style(qs_sleep, false);
 		lv_obj_set_style_bg_color(qs_sleep, M.surface_c_highest, LV_STATE_PRESSED);
