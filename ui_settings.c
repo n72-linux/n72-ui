@@ -326,8 +326,8 @@ void open_display(lv_event_t *e)
 	lv_obj_align(dd, LV_ALIGN_TOP_LEFT, 0, 26);
 	lv_obj_set_height(c, 100);
 	lv_obj_add_event_cb(dd, idle_cb, LV_EVENT_VALUE_CHANGED, NULL);
-	m3_note(body, "The screen locks when it turns off. On battery the iPod sleeps after the "
-		"timeout; on USB power only the screen turns off.");
+	m3_note(body, "The screen locks when it turns off. On battery or a wall charger the "
+		"iPod sleeps; connected to a computer only the screen turns off.");
 
 	c = m3_card(body, M.surface_c);
 	lv_obj_set_height(c, LV_SIZE_CONTENT);
@@ -572,6 +572,21 @@ static void open_storage(lv_event_t *e)
 static lv_obj_t *about_val[8];
 static lv_timer_t *about_timer;
 
+static bool usb_is_mtp(void)
+{
+	char buf[32] = "";
+	FILE *f = fopen("/run/n72-usb", "r");
+
+	if (!f)
+		f = fopen("/var/lib/n72/usb-mode", "r");
+	if (!f)
+		return false;
+	if (!fgets(buf, sizeof(buf), f))
+		buf[0] = 0;
+	fclose(f);
+	return !strncmp(buf, "mtp", 3);
+}
+
 static void about_update(lv_timer_t *t)
 {
 	char buf[160], kernel[96] = "?", line[128], usb[32], wlan[32];
@@ -614,7 +629,10 @@ static void about_update(lv_timer_t *t)
 	if (usb_powered())
 		snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "\nUSB power, %d mA limit", ilim);
 	label_set_if_changed(about_val[4], buf);
-	ip_of("usb0", usb, sizeof(usb));
+	if (usb_is_mtp())
+		snprintf(usb, sizeof(usb), "MTP");
+	else
+		ip_of("usb0", usb, sizeof(usb));
 	ip_of("wlan0", wlan, sizeof(wlan));
 	snprintf(buf, sizeof(buf), "USB: %s\nWi-Fi: %s", usb, wlan);
 	label_set_if_changed(about_val[5], buf);
@@ -1003,11 +1021,13 @@ static void jack_ev(int fd)
 	vol_hud_show();
 }
 
-/* /run changed: n72-audio-route's file (a Bluetooth sound device came or went). */
+/* /run changed: n72-audio-route (Bluetooth sound) or n72-usb (USB gadget mode). */
+static void usb_refresh_ui(void);
+
 static void run_ev(int fd)
 {
 	char buf[1024] __attribute__((aligned(__alignof__(struct inotify_event))));
-	bool ours = false;
+	bool ours = false, usb_ev = false;
 	ssize_t n;
 
 	while ((n = read(fd, buf, sizeof(buf))) > 0) {
@@ -1018,6 +1038,8 @@ static void run_ev(int fd)
 
 			if (ev->len && !strcmp(ev->name, "n72-audio"))
 				ours = true;
+			else if (ev->len && !strcmp(ev->name, "n72-usb"))
+				usb_ev = true;
 			p += sizeof(*ev) + ev->len;
 		}
 	}
@@ -1025,6 +1047,8 @@ static void run_ev(int fd)
 		snd_refresh_ui();
 		net_ui_sync();	/* the Bluetooth tile and row: the device's name or "On" */
 	}
+	if (usb_ev)
+		usb_refresh_ui();
 }
 
 /*
@@ -1055,6 +1079,153 @@ void sound_ui_init(void)
 #include "wallpaper.c"	/* wallpapers: conversion, frames, the Settings page */
 #include "datetime.c"	/* Settings > Date & Time: the zone, network or set time */
 
+/* ------------------------------------------------------------------ USB */
+
+static lv_obj_t *set_usb_sub, *usb_page, *usb_mode_mat, *usb_state_lbl, *usb_detail_lbl;
+static lv_timer_t *usb_timer;
+static bool usb_busy;
+
+static void usb_summary(char *buf, size_t len)
+{
+	snprintf(buf, len, "%s", usb_is_mtp() ? "File transfer (MTP)" : "Networking");
+}
+
+static void usb_udc_state(char *buf, size_t len)
+{
+	FILE *f = fopen("/sys/class/udc/38400000.usb/state", "r");
+
+	buf[0] = 0;
+	if (!f)
+		return;
+	if (!fgets(buf, (int)len, f))
+		buf[0] = 0;
+	fclose(f);
+	buf[strcspn(buf, "\r\n")] = 0;
+}
+
+static void usb_refresh_ui(void)
+{
+	char buf[96], detail[96];
+	bool mtp = usb_is_mtp();
+
+	if (set_usb_sub) {
+		usb_summary(buf, sizeof(buf));
+		label_set_if_changed(set_usb_sub, buf);
+	}
+	if (!usb_page)
+		return;
+	if (usb_mode_mat && !usb_busy &&
+	    !lv_buttonmatrix_has_button_ctrl(usb_mode_mat, mtp ? 1 : 0,
+					     LV_BUTTONMATRIX_CTRL_CHECKED))
+		lv_buttonmatrix_set_button_ctrl(usb_mode_mat, mtp ? 1 : 0,
+						LV_BUTTONMATRIX_CTRL_CHECKED);
+	if (usb_state_lbl) {
+		const char *conn = usb_sdp() ? "Computer (USB)" :
+				   usb_powered() ? "Wall charger" : "Not connected";
+		label_set_if_changed(usb_state_lbl, conn);
+	}
+	if (usb_detail_lbl) {
+		if (usb_busy) {
+			snprintf(detail, sizeof(detail), "Switching USB mode...");
+		} else if (mtp) {
+			usb_udc_state(buf, sizeof(buf));
+			snprintf(detail, sizeof(detail), "Exposing / over MTP%s%s%s",
+				 buf[0] ? " (" : "", buf, buf[0] ? ")" : "");
+		} else {
+			ip_of("usb0", buf, sizeof(buf));
+			snprintf(detail, sizeof(detail), "usb0: %s", buf);
+		}
+		label_set_if_changed(usb_detail_lbl, detail);
+	}
+}
+
+static void usb_switch_done(const char *out, void *ud)
+{
+	LV_UNUSED(out);
+	LV_UNUSED(ud);
+	usb_busy = false;
+	usb_refresh_ui();
+}
+
+static void usb_mode_cb(lv_event_t *e)
+{
+	uint32_t sel = lv_buttonmatrix_get_selected_button(lv_event_get_target(e));
+	bool want_mtp, cur = usb_is_mtp();
+
+	if (sel > 1 || usb_busy) {
+		if (usb_mode_mat &&
+		    !lv_buttonmatrix_has_button_ctrl(usb_mode_mat, cur ? 1 : 0,
+						     LV_BUTTONMATRIX_CTRL_CHECKED))
+			lv_buttonmatrix_set_button_ctrl(usb_mode_mat, cur ? 1 : 0,
+							LV_BUTTONMATRIX_CTRL_CHECKED);
+		return;
+	}
+	want_mtp = sel == 1;
+	if (want_mtp == cur)
+		return;
+	usb_busy = true;
+	usb_refresh_ui();
+	if (job_run(want_mtp ? "/usr/sbin/n72-usb set mtp" : "/usr/sbin/n72-usb set net",
+		    NULL, usb_switch_done, NULL) < 0) {
+		usb_busy = false;
+		usb_refresh_ui();
+	}
+}
+
+static void usb_timer_cb(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	if (screen_off)
+		return;
+	usb_refresh_ui();
+}
+
+static void usb_delete_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	if (usb_timer)
+		lv_timer_delete(usb_timer);
+	usb_timer = NULL;
+}
+
+static void open_usb(lv_event_t *e)
+{
+	static const char *const usb_mode_map[] = { "Network", "MTP", "" };
+	lv_obj_t *scr, *body, *c;
+
+	LV_UNUSED(e);
+	nav_mark(open_usb, NULL);
+	body = m3_page("USB", &scr);
+	usb_page = scr;
+	obj_track(&usb_page);
+
+	m3_section(body, "Mode");
+	usb_mode_mat = segmented_matrix(body, usb_mode_map, usb_is_mtp() ? 1 : 0, usb_mode_cb);
+	obj_track(&usb_mode_mat);
+
+	m3_section(body, "Status");
+	c = m3_card(body, M.surface_c);
+	lv_obj_set_style_pad_all(c, 12, 0);
+	lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_style_pad_row(c, 4, 0);
+	m3_label(c, "Connection", &lv_font_montserrat_12, M.primary);
+	usb_state_lbl = m3_label(c, "", &lv_font_montserrat_14, M.on_surface);
+	obj_track(&usb_state_lbl);
+	m3_label(c, "Active interface", &lv_font_montserrat_12, M.primary);
+	usb_detail_lbl = m3_label(c, "", &lv_font_montserrat_14, M.on_surface);
+	obj_track(&usb_detail_lbl);
+	lv_obj_set_width(usb_detail_lbl, lv_pct(100));
+	lv_label_set_long_mode(usb_detail_lbl, LV_LABEL_LONG_WRAP);
+
+	m3_note(body, "Network provides USB Ethernet (SSH at 192.168.7.2). MTP exposes the "
+		"full filesystem (/) for file transfers. Switching reconnects USB.");
+
+	usb_refresh_ui();
+	usb_timer = lv_timer_create(usb_timer_cb, 2000, NULL);
+	lv_obj_add_event_cb(scr, usb_delete_cb, LV_EVENT_DELETE, NULL);
+	push(scr);
+}
+
 void open_settings(lv_event_t *e)
 {
 	nav_mark(open_settings, NULL);
@@ -1075,6 +1246,11 @@ void open_settings(lv_event_t *e)
 	       !have_tool("bluetoothctl") ? "Not installed" : bt_powered ? "On" : "Off",
 	       open_bt, NULL, &set_bt_sub);
 	obj_track(&set_bt_sub);
+	if (access("/usr/sbin/n72-usb", X_OK) == 0) {
+		usb_summary(sub, sizeof(sub));
+		m3_row(c, LV_SYMBOL_USB, "USB", sub, open_usb, NULL, &set_usb_sub);
+		obj_track(&set_usb_sub);
+	}
 
 	/* Appearance & Sound */
 	c = m3_card(body, M.surface_c);
