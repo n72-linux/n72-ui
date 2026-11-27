@@ -1478,17 +1478,16 @@ bool mbx_gpu_set_warmth(int pct)
 			.data = (uintptr_t)lut,
 			.length = sizeof(lut),
 		};
-		double t = pct / 100.0;
-		double gg = 1.0 - 0.14 * t;
-		double bg = 1.0 - 0.42 * t;
+		uint32_t gg = (6553600u - (uint32_t)pct * 9175u + 50u) / 100u;
+		uint32_t bg = (6553600u - (uint32_t)pct * 27525u + 50u) / 100u;
 		int i;
 
 		for (i = 0; i < 256; i++) {
-			uint16_t v = (uint16_t)(i * 65535 / 255);
+			uint32_t v = (uint32_t)i * 257u;
 
-			lut[i].red = v;
-			lut[i].green = (uint16_t)(v * gg + 0.5);
-			lut[i].blue = (uint16_t)(v * bg + 0.5);
+			lut[i].red = (uint16_t)v;
+			lut[i].green = (uint16_t)((v * gg + 32768u) >> 16);
+			lut[i].blue = (uint16_t)((v * bg + 32768u) >> 16);
 			lut[i].reserved = 0;
 		}
 		if (ioctl(kms_fd, DRM_IOCTL_MODE_CREATEPROPBLOB, &cb))

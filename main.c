@@ -762,7 +762,7 @@ void ui_unwatch(int fd)
 #define ALS_DIR "/sys/bus/i2c/devices/1-0044"
 
 static lv_timer_t *als_timer;
-static double als_lux = -1.0;
+static float als_lux = -1.0f;
 static int als_dir, als_dir_cnt;
 
 bool als_present(void)
@@ -773,8 +773,10 @@ bool als_present(void)
 
 static void als_tick(lv_timer_t *t)
 {
+	/* 88.0f / log1pf(3000.0f) */
+	static const float als_log_scale = 88.0f / 8.00670085f;
 	int lux, target, cur, diff, dir, from, to;
-	double alpha;
+	float alpha, flux;
 
 	LV_UNUSED(t);
 	if (!conf.auto_bright || screen_off)
@@ -782,13 +784,14 @@ static void als_tick(lv_timer_t *t)
 	lux = read_int(ALS_DIR "/lux", -1);
 	if (lux < 0)
 		return;
-	if (als_lux < 0.0) {
-		als_lux = (double)lux;
+	flux = (float)lux;
+	if (als_lux < 0.0f) {
+		als_lux = flux;
 	} else {
-		alpha = (double)lux > als_lux ? 0.25 : 0.12;
-		als_lux += alpha * ((double)lux - als_lux);
+		alpha = flux > als_lux ? 0.25f : 0.12f;
+		als_lux += alpha * (flux - als_lux);
 	}
-	target = 12 + (int)(88.0 * log1p(als_lux) / log1p(3000.0) + 0.5);
+	target = 12 + (int)(als_log_scale * log1pf(als_lux) + 0.5f);
 	target = LV_CLAMP(12, target, 100);
 	cur = backlight_get();
 	diff = target - cur;
@@ -837,7 +840,7 @@ void auto_bright_sync(void)
 			awake_timer_delete(als_timer);
 			als_timer = NULL;
 		}
-		als_lux = -1.0;
+		als_lux = -1.0f;
 		als_dir = 0;
 		als_dir_cnt = 0;
 		if (als_present())
