@@ -409,11 +409,13 @@ static bool deep_sleep(void)
  * is unavailable or refused, so the caller can fall back to blanking the
  * screen.
  */
+static int last_plug = -1;
+
 bool system_sleep(void)
 {
 	const char *e = getenv("N72_SLEEP");
 	time_t start = boot_s();
-	bool ok, own = false;	/* the alarm set is ours */
+	bool ok, own = false, keep_dark = false;	/* the alarm set is ours */
 	int busy_tries = 0;
 
 	if (e && !strcmp(e, "0"))
@@ -458,8 +460,17 @@ bool system_sleep(void)
 			 */
 			if (!ok && sleep_errno == EBUSY && ++busy_tries <= 10) {
 				woke_us = mono_us();
-				if (woke_for_screen(&before, false) || dark_linger()) {
+				if (woke_for_screen(&before, false)) {
 					ok = true;	/* (a wake like any other: the screen goes on) */
+					break;
+				}
+				if (usb_sdp()) {
+					ok = true;
+					keep_dark = true;
+					break;
+				}
+				if (dark_linger()) {
+					ok = true;
 					break;
 				}
 				continue;
@@ -477,6 +488,10 @@ bool system_sleep(void)
 		}
 		if (!ok || woke_for_screen(&before, slept) || (slept_deep && deep_woke_by_button(&before)))
 			break;
+		if (usb_sdp()) {
+			keep_dark = true;
+			break;
+		}
 		if (own) {
 			struct wake_marks now;
 
@@ -494,10 +509,14 @@ bool system_sleep(void)
 
 	/* the wake press and anything touched meanwhile are not input */
 	drain(keys_fd);
-	screen_set(true);
-	/* the idle and lock timeouts count from the wake, not from the press
-	 * that put it to sleep (which a long sleep has long outlasted) */
-	lv_display_trigger_activity(NULL);
+	if (keep_dark) {
+		last_plug = usb_powered();
+	} else {
+		screen_set(true);
+		/* the idle and lock timeouts count from the wake, not from the press
+		 * that put it to sleep (which a long sleep has long outlasted) */
+		lv_display_trigger_activity(NULL);
+	}
 	return ok;
 }
 
@@ -576,6 +595,8 @@ void screen_off_or_sleep(void)
 	 * was in the controller before the layers were back.
 	 */
 	screen_set(false);
+	if (usb_sdp())
+		return;
 	if (audio_playing() || yt_dl_busy()) {
 		screen_off_for_sound = true;
 		screen_set(false);
@@ -605,18 +626,20 @@ void playback_check(lv_timer_t *t)
 		return;
 	quiet = 0;
 	screen_off_for_sound = false;
+	if (usb_sdp())
+		return;
 	if (!system_sleep())
 		screen_set(false);
 }
 
-/* Sleep after a while without input, unless running from USB power. */
+/* Sleep after a while without input, unless connected to a USB host (SDP). */
 /*
- * The screen goes dark (locked): on USB power only the screen, on battery
- * the system sleeps as well.
+ * The screen goes dark (locked): on a USB host only the screen, on battery
+ * or a wall charger the system sleeps as well.
  */
 static void screen_dark(void)
 {
-	if (usb_powered())
+	if (usb_sdp())
 		screen_set(false);
 	else
 		screen_off_or_sleep();
@@ -634,7 +657,6 @@ static int uevent_fd = -1;
 
 static void plug_changed(void)
 {
-	static int last_plug = -1;
 	int plug = usb_powered();
 
 	if (last_plug < 0 || plug == last_plug) {

@@ -278,6 +278,19 @@ bool usb_powered(void)
 	return read_sysfs_int("/sys/class/power_supply/usb/online", 0) == 1;
 }
 
+bool usb_sdp(void)
+{
+	char buf[64] = "";
+	FILE *f = fopen("/sys/class/power_supply/usb/usb_type", "r");
+
+	if (!f)
+		return usb_powered();
+	if (!fgets(buf, sizeof(buf), f))
+		buf[0] = 0;
+	fclose(f);
+	return strstr(buf, "[SDP]") != NULL;
+}
+
 /*
  * Set a label's text only when it changes: lv_label_set_text() always
  * invalidates the label, and a 1 s timer rewriting unchanged text was a

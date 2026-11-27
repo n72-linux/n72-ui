@@ -64,6 +64,7 @@ extern bool locked;
 extern bool app_dormant;
 bool have_tool(const char *name);
 bool usb_powered(void);
+bool usb_sdp(void);
 void status_kick(bool batt, bool net);
 bool game_playing(void);
 bool video_playing(void);
