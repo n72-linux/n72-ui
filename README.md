@@ -5,15 +5,19 @@ A touch launcher for Linux on the iPod touch 2G (N72AP), built on
 
 - Home screen with a clock and weather card, pages of tiles with a dock,
   quick settings shade, lock screen and on-screen keyboard. Built in:
-  Settings (Wi-Fi, Bluetooth, Display, Wallpaper, Sound, Power, Date & Time,
+  Settings (Wi-Fi, Bluetooth, USB, Display, Wallpaper, Sound, Power, Date & Time,
   Weather, Storage, About, Logs), Paint (finger drawing), Files, YouTube and
   Games (RetroArch). Other programs add a tile with a manifest
   (`/usr/share/n72-ui/apps/NAME.app`).
 ![Home screen](screenshot-home.png)
 
-- Buttons: Home returns to the launcher (in
+- Buttons & sleep: Home returns to the launcher (in
   a game it opens the pause panel), Power turns the screen off or puts the
   system to sleep and wakes it, the volume keys change the sound volume.
+  While connected to a USB host (`SDP` in `/sys/class/power_supply/usb/usb_type`),
+  Power and the idle timeout only turn off and lock the screen without suspending,
+  keeping USB SSH and MTP live (unplugging while dark puts the iPod to sleep);
+  on battery or a wall charger (`DCP`) it enters `s2idle`/deep sleep as usual.
 
 ## Gestures and animations (frame rates measured on the device)
 
