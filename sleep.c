@@ -411,6 +411,15 @@ static bool deep_sleep(void)
  */
 static int last_plug = -1;
 
+static void wifi_ps_sync(bool usb)
+{
+	if (!wifi_powered() || !have_tool("iw"))
+		return;
+	job_run(usb ? "iw dev wlan0 set power_save off" :
+		      "iw dev wlan0 set power_save on",
+		NULL, NULL, NULL);
+}
+
 bool system_sleep(void)
 {
 	const char *e = getenv("N72_SLEEP");
@@ -513,6 +522,7 @@ bool system_sleep(void)
 	drain(keys_fd);
 	if (keep_dark) {
 		last_plug = usb_powered();
+		wifi_ps_sync(last_plug);
 	} else {
 		screen_set(true);
 		/* the idle and lock timeouts count from the wake, not from the press
@@ -661,11 +671,15 @@ static void plug_changed(void)
 {
 	int plug = usb_powered();
 
-	if (last_plug < 0 || plug == last_plug) {
+	if (last_plug < 0) {
 		last_plug = plug;
+		wifi_ps_sync(plug);
 		return;
 	}
+	if (plug == last_plug)
+		return;
 	last_plug = plug;
+	wifi_ps_sync(plug);
 	battery_crit_check();
 	if (screen_off && conf.wake_plug) {	/* Settings > Display */
 		screen_off_for_sound = false;
