@@ -11,6 +11,14 @@ A touch launcher for Linux on the iPod touch 2G (N72AP), built on
   (`/usr/share/n72-ui/apps/NAME.app`).
 ![Home screen](screenshot-home.png)
 
+- Display & power: **Settings > Display** configures ISL29003 ambient-light
+  auto-brightness (smoothed EMA with hysteresis and animated DAC ramps),
+  Night Shift warm colour temperature via the CLCD's 256-entry DRM `GAMMA_LUT`
+  (also toggled from the Quick Settings shade), and Adaptive Contrast (CLCD MIE:
+  Off, Video-only, or Always). Low battery levels are highlighted in error
+  tint, and `Critical` battery level on battery power triggers a 10 s warning
+  banner before powering off. External application overlays support `ARGB8888`,
+  `ARGB1555`, and `ARGB4444`.
 - Buttons & sleep: Home returns to the launcher (in
   a game it opens the pause panel), Power turns the screen off or puts the
   system to sleep and wakes it, the volume keys change the sound volume.
@@ -102,8 +110,8 @@ tree's is v9.2.2 plus eight commits marked `(n72)`). The GPU part links
 `N72_CC=clang` for clang, the build `pgo/n72ui.profdata` applies to, into
 `build/n72-ui-clang/`):
 
-    sh n72-ui/build.sh
-    N72_DEBUG=1 sh n72-ui/build.sh   # with --bench and timing diagnostics (into build/n72-ui-debug/)
+    sh n72-ui/build.sh                  # default: -O3 -flto=auto -fno-stack-protector -> build/n72-ui/
+    N72_DEBUG=1 sh n72-ui/build.sh      # adds --bench and timing diagnostics -> build/n72-ui-debug/
 
 The static binary is `n72-ui` in the corresponding build folder (`n72-ui.debug` beside it is the
 unstripped copy). `n72-alpine/build.sh` packs it as the `n72-ui` package
@@ -142,6 +150,7 @@ line to skip it.
 | `N72_NO_TRIM` | With `N72_DEBUG=1`: disables look-ahead background fill trimming |
 | `N72_GPU_ADBG` | With `N72_DEBUG=1`: logs every task the GPU draws |
 | `N72_ALPHACHECK` | With `N72_DEBUG=1`: reports non-opaque pixels in opaque frames |
+| `N72_NO_CRIT_OFF` | With `N72_DEBUG=1`: non-zero suppresses automatic power-off on `Critical` battery level |
 | `N72_KMS_HANDOFF` | Internal: set by n72-ui for the n72-ui it execs (theme change) to take over the display |
 | `TZ` | Clock time zone (the OpenRC service sets it from `/etc/TZ`) |
 
