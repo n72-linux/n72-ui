@@ -444,6 +444,7 @@ static void backlight_init(void)
  * below leave alone while they move the hardware's level.
  */
 static int bl_user = -1;
+static int bl_hw_raw = -1;
 static int bl_fade_v;		/* the fade-in's animated variable */
 
 /* the user's level in the hardware's steps (rounded: percent -> raw -> percent is stable) */
@@ -452,11 +453,14 @@ static int bl_user_raw(void);
 static void backlight_raw(int raw)
 {
 	char p[160];
+	int clamped;
 
 	if (!bl_dir[0])
 		return;
+	clamped = LV_CLAMP(1, raw, bl_max);
+	bl_hw_raw = clamped;
 	snprintf(p, sizeof(p), "%s/brightness", bl_dir);
-	write_int(p, LV_CLAMP(1, raw, bl_max));
+	write_int(p, clamped);
 }
 
 int backlight_get(void)
@@ -758,6 +762,8 @@ void ui_unwatch(int fd)
 #define ALS_DIR "/sys/bus/i2c/devices/1-0044"
 
 static lv_timer_t *als_timer;
+static double als_lux = -1.0;
+static int als_dir, als_dir_cnt;
 
 bool als_present(void)
 {
@@ -767,7 +773,8 @@ bool als_present(void)
 
 static void als_tick(lv_timer_t *t)
 {
-	int lux, target, cur, next;
+	int lux, target, cur, diff, dir, from, to;
+	double alpha;
 
 	LV_UNUSED(t);
 	if (!conf.auto_bright || screen_off)
@@ -775,14 +782,46 @@ static void als_tick(lv_timer_t *t)
 	lux = read_int(ALS_DIR "/lux", -1);
 	if (lux < 0)
 		return;
-	target = 12 + (int)(88.0 * log1p((double)lux) / log1p(3000.0) + 0.5);
+	if (als_lux < 0.0) {
+		als_lux = (double)lux;
+	} else {
+		alpha = (double)lux > als_lux ? 0.25 : 0.12;
+		als_lux += alpha * ((double)lux - als_lux);
+	}
+	target = 12 + (int)(88.0 * log1p(als_lux) / log1p(3000.0) + 0.5);
 	target = LV_CLAMP(12, target, 100);
 	cur = backlight_get();
-	if (abs(target - cur) < 6)
+	diff = target - cur;
+	if ((diff > 0 && diff < 6) || (diff <= 0 && -diff < 8)) {
+		als_dir = 0;
+		als_dir_cnt = 0;
 		return;
-	next = cur + LV_CLAMP(-6, target - cur, 6);
-	backlight_set(next);
-	ui_bright_sync_widgets(next);
+	}
+	dir = diff > 0 ? 1 : -1;
+	if (dir != als_dir) {
+		als_dir = dir;
+		als_dir_cnt = 1;
+		return;
+	}
+	if (++als_dir_cnt < (dir > 0 ? 2 : 4))
+		return;
+	als_dir_cnt = 0;
+	from = bl_hw_raw > 0 ? bl_hw_raw : bl_user_raw();
+	bl_user = target;
+	to = bl_user_raw();
+	if (from != to) {
+		lv_anim_t a;
+
+		lv_anim_delete(&bl_fade_v, NULL);
+		lv_anim_init(&a);
+		lv_anim_set_var(&a, &bl_fade_v);
+		lv_anim_set_exec_cb(&a, bl_fade_exec);
+		lv_anim_set_values(&a, from, to);
+		lv_anim_set_duration(&a, LV_CLAMP(500, abs(to - from) * 18, 1800));
+		lv_anim_set_path_cb(&a, ios_path_ease_in_out);
+		lv_anim_start(&a);
+	}
+	ui_bright_sync_widgets(target);
 }
 
 void auto_bright_sync(void)
@@ -792,12 +831,15 @@ void auto_bright_sync(void)
 	if (want) {
 		write_int(ALS_DIR "/power_state", 1);
 		if (!als_timer)
-			als_timer = awake_timer(als_tick, 1000, NULL);
+			als_timer = awake_timer(als_tick, 500, NULL);
 	} else {
 		if (als_timer) {
 			awake_timer_delete(als_timer);
 			als_timer = NULL;
 		}
+		als_lux = -1.0;
+		als_dir = 0;
+		als_dir_cnt = 0;
 		if (als_present())
 			write_int(ALS_DIR "/power_state", 0);
 	}

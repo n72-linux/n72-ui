@@ -702,6 +702,7 @@ static uint32_t kms_plane, kms_prop_rot, kms_prop_fb, kms_prop_sw, kms_prop_sh;
 static uint32_t kms_prop_cx, kms_prop_cy, kms_prop_cw, kms_prop_ch, kms_prop_sx, kms_prop_sy;
 static uint32_t kms_prop_plane_crtc, kms_prop_active, kms_prop_mode_id, kms_prop_conn_crtc;
 static uint32_t kms_prop_gamma_lut, kms_gamma_size;
+static int kms_warmth = -1;
 static uint32_t kms_mode_blob;
 static uint64_t kms_rot_cur;		/* the plane's rotation (DRM_MODE_ROTATE_*) */
 
@@ -1378,6 +1379,7 @@ static bool kms_setup(bool shell_layer)
 		if (!ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &c))
 			kms_gamma_size = c.gamma_size;
 		kms_prop_gamma_lut = kms_obj_prop(fd, kms_crtc, DRM_MODE_OBJECT_CRTC, "GAMMA_LUT");
+		kms_warmth = -1;
 	}
 	/* probe plane & rotation before importing framebuffers so kms_import_scan creates kms_fb_l[] */
 	if (kms_find_plane(fd)) {
@@ -1467,6 +1469,8 @@ bool mbx_gpu_set_warmth(int pct)
 		pct = 0;
 	if (pct > 100)
 		pct = 100;
+	if (pct == kms_warmth)
+		return true;
 	flip_wait();
 	if (pct > 0) {
 		struct drm_color_lut lut[256];
@@ -1506,6 +1510,8 @@ bool mbx_gpu_set_warmth(int pct)
 
 		ioctl(kms_fd, DRM_IOCTL_MODE_DESTROYPROPBLOB, &db);
 	}
+	if (ret == 0)
+		kms_warmth = pct;
 	return ret == 0;
 }
 

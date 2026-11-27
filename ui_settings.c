@@ -10,7 +10,6 @@ static lv_obj_t *auto_bright_sw;
 static lv_obj_t *night_sw;
 static lv_obj_t *night_slider;
 static lv_obj_t *night_val;
-static lv_timer_t *night_apply_timer;
 
 #define CLCD_MIE_PATH	"/sys/devices/platform/display-subsystem/mie"
 
@@ -40,6 +39,7 @@ static void mie_cb(lv_event_t *e)
 		return;
 	conf.mie_mode = (int)sel;
 	display_mie_apply();
+	pf_label_changed(lv_event_get_target(e));
 	conf_save();
 }
 
@@ -68,21 +68,23 @@ static lv_obj_t *segmented_matrix(lv_obj_t *parent, const char *const *map, uint
 	return bm;
 }
 
-static void night_apply_cb(lv_timer_t *t)
+void ui_night_sync_widgets(void)
 {
-	LV_UNUSED(t);
-	night_apply_timer = NULL;
-	display_night_apply();
+	if (!night_sw)
+		return;
+	if (conf.night_shift)
+		lv_obj_add_state(night_sw, LV_STATE_CHECKED);
+	else
+		lv_obj_remove_state(night_sw, LV_STATE_CHECKED);
+	pf_label_changed(night_sw);
 }
 
 static void night_sw_cb(lv_event_t *e)
 {
 	conf.night_shift = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
-	if (night_apply_timer) {
-		lv_timer_delete(night_apply_timer);
-		night_apply_timer = NULL;
-	}
 	display_night_apply();
+	qs_night_sync();
+	pf_label_changed(lv_event_get_target(e));
 	conf_save();
 }
 
@@ -96,23 +98,14 @@ static void night_warmth_cb(lv_event_t *e)
 	label_set_if_changed(night_val, buf);
 	if (!conf.night_shift) {
 		conf.night_shift = true;
-		if (night_sw)
-			lv_obj_add_state(night_sw, LV_STATE_CHECKED);
+		ui_night_sync_widgets();
 	}
+	qs_night_sync();
+	pf_label_changed(lv_event_get_target(e));
 	if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
-		if (night_apply_timer) {
-			lv_timer_delete(night_apply_timer);
-			night_apply_timer = NULL;
-		}
 		display_night_apply();
 		conf_save();
-		return;
 	}
-	if (!night_apply_timer) {
-		night_apply_timer = lv_timer_create(night_apply_cb, 60, NULL);
-		lv_timer_set_repeat_count(night_apply_timer, 1);
-	}
-	conf_save_later();
 }
 
 void ui_bright_sync_widgets(int pct)
@@ -123,8 +116,10 @@ void ui_bright_sync_widgets(int pct)
 		lv_slider_set_value(home_bright, pct, LV_ANIM_OFF);
 		shade_changed(home_bright);
 	}
-	if (bright_slider)
+	if (bright_slider) {
 		lv_slider_set_value(bright_slider, pct, LV_ANIM_OFF);
+		pf_label_changed(bright_slider);
+	}
 	if (bright_val) {
 		snprintf(buf, sizeof(buf), "%d%%", pct);
 		label_set_if_changed(bright_val, buf);
@@ -136,8 +131,10 @@ void ui_auto_bright_off(void)
 	if (!conf.auto_bright)
 		return;
 	conf.auto_bright = false;
-	if (auto_bright_sw)
+	if (auto_bright_sw) {
 		lv_obj_remove_state(auto_bright_sw, LV_STATE_CHECKED);
+		pf_label_changed(auto_bright_sw);
+	}
 	auto_bright_sync();
 }
 
@@ -145,6 +142,7 @@ static void auto_bright_cb(lv_event_t *e)
 {
 	conf.auto_bright = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
 	auto_bright_sync();
+	pf_label_changed(lv_event_get_target(e));
 	conf_save();
 }
 
@@ -161,6 +159,7 @@ static void bright_cb(lv_event_t *e)
 	shade_changed(home_bright);	/* (the panel's picture is taken again: no jump when pulled) */
 	snprintf(buf, sizeof(buf), "%d%%", v);
 	label_set_if_changed(bright_val, buf);
+	pf_label_changed(lv_event_get_target(e));
 }
 
 static void theme_cb(lv_event_t *e)
@@ -193,6 +192,7 @@ static void idle_cb(lv_event_t *e)
 	if (i < sizeof(idle_opts) / sizeof(idle_opts[0])) {
 		conf.idle_s = idle_opts[i];
 		idle_kick();
+		pf_label_changed(lv_event_get_target(e));
 		conf_save();
 	}
 }
@@ -200,6 +200,7 @@ static void idle_cb(lv_event_t *e)
 static void plug_cb(lv_event_t *e)
 {
 	conf.wake_plug = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+	pf_label_changed(lv_event_get_target(e));
 	conf_save();
 }
 
@@ -248,17 +249,11 @@ void open_display(lv_event_t *e)
 	if (mbx_gpu_gamma_supported()) {
 		m3_section(body, "Night Shift");
 		c = m3_card(body, M.surface_c);
-		lv_obj_set_flex_flow(c, LV_FLEX_FLOW_COLUMN);
-		lv_obj_set_style_pad_row(c, 12, 0);
-		row = lv_obj_create(c);
-		plain(row);
-		lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-		lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-		lv_obj_set_style_pad_all(row, 0, 0);
-		lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-		s = m3_label(row, "Warm color tint", &lv_font_montserrat_14, M.on_surface);
+		lv_obj_set_height(c, LV_SIZE_CONTENT);
+		lv_obj_set_style_min_height(c, 64, 0);
+		s = m3_label(c, "Warm color tint", &lv_font_montserrat_14, M.on_surface);
 		lv_obj_align(s, LV_ALIGN_LEFT_MID, 0, 0);
-		s = ios_switch(lv_switch_create(row));
+		s = ios_switch(lv_switch_create(c));
 		night_sw = s;
 		obj_track(&night_sw);
 		lv_obj_align(s, LV_ALIGN_RIGHT_MID, 0, 0);
@@ -266,24 +261,20 @@ void open_display(lv_event_t *e)
 			lv_obj_add_state(s, LV_STATE_CHECKED);
 		lv_obj_add_event_cb(s, night_sw_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-		row = lv_obj_create(c);
-		plain(row);
-		lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-		lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-		lv_obj_set_style_pad_all(row, 0, 0);
-		lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-		lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-		lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-		lv_obj_set_style_pad_column(row, 12, 0);
-		m3_label(row, "Warmth", &lv_font_montserrat_12, M.on_surface_v);
-		s = row_slider(row, false);
+		c = m3_card(body, M.surface_c);
+		lv_obj_set_flex_flow(c, LV_FLEX_FLOW_ROW);
+		lv_obj_set_flex_align(c, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+				      LV_FLEX_ALIGN_CENTER);
+		lv_obj_set_style_pad_column(c, 12, 0);
+		m3_label(c, LV_SYMBOL_TINT, &lv_font_montserrat_20, M.on_surface_v);
+		s = row_slider(c, false);
 		night_slider = s;
 		obj_track(&night_slider);
 		lv_slider_set_range(s, 10, 100);
 		lv_slider_set_value(s, conf.night_warmth, LV_ANIM_OFF);
 		lv_obj_add_event_cb(s, night_warmth_cb, LV_EVENT_VALUE_CHANGED, NULL);
 		lv_obj_add_event_cb(s, night_warmth_cb, LV_EVENT_RELEASED, NULL);
-		night_val = slider_value(row);
+		night_val = slider_value(c);
 		obj_track(&night_val);
 		lv_label_set_text_fmt(night_val, "%d%%", conf.night_warmth);
 	}
@@ -935,12 +926,14 @@ static void jack_check(lv_timer_t *t)
 static void snd_slider_cb(lv_event_t *e)
 {
 	volume_set(lv_slider_get_value(lv_event_get_target(e)), false);
+	pf_label_changed(lv_event_get_target(e));
 }
 
 static void snd_spk_cb(lv_event_t *e)
 {
 	conf.spk = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
 	snd_apply_output(conf.spk);
+	pf_label_changed(lv_event_get_target(e));
 	conf_save();
 	snd_refresh_ui();
 }

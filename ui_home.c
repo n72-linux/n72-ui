@@ -479,12 +479,13 @@ void ui_reopen(void);
 
 /* A quick-settings tile: rounded rectangle, icon, title and state line. */
 static lv_obj_t *qs_tile(lv_obj_t *parent, const char *icon, const char *title,
-			 lv_obj_t **sub, lv_event_cb_t cb)
+			 lv_obj_t **sub, lv_event_cb_t cb, bool wide)
 {
 	lv_obj_t *t = lv_obj_create(parent), *col;
 
 	plain(t);
-	int32_t tw = (W - 2 * STATUS_PAD - 8 * (QS_COLS - 1)) / QS_COLS;	/* 8 apart */
+	int32_t tw = wide ? (W - 2 * STATUS_PAD)
+			  : (W - 2 * STATUS_PAD - 8 * (QS_COLS - 1)) / QS_COLS;	/* 8 apart */
 
 	lv_obj_set_size(t, tw, SHADE_TILE_H);
 	lv_obj_set_style_radius(t, 20, 0);
@@ -1005,7 +1006,7 @@ static void qs_power_cb(lv_event_t *e)
 	qs_to_page(open_power);
 }
 
-lv_obj_t *qs_rot, *qs_rot_sub;
+lv_obj_t *qs_rot, *qs_rot_sub, *qs_night, *qs_night_sub;
 void rot_conf_changed(void);
 
 int ui_rot;			/* the screen's turn now */
@@ -1018,6 +1019,32 @@ void qs_rot_sync(void)
 	qs_style(qs_rot, conf.autorot == ROT_AUTO);
 	label_set_if_changed(qs_rot_sub, ui_rot ? "Landscape" : "Portrait");
 	shade_changed(qs_rot);
+}
+
+/* The Night Shift tile: lit while on; subtitle shows warmth % or Off. */
+void qs_night_sync(void)
+{
+	char buf[16];
+
+	if (!qs_night)
+		return;
+	qs_style(qs_night, conf.night_shift);
+	if (conf.night_shift)
+		snprintf(buf, sizeof(buf), "%d%%", conf.night_warmth);
+	else
+		snprintf(buf, sizeof(buf), "Off");
+	label_set_if_changed(qs_night_sub, buf);
+	shade_changed(qs_night);
+}
+
+static void qs_night_cb(lv_event_t *e)
+{
+	LV_UNUSED(e);
+	conf.night_shift = !conf.night_shift;
+	display_night_apply();
+	conf_save();
+	qs_night_sync();
+	ui_night_sync_widgets();
 }
 
 /* A tap: on, or off held the way it is now. */
@@ -1104,7 +1131,9 @@ void build_shade(void)
 
 	/* the tiles: a grid, QS_COLS a row, 8 apart */
 	{
-		int rows = (4 + QS_COLS - 1) / QS_COLS;
+		bool has_night = mbx_gpu_gamma_supported();
+		int ntiles = 4 + (has_night ? 1 : 0);
+		int rows = (ntiles + QS_COLS - 1) / QS_COLS;
 		int32_t th = rows * SHADE_TILE_H + (rows - 1) * 8;
 
 		row = lv_obj_create(shade);
@@ -1118,11 +1147,17 @@ void build_shade(void)
 		lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 		lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW_WRAP);
 		lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-		qs_wifi = qs_tile(row, LV_SYMBOL_WIFI, "Wi-Fi", &qs_wifi_sub, qs_open_wifi);
-		qs_bt = qs_tile(row, LV_SYMBOL_BLUETOOTH, "Bluetooth", &qs_bt_sub, qs_open_bt);
-		qs_rot = qs_tile(row, LV_SYMBOL_REFRESH, "Auto-rotate", &qs_rot_sub, qs_rot_cb);
+		qs_wifi = qs_tile(row, LV_SYMBOL_WIFI, "Wi-Fi", &qs_wifi_sub, qs_open_wifi, false);
+		qs_bt = qs_tile(row, LV_SYMBOL_BLUETOOTH, "Bluetooth", &qs_bt_sub, qs_open_bt, false);
+		qs_rot = qs_tile(row, LV_SYMBOL_REFRESH, "Auto-rotate", &qs_rot_sub, qs_rot_cb, false);
 		qs_rot_sync();
-		qs_sleep = qs_tile(row, N72_SYMBOL_SLEEP, "Sleep", &sleep_sub, qs_sleep_cb);
+		if (has_night) {
+			qs_night = qs_tile(row, LV_SYMBOL_TINT, "Night Shift", &qs_night_sub,
+					   qs_night_cb, false);
+			qs_night_sync();
+		}
+		qs_sleep = qs_tile(row, N72_SYMBOL_SLEEP, "Sleep", &sleep_sub, qs_sleep_cb,
+				   (ntiles % QS_COLS) == 1);
 		lv_label_set_text(sleep_sub, "Screen off");
 		qs_style(qs_sleep, false);
 		lv_obj_set_style_bg_color(qs_sleep, M.surface_c_highest, LV_STATE_PRESSED);

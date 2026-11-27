@@ -70,8 +70,8 @@ bool video_playing(void);
 void app_dormant_wake(bool full);
 void app_dormant_sync(void);
 
-#define QS_COLS		2	/* quick-settings tiles a row */
-#define SHADE_TILE_H	(W > H ? 52 : 64)
+#define QS_COLS		(W > H ? 3 : 2)	/* quick-settings tiles a row */
+#define SHADE_TILE_H	(W > H ? 52 : 56)
 #define SHADE_BRIGHT_H	(W > H ? 48 : 56)
 #define SHADE_FOOT_H	(W > H ? 28 : 36)
 
@@ -447,8 +447,11 @@ void wifi_set(bool on);
 extern lv_obj_t *settings_tile;
 extern lv_obj_t *qs_rot;
 extern lv_obj_t *qs_rot_sub;
+extern lv_obj_t *qs_night;
+extern lv_obj_t *qs_night_sub;
 extern int ui_rot;
 void qs_rot_sync(void);
+void qs_night_sync(void);
 void build_shade(void);
 extern lv_timer_t *app_timer;
 extern lv_obj_t *app_bar;
@@ -576,6 +579,7 @@ void open_display(lv_event_t *e);
 void display_night_apply(void);
 void display_mie_apply(void);
 void ui_bright_sync_widgets(int pct);
+void ui_night_sync_widgets(void);
 void ui_auto_bright_off(void);
 void open_power(lv_event_t *e);
 void open_about(lv_event_t *e);

@@ -189,6 +189,7 @@ static void ui_rebuild_overlays_free(void)
 			&app_bar_time, &app_bar_batt, &app_bar_wifi, &app_bar_bt,
 			&clock_lbl, &date_lbl,
 			&qs_wifi, &qs_bt, &qs_wifi_sub, &qs_bt_sub, &qs_rot, &qs_rot_sub,
+			&qs_night, &qs_night_sub,
 			&home_bright, &qs_settings_btn, &vol_hud_slider, &vol_hud_icon,
 			&np.card, &np.title, &np.sub, &np.play_sym, &shade_bright_row,
 		};
@@ -214,6 +215,7 @@ static void ui_rebuild_overlays(void)
 	lv_obj_invalidate(lv_layer_top());
 	net_ui_sync();
 	qs_rot_sync();
+	qs_night_sync();
 	vc_turned();
 	kbd_turned();
 }
@@ -302,6 +304,7 @@ void ui_rebuild(bool load)
 	net_ui_sync();
 	status_refresh(true);
 	qs_rot_sync();
+	qs_night_sync();
 	vc_turned();
 	layout_stale = false;
 	home_stale = false;
@@ -362,6 +365,7 @@ void home_fresh(void)
 	net_ui_sync();
 	status_refresh(true);
 	qs_rot_sync();
+	qs_night_sync();
 }
 
 /* Page @i of the stack, built again if a turn left it (not showing). */
@@ -482,6 +486,7 @@ bool ui_turn(int rot)
 		lv_obj_delete(tmp);
 		net_ui_sync();
 		qs_rot_sync();
+		qs_night_sync();
 	} else {
 		ui_rebuild(true);
 	}
