@@ -22,7 +22,8 @@
  * puts the picture's top at the panel's left edge); on the left side
  * x < 0: 270. Upside down is not used.
  */
-#define ROT_POS "/sys/devices/platform/lis3lv02d/position"
+#define ROT_POS_FAUX "/sys/devices/faux/lis3lv02d/position"
+#define ROT_POS_PLAT "/sys/devices/platform/lis3lv02d/position"
 #define ROT_G 550		/* mg along an axis to count as down */
 #define ROT_HOLD_MS 450
 /*
@@ -33,7 +34,8 @@
  * and the screen is turned to match, then arms the chip again and rests.
  * Without it (an older kernel) the timer reads all the time, as before.
  */
-#define ROT_MOTION "/sys/devices/platform/lis3lv02d/motion"
+#define ROT_MOTION_FAUX "/sys/devices/faux/lis3lv02d/motion"
+#define ROT_MOTION_PLAT "/sys/devices/platform/lis3lv02d/motion"
 #define ROT_SETTLE_MS 1000
 static int rot_pos_fd = -1;		/* "position", kept open: notified, and read */
 static bool rot_ev;			/* the kernel has the motion wake */
@@ -49,6 +51,24 @@ int video_rot = -1;		/* the player's controls asked for this (-1: follow) */
 bool app_is_video(void);
 void vc_turned(void);
 
+static int rot_open_pos(void)
+{
+	int fd = open(ROT_POS_FAUX, O_RDONLY | O_CLOEXEC);
+
+	if (fd < 0)
+		fd = open(ROT_POS_PLAT, O_RDONLY | O_CLOEXEC);
+	return fd;
+}
+
+static const char *rot_motion_path(void)
+{
+	if (access(ROT_MOTION_FAUX, W_OK) == 0)
+		return ROT_MOTION_FAUX;
+	if (access(ROT_MOTION_PLAT, W_OK) == 0)
+		return ROT_MOTION_PLAT;
+	return NULL;
+}
+
 /* The way the iPod is held: 0, 90, 270; -1 flat or upside down. */
 static int rot_read(void)
 {
@@ -59,7 +79,7 @@ static int rot_read(void)
 	if (rot_pos_fd >= 0) {
 		n = pread(rot_pos_fd, buf, sizeof(buf) - 1, 0);	/* (also takes the notification) */
 	} else {
-		fd = open(ROT_POS, O_RDONLY | O_CLOEXEC);
+		fd = rot_open_pos();
 		if (fd < 0)
 			return -1;
 		n = read(fd, buf, sizeof(buf) - 1);
@@ -552,7 +572,8 @@ static bool rot_can_turn(void)
 
 static void rot_motion(bool on)
 {
-	int fd = open(ROT_MOTION, O_WRONLY | O_CLOEXEC);
+	const char *path = rot_motion_path();
+	int fd = path ? open(path, O_WRONLY | O_CLOEXEC) : -1;
 
 	if (fd >= 0) {
 		if (write(fd, on ? "1" : "0", 1) != 1)
@@ -647,8 +668,8 @@ void rot_conf_changed(void)
 
 void rot_init(void)
 {
-	rot_pos_fd = open(ROT_POS, O_RDONLY | O_CLOEXEC);
-	if (rot_pos_fd >= 0 && access(ROT_MOTION, W_OK) == 0) {
+	rot_pos_fd = rot_open_pos();
+	if (rot_pos_fd >= 0 && rot_motion_path()) {
 		rot_ev = true;
 		ui_watch_ev(rot_pos_fd, rot_pos_ev, POLLPRI);
 		/* a UI before this one (restarted, or crashed) may have left the
