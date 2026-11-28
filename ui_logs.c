@@ -243,15 +243,22 @@ static void logs_kmsg_ev(int fd)
 		lv_timer_resume(logs_show_t);
 }
 
-static void logs_update(lv_timer_t *t)
+void logs_net_refresh(void)
 {
 	char usb[32], wlan[32], buf[96];
 
-	LV_UNUSED(t);
+	if (!logs_net || !lv_obj_is_valid(logs_net))
+		return;
 	ip_of("usb0", usb, sizeof(usb));
 	ip_of("wlan0", wlan, sizeof(wlan));
 	snprintf(buf, sizeof(buf), "usb0 %s    wlan0 %s", usb, wlan);
 	label_set_if_changed(logs_net, buf);
+}
+
+static void logs_update(lv_timer_t *t)
+{
+	LV_UNUSED(t);
+	logs_net_refresh();
 	/* no /dev/kmsg: look at the end of the ring (cheap: the kernel formats only that) */
 	if (logs_kmsg < 0 && logs_seen && logs_fill(logs_seen))
 		logs_show();
@@ -261,7 +268,7 @@ static void logs_delete_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
 	if (logs_timer)
-		lv_timer_delete(logs_timer);
+		awake_timer_delete(logs_timer);
 	logs_timer = NULL;
 	if (logs_show_t)
 		lv_timer_pause(logs_show_t);
@@ -329,8 +336,9 @@ void open_logs(lv_event_t *e)
 		if (logs_show_t)
 			lv_timer_pause(logs_show_t);
 	}
-	logs_update(NULL);
-	logs_timer = lv_timer_create(logs_update, 2000, NULL);
+	logs_net_refresh();
+	if (logs_kmsg < 0 || !rtnl_active())
+		logs_timer = awake_timer(logs_update, 2000, NULL);
 	lv_obj_add_event_cb(scr, logs_delete_cb, LV_EVENT_DELETE, NULL);
 	push(scr);
 }

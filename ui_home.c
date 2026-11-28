@@ -40,11 +40,6 @@ static void battery_text_usb(char *buf, size_t len, bool usb)
 		 cap, icon);
 }
 
-static void battery_text(char *buf, size_t len)
-{
-	battery_text_usb(buf, len, usb_powered());
-}
-
 enum batt_lvl battery_cap_level(void)
 {
 	char buf[24] = "";
@@ -64,14 +59,6 @@ enum batt_lvl battery_cap_level(void)
 }
 
 static bool batt_warn_cached;
-
-static bool battery_warn(void)
-{
-	bool warn = !usb_powered() && battery_cap_level() != BATT_NORMAL;
-
-	batt_warn_cached = warn;
-	return warn;
-}
 
 static void battery_style_label(lv_obj_t *lbl, lv_color_t normal_col, bool warn)
 {
@@ -331,6 +318,28 @@ static bool status_batt_dirty, status_net_dirty;
 static lv_timer_t *status_ev_timer;
 static int rtnl_fd = -1;
 
+static void lock_batt_apply(const char *buf, bool warn)
+{
+	if (!lock_scr)
+		return;
+	label_set_if_changed(lock_batt, strstr(buf, LV_SYMBOL_CHARGE) ? buf : "");
+	if (lock_bar_batt) {
+		label_set_if_changed(lock_bar_batt, buf);
+		battery_style_label(lock_bar_batt, lv_color_hex(0xe8e0f0), warn);
+	}
+}
+
+static void batt_labels_apply(const char *buf, bool warn)
+{
+	label_set_if_changed(batt_lbl, buf);
+	battery_style_label(batt_lbl, home_wp ? WP_TEXT : M.on_surface_v, warn);
+	if (home_batt) {
+		label_set_if_changed(home_batt, buf);
+		battery_style_label(home_batt, M.on_surface_v, warn);
+	}
+	lock_batt_apply(buf, warn);
+}
+
 static void status_batt_update(void)
 {
 	char buf[64];
@@ -340,14 +349,10 @@ static void status_batt_update(void)
 
 	batt_warn_cached = warn;
 	battery_text_usb(buf, sizeof(buf), usb);
-	label_set_if_changed(batt_lbl, buf);
-	battery_style_label(batt_lbl, home_wp ? WP_TEXT : M.on_surface_v, warn);
-	if (home_batt) {
-		label_set_if_changed(home_batt, buf);
-		battery_style_label(home_batt, M.on_surface_v, warn);
-	}
+	batt_labels_apply(buf, warn);
 	battery_crit_check_state(blvl, usb);
 	app_bar_update();
+	usb_refresh_ui();
 }
 
 static void status_ev_run(lv_timer_t *t)
@@ -381,8 +386,8 @@ void status_kick(bool batt, bool net)
 	lv_timer_set_repeat_count(status_ev_timer, 1);
 }
 
-/* Is this rtnetlink message about wlan0 (by name for links, by index for addresses)? */
-static bool rtnl_is_wlan(struct nlmsghdr *h, unsigned int wl_idx)
+/* Is this rtnetlink message about @name (by name for links, by index for addresses)? */
+static bool rtnl_is_if(struct nlmsghdr *h, unsigned int idx, const char *name)
 {
 	if (h->nlmsg_type == RTM_NEWLINK || h->nlmsg_type == RTM_DELLINK) {
 		struct ifinfomsg *ifi = NLMSG_DATA(h);
@@ -390,13 +395,13 @@ static bool rtnl_is_wlan(struct nlmsghdr *h, unsigned int wl_idx)
 
 		for (struct rtattr *a = IFLA_RTA(ifi); RTA_OK(a, len); a = RTA_NEXT(a, len))
 			if (a->rta_type == IFLA_IFNAME)
-				return !strcmp(RTA_DATA(a), "wlan0");
-		return wl_idx && (unsigned int)ifi->ifi_index == wl_idx;
+				return !strcmp(RTA_DATA(a), name);
+		return idx && (unsigned int)ifi->ifi_index == idx;
 	}
 	if (h->nlmsg_type == RTM_NEWADDR || h->nlmsg_type == RTM_DELADDR) {
 		struct ifaddrmsg *ifa = NLMSG_DATA(h);
 
-		return wl_idx && ifa->ifa_index == wl_idx;
+		return idx && ifa->ifa_index == idx;
 	}
 	return false;
 }
@@ -405,18 +410,25 @@ static void rtnl_ev(int fd)
 {
 	char buf[4096] __attribute__((aligned(4)));
 	unsigned int wl_idx = if_nametoindex("wlan0");
-	bool wl = false;
+	unsigned int usb_idx = if_nametoindex("usb0");
+	bool wl = false, usb = false;
 	ssize_t n;
 
 	while ((n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT)) > 0) {
 		int len = (int)n;
 
 		for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, len);
-		     h = NLMSG_NEXT(h, len))
-			wl |= rtnl_is_wlan(h, wl_idx);
+		     h = NLMSG_NEXT(h, len)) {
+			wl |= rtnl_is_if(h, wl_idx, "wlan0");
+			usb |= rtnl_is_if(h, usb_idx, "usb0");
+		}
 	}
 	if (wl)
 		status_kick(false, true);
+	if (usb)
+		usb_refresh_ui();
+	if (wl || usb)
+		logs_net_refresh();
 }
 
 void rtnl_init(void)
@@ -432,6 +444,11 @@ void rtnl_init(void)
 	rtnl_fd = fd;
 	if (fd >= 0)
 		ui_watch(fd, rtnl_ev);
+}
+
+bool rtnl_active(void)
+{
+	return rtnl_fd >= 0;
 }
 
 void home_update(lv_timer_t *t)
@@ -456,7 +473,6 @@ void home_update(lv_timer_t *t)
 		status_refresh(false);	/* lands in a moment: wifi_status_done */
 		last_status = now;
 	}
-	status_batt_dirty = false;	/* (read below) */
 	localtime_r(&now, &tm);
 	/* No seconds on screen: run again just after the next minute starts. */
 	if (t)
@@ -464,12 +480,20 @@ void home_update(lv_timer_t *t)
 	snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
 	label_set_if_changed(clock_lbl, buf);
 	label_set_if_changed(status_time, buf);
+	if (locked && lock_scr) {
+		char lt[16];
+
+		snprintf(lt, sizeof(lt), "%d:%02d", tm.tm_hour, tm.tm_min);
+		label_set_if_changed(lock_time, lt);
+	}
 	if (tm.tm_year + 1900 < 2024)
 		snprintf(buf, sizeof(buf), "Clock not set");
 	else
 		snprintf(buf, sizeof(buf), "%s, %d %s", days[tm.tm_wday],
 			 tm.tm_mday, months[tm.tm_mon]);
 	label_set_if_changed(date_lbl, buf);
+	if (locked && lock_scr)
+		label_set_if_changed(lock_date, buf);
 	if (home_date) {
 		char d[32];
 
@@ -484,19 +508,15 @@ void home_update(lv_timer_t *t)
 		snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
 		label_set_if_changed(home_clock, buf);
 	}
-	{
+	if (!t || !uevent_active() || status_batt_dirty || batt_warn_cached) {
 		bool usb = usb_powered();
 		enum batt_lvl blvl = battery_cap_level();
 		bool warn = !usb && blvl != BATT_NORMAL;
 
+		status_batt_dirty = false;
 		batt_warn_cached = warn;
 		battery_text_usb(buf, sizeof(buf), usb);
-		label_set_if_changed(batt_lbl, buf);
-		battery_style_label(batt_lbl, home_wp ? WP_TEXT : M.on_surface_v, warn);
-		if (home_batt) {
-			label_set_if_changed(home_batt, buf);
-			battery_style_label(home_batt, M.on_surface_v, warn);
-		}
+		batt_labels_apply(buf, warn);
 		battery_crit_check_state(blvl, usb);
 	}
 	net_ui_sync();
@@ -2002,11 +2022,14 @@ void lock_update(void)
 		snprintf(buf, sizeof(buf), "%s, %d %s", days[tm.tm_wday], tm.tm_mday,
 			 months[tm.tm_mon]);
 	label_set_if_changed(lock_date, buf);
-	battery_text(buf, sizeof(buf));
-	label_set_if_changed(lock_batt, strstr(buf, LV_SYMBOL_CHARGE) ? buf : "");
-	if (lock_bar_batt && batt_lbl) {
-		label_set_if_changed(lock_bar_batt, lv_label_get_text(batt_lbl));
-		battery_style_label(lock_bar_batt, lv_color_hex(0xe8e0f0), battery_warn());
+	{
+		bool usb = usb_powered();
+		enum batt_lvl blvl = battery_cap_level();
+		bool warn = !usb && blvl != BATT_NORMAL;
+
+		batt_warn_cached = warn;
+		battery_text_usb(buf, sizeof(buf), usb);
+		batt_labels_apply(buf, warn);
 	}
 	np_lock_sync();
 }

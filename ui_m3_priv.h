@@ -428,6 +428,7 @@ bool wifi_shown_on(void);
 void switch_show(lv_obj_t *sw, bool on);
 void net_ui_sync(void);
 void rtnl_init(void);
+bool rtnl_active(void);
 void home_update(lv_timer_t *t);
 extern lv_draw_buf_t *icon_shadow;
 void app_tile(lv_obj_t *parent, const char *icon, const char *name, lv_color_t bg, lv_color_t fg, lv_event_cb_t cb);
@@ -577,6 +578,7 @@ void bt_auto_kick(void);
 void bt_auto_tick(lv_timer_t *t);
 
 /* ui_settings.c */
+void usb_refresh_ui(void);
 void open_display(lv_event_t *e);
 void display_night_apply(void);
 void display_mie_apply(void);
@@ -615,6 +617,7 @@ void open_ipa_install(const char *path);
 void open_settings(lv_event_t *e);
 
 /* ui_logs.c */
+void logs_net_refresh(void);
 void open_logs(lv_event_t *e);
 void ui_reopen(void);
 

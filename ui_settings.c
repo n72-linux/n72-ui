@@ -642,7 +642,7 @@ static void about_delete_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
 	if (about_timer)
-		lv_timer_delete(about_timer);
+		awake_timer_delete(about_timer);
 	about_timer = NULL;
 }
 
@@ -667,7 +667,7 @@ void open_about(lv_event_t *e)
 		lv_label_set_long_mode(about_val[i], LV_LABEL_LONG_WRAP);
 	}
 	about_update(NULL);
-	about_timer = lv_timer_create(about_update, 2000, NULL);
+	about_timer = awake_timer(about_update, 2000, NULL);
 	lv_obj_add_event_cb(scr, about_delete_cb, LV_EVENT_DELETE, NULL);
 	push(scr);
 }
@@ -1022,8 +1022,6 @@ static void jack_ev(int fd)
 }
 
 /* /run changed: n72-audio-route (Bluetooth sound) or n72-usb (USB gadget mode). */
-static void usb_refresh_ui(void);
-
 static void run_ev(int fd)
 {
 	char buf[1024] __attribute__((aligned(__alignof__(struct inotify_event))));
@@ -1081,8 +1079,10 @@ void sound_ui_init(void)
 
 /* ------------------------------------------------------------------ USB */
 
+#define USB_UDC_STATE "/sys/class/udc/38400000.usb/state"
+
 static lv_obj_t *set_usb_sub, *usb_page, *usb_mode_mat, *usb_state_lbl, *usb_detail_lbl;
-static lv_timer_t *usb_timer;
+static int usb_udc_fd = -1;
 static bool usb_busy;
 
 static void usb_summary(char *buf, size_t len)
@@ -1092,18 +1092,31 @@ static void usb_summary(char *buf, size_t len)
 
 static void usb_udc_state(char *buf, size_t len)
 {
-	FILE *f = fopen("/sys/class/udc/38400000.usb/state", "r");
-
 	buf[0] = 0;
-	if (!f)
+	if (!len)
 		return;
-	if (!fgets(buf, (int)len, f))
-		buf[0] = 0;
-	fclose(f);
-	buf[strcspn(buf, "\r\n")] = 0;
+	if (usb_udc_fd >= 0) {
+		ssize_t n = pread(usb_udc_fd, buf, len - 1, 0);
+
+		if (n > 0) {
+			buf[n] = 0;
+			buf[strcspn(buf, "\r\n")] = 0;
+		}
+		return;
+	}
+	{
+		FILE *f = fopen(USB_UDC_STATE, "r");
+
+		if (!f)
+			return;
+		if (!fgets(buf, (int)len, f))
+			buf[0] = 0;
+		fclose(f);
+		buf[strcspn(buf, "\r\n")] = 0;
+	}
 }
 
-static void usb_refresh_ui(void)
+void usb_refresh_ui(void)
 {
 	char buf[96], detail[96];
 	bool mtp = usb_is_mtp();
@@ -1172,20 +1185,24 @@ static void usb_mode_cb(lv_event_t *e)
 	}
 }
 
-static void usb_timer_cb(lv_timer_t *t)
+static void usb_udc_ev(int fd)
 {
-	LV_UNUSED(t);
-	if (screen_off)
+	char buf[32];
+
+	if (pread(fd, buf, sizeof(buf), 0) < 0)
 		return;
-	usb_refresh_ui();
+	if (!screen_off)
+		usb_refresh_ui();
 }
 
 static void usb_delete_cb(lv_event_t *e)
 {
 	LV_UNUSED(e);
-	if (usb_timer)
-		lv_timer_delete(usb_timer);
-	usb_timer = NULL;
+	if (usb_udc_fd >= 0) {
+		ui_unwatch(usb_udc_fd);
+		close(usb_udc_fd);
+		usb_udc_fd = -1;
+	}
 }
 
 static void open_usb(lv_event_t *e)
@@ -1220,8 +1237,19 @@ static void open_usb(lv_event_t *e)
 	m3_note(body, "Network provides USB Ethernet (SSH at 192.168.7.2). MTP exposes the "
 		"full filesystem (/) for file transfers. Switching reconnects USB.");
 
+	if (usb_udc_fd >= 0) {
+		ui_unwatch(usb_udc_fd);
+		close(usb_udc_fd);
+		usb_udc_fd = -1;
+	}
+	usb_udc_fd = open(USB_UDC_STATE, O_RDONLY | O_CLOEXEC);
+	if (usb_udc_fd >= 0) {
+		char dummy[32];
+
+		(void)pread(usb_udc_fd, dummy, sizeof(dummy), 0);
+		ui_watch_ev(usb_udc_fd, usb_udc_ev, POLLPRI);
+	}
 	usb_refresh_ui();
-	usb_timer = lv_timer_create(usb_timer_cb, 2000, NULL);
 	lv_obj_add_event_cb(scr, usb_delete_cb, LV_EVENT_DELETE, NULL);
 	push(scr);
 }

@@ -713,8 +713,14 @@ static void uevent_ev(int fd)
 		plug_changed();
 	if (psy) {
 		status_kick(true, false);	/* the battery text: bolt, level */
-		battery_crit_check();
+		if (!usb)
+			battery_crit_check();
 	}
+}
+
+bool uevent_active(void)
+{
+	return uevent_fd >= 0;
 }
 
 void uevent_init(void)

@@ -63,6 +63,7 @@ extern lv_timer_t *playback_timer;
 void screen_off_or_sleep(void);
 void playback_check(lv_timer_t *t);
 void uevent_init(void);
+bool uevent_active(void);
 void idle_check(lv_timer_t *t);
 void idle_kick(void);
 void idle_timer_sync(void);

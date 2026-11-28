@@ -176,7 +176,8 @@ static void ui_rebuild_overlays_free(void)
 	}
 	if (lock_scr && !locked) {
 		lv_obj_t **lk[] = {
-			&lock_scr, &lock_bar_time, &lock_bar_wifi, &lock_bar_bt, &lock_bar_batt, &lock_bar_np,
+			&lock_scr, &lock_time, &lock_date, &lock_batt,
+			&lock_bar_time, &lock_bar_wifi, &lock_bar_bt, &lock_bar_batt, &lock_bar_np,
 			&npl.card, &npl.title, &npl.sub, &npl.play_sym,
 		};
 
