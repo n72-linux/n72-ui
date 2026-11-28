@@ -91,11 +91,14 @@ static void yt_conf_save(void)
 	FILE *f;
 
 	yt_mkdir();
-	f = fopen(YT_DIR "/conf", "w");
+	f = fopen(YT_DIR "/conf.new", "w");
 	if (!f)
 		return;
 	fprintf(f, "quality=%d\n", yt_quality);
+	if (fflush(f) == 0)
+		fsync(fileno(f));
 	fclose(f);
+	rename(YT_DIR "/conf.new", YT_DIR "/conf");
 }
 
 /*
@@ -1722,9 +1725,9 @@ static void yt_seg_cb(lv_event_t *e)
 	for (int i = 0; i < 2; i++) {
 		bool on = (i == 0) == (q == 360);
 
-		lv_obj_set_style_bg_color(yv.seg[i], on ? M.secondary_c : M.surface, 0);
+		lv_obj_set_style_bg_color(yv.seg[i], on ? M.primary : M.surface, 0);
 		lv_obj_set_style_text_color(lv_obj_get_child(yv.seg[i], 0),
-					    on ? M.on_secondary_c : M.on_surface, 0);
+					    on ? M.on_primary : M.on_surface, 0);
 	}
 	yt_video_off_sync();
 	bp_changed(yv.scr);
@@ -1757,11 +1760,11 @@ static lv_obj_t *yt_quality_seg(lv_obj_t *parent)
 		lv_obj_set_height(b, lv_pct(100));
 		lv_obj_set_flex_grow(b, 1);
 		lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
-		lv_obj_set_style_bg_color(b, on ? M.secondary_c : M.surface, 0);
+		lv_obj_set_style_bg_color(b, on ? M.primary : M.surface, 0);
 		lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
 		lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
 		snprintf(txt, sizeof(txt), "%dp%s", qs[i], i ? "  saves data" : "  sharper");
-		l = m3_label(b, txt, &lv_font_montserrat_14, on ? M.on_secondary_c : M.on_surface);
+		l = m3_label(b, txt, &lv_font_montserrat_14, on ? M.on_primary : M.on_surface);
 		lv_obj_center(l);
 		lv_obj_add_event_cb(b, yt_seg_cb, LV_EVENT_CLICKED, (void *)(intptr_t)qs[i]);
 		yv.seg[i] = b;
@@ -2264,9 +2267,9 @@ static void yt_off_seg_cb(lv_event_t *e)
 	for (int i = 0; i < 3; i++) {
 		bool on = i == f;
 
-		lv_obj_set_style_bg_color(yo.seg[i], on ? M.secondary_c : M.surface, 0);
+		lv_obj_set_style_bg_color(yo.seg[i], on ? M.primary : M.surface, 0);
 		lv_obj_set_style_text_color(lv_obj_get_child(yo.seg[i], 0),
-					    on ? M.on_secondary_c : M.on_surface, 0);
+					    on ? M.on_primary : M.on_surface, 0);
 	}
 	yt_offline_refresh();
 }
@@ -2294,11 +2297,11 @@ static lv_obj_t *yt_off_seg(lv_obj_t *parent)
 		lv_obj_set_height(b, lv_pct(100));
 		lv_obj_set_flex_grow(b, 1);
 		lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
-		lv_obj_set_style_bg_color(b, on ? M.secondary_c : M.surface, 0);
+		lv_obj_set_style_bg_color(b, on ? M.primary : M.surface, 0);
 		lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
 		lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
 		l = m3_label(b, names[i], &lv_font_montserrat_14,
-			     on ? M.on_secondary_c : M.on_surface);
+			     on ? M.on_primary : M.on_surface);
 		lv_obj_center(l);
 		lv_obj_add_event_cb(b, yt_off_seg_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 		yo.seg[i] = b;

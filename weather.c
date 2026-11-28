@@ -294,7 +294,7 @@ static void wx_lock_build(lv_obj_t *scr, int32_t y)
 	lv_obj_set_style_pad_column(r, 8, 0);
 	lv_obj_remove_flag(r, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 	wx.l_icon = lv_image_create(r);
-	wx.l_text = m3_label(r, "", &lv_font_montserrat_16, lv_color_hex(0xe8e0f0));
+	wx.l_text = m3_label(r, "", &lv_font_montserrat_16, lock_text_color());
 	lv_obj_align(r, LV_ALIGN_TOP_MID, 0, y);
 	obj_track(&wx.l_row);
 	obj_track(&wx.l_icon);

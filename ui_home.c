@@ -98,6 +98,7 @@ static void battery_crit_tick(lv_timer_t *t)
 	}
 	if (--crit_secs <= 0) {
 		battery_crit_stop();
+		conf_save_flush();
 		sync();
 		reboot(RB_POWER_OFF);
 		return;
@@ -318,18 +319,61 @@ static bool status_batt_dirty, status_net_dirty;
 static lv_timer_t *status_ev_timer;
 static int rtnl_fd = -1;
 
-static void lock_batt_apply(const char *buf, bool warn)
+static void lock_charge_text(char *buf, size_t len, bool usb)
 {
-	if (!lock_scr)
+	char st[24] = "";
+	FILE *f;
+	bool charging;
+	int ua, ma;
+
+	f = fopen("/sys/class/power_supply/battery/status", "r");
+	if (f) {
+		if (!fgets(st, sizeof(st), f))
+			st[0] = 0;
+		fclose(f);
+	}
+	charging = !strncmp(st, "Charging", 8);
+	if (!charging && !usb) {
+		buf[0] = 0;
 		return;
-	label_set_if_changed(lock_batt, strstr(buf, LV_SYMBOL_CHARGE) ? buf : "");
-	if (lock_bar_batt) {
-		label_set_if_changed(lock_bar_batt, buf);
-		battery_style_label(lock_bar_batt, lv_color_hex(0xe8e0f0), warn);
+	}
+	ua = read_sysfs_int("/sys/class/power_supply/battery/current_now", 0);
+	ma = ua ? LV_ABS(ua) / 1000 : 0;
+	if (ma <= 0)
+		ma = read_sysfs_int("/sys/class/power_supply/usb/input_current_limit", 0) / 1000;
+	if (charging) {
+		if (ma > 0)
+			snprintf(buf, len, LV_SYMBOL_CHARGE "  Charging, %d mA", ma);
+		else
+			snprintf(buf, len, LV_SYMBOL_CHARGE "  Charging");
+	} else if (!strncmp(st, "Full", 4)) {
+		if (ma > 0)
+			snprintf(buf, len, LV_SYMBOL_CHARGE "  Charged, %d mA", ma);
+		else
+			snprintf(buf, len, LV_SYMBOL_CHARGE "  Charged");
+	} else {
+		if (ma > 0)
+			snprintf(buf, len, LV_SYMBOL_CHARGE "  USB power, %d mA", ma);
+		else
+			snprintf(buf, len, LV_SYMBOL_CHARGE "  USB power");
 	}
 }
 
-static void batt_labels_apply(const char *buf, bool warn)
+static void lock_batt_apply(const char *buf, bool usb, bool warn)
+{
+	char chg[48];
+
+	if (!lock_scr)
+		return;
+	lock_charge_text(chg, sizeof(chg), usb);
+	label_set_if_changed(lock_batt, chg);
+	if (lock_bar_batt) {
+		label_set_if_changed(lock_bar_batt, buf);
+		battery_style_label(lock_bar_batt, lock_text_color(), warn);
+	}
+}
+
+static void batt_labels_apply(const char *buf, bool usb, bool warn)
 {
 	label_set_if_changed(batt_lbl, buf);
 	battery_style_label(batt_lbl, home_wp ? WP_TEXT : M.on_surface_v, warn);
@@ -337,7 +381,7 @@ static void batt_labels_apply(const char *buf, bool warn)
 		label_set_if_changed(home_batt, buf);
 		battery_style_label(home_batt, M.on_surface_v, warn);
 	}
-	lock_batt_apply(buf, warn);
+	lock_batt_apply(buf, usb, warn);
 }
 
 static void status_batt_update(void)
@@ -349,7 +393,7 @@ static void status_batt_update(void)
 
 	batt_warn_cached = warn;
 	battery_text_usb(buf, sizeof(buf), usb);
-	batt_labels_apply(buf, warn);
+	batt_labels_apply(buf, usb, warn);
 	battery_crit_check_state(blvl, usb);
 	app_bar_update();
 	usb_refresh_ui();
@@ -516,7 +560,7 @@ void home_update(lv_timer_t *t)
 		status_batt_dirty = false;
 		batt_warn_cached = warn;
 		battery_text_usb(buf, sizeof(buf), usb);
-		batt_labels_apply(buf, warn);
+		batt_labels_apply(buf, usb, warn);
 		battery_crit_check_state(blvl, usb);
 	}
 	net_ui_sync();
@@ -881,13 +925,20 @@ void home_wake(void)
 
 static void home_bright_cb(lv_event_t *e)
 {
-	int v = lv_slider_get_value(lv_event_get_target(e));
+	int v;
 
+	if (sd.on)
+		return;
+	if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+		conf_save_flush();
+		return;
+	}
+	v = lv_slider_get_value(lv_event_get_target(e));
 	ui_auto_bright_off();
 	backlight_set(v);
 	conf.bright = v;
 	conf_save_later();
-	shade_changed(home_bright);
+	ui_bright_sync_widgets(v);
 }
 
 /* ------------------------------------------------- quick settings shade */
@@ -1239,6 +1290,7 @@ void build_shade(void)
 	lv_slider_set_range(home_bright, 5, 100);
 	lv_slider_set_value(home_bright, backlight_get(), LV_ANIM_OFF);
 	lv_obj_add_event_cb(home_bright, home_bright_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	lv_obj_add_event_cb(home_bright, home_bright_cb, LV_EVENT_RELEASED, NULL);
 	/* a drag on the slider is not a swipe */
 	lv_obj_remove_flag(home_bright, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
@@ -1986,7 +2038,7 @@ static void sd_release(void)
  */
 #include "clock_font.h"
 
-lv_obj_t *lock_scr, *lock_time, *lock_date, *lock_batt;
+lv_obj_t *lock_scr, *lock_time, *lock_date, *lock_batt, *lock_hint, *lock_pill;
 static lv_obj_t *lock_from;		/* the screen the lock went over */
 static lv_font_t *clock_font;
 
@@ -2029,7 +2081,7 @@ void lock_update(void)
 
 		batt_warn_cached = warn;
 		battery_text_usb(buf, sizeof(buf), usb);
-		batt_labels_apply(buf, warn);
+		batt_labels_apply(buf, usb, warn);
 	}
 	np_lock_sync();
 }
@@ -2037,6 +2089,7 @@ void lock_update(void)
 static void lock_build(void)
 {
 	lv_obj_t *o;
+	lv_color_t fg;
 
 	if (!clock_font)
 		clock_font = lv_tiny_ttf_create_data(clock_ttf, clock_ttf_len, 88);
@@ -2047,6 +2100,7 @@ static void lock_build(void)
 	lv_obj_set_style_bg_grad_color(lock_scr, lv_color_black(), 0);
 	lv_obj_set_style_bg_grad_dir(lock_scr, LV_GRAD_DIR_VER, 0);
 	lock_wp = wp_put(lock_scr, WP_LOCK);	/* (a picture, if one is set, over the gradient) */
+	fg = lock_text_color();
 
 	/* the status bar, as home's: its time hidden (the clock below shows it) */
 	o = lv_obj_create(lock_scr);
@@ -2057,38 +2111,56 @@ static void lock_build(void)
 	lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
 	status_row(o, &lock_bar_time, &lock_bar_wifi, &lock_bar_bt, &lock_bar_batt);
 	lv_obj_add_flag(lock_bar_time, LV_OBJ_FLAG_HIDDEN);
-	lock_bar_np = m3_label(o, LV_SYMBOL_AUDIO, &lv_font_montserrat_14, M.on_surface_v);
+	lock_bar_np = m3_label(o, LV_SYMBOL_AUDIO, &lv_font_montserrat_14, fg);
 	lv_obj_move_to_index(lock_bar_np, (int32_t)lv_obj_get_index(lock_bar_wifi));
 	lv_obj_add_flag(lock_bar_np, LV_OBJ_FLAG_HIDDEN);
 	{
 		lv_obj_t *const l[] = { lock_bar_np, lock_bar_wifi, lock_bar_bt, lock_bar_batt };
 
 		for (unsigned i = 0; i < sizeof(l) / sizeof(l[0]); i++)
-			lv_obj_set_style_text_color(l[i], lv_color_hex(0xe8e0f0), 0);
+			lv_obj_set_style_text_color(l[i], fg, 0);
 	}
 
-	lock_date = m3_label(lock_scr, "", &lv_font_montserrat_20, lv_color_hex(0xe8e0f0));
+	lock_date = m3_label(lock_scr, "", &lv_font_montserrat_20, fg);
 	lv_obj_align(lock_date, LV_ALIGN_TOP_MID, 0, 64);
-	lock_time = m3_label(lock_scr, "", clock_font ? clock_font : &lv_font_montserrat_48,
-			     lv_color_white());
+	lock_time = m3_label(lock_scr, "", clock_font ? clock_font : &lv_font_montserrat_48, fg);
 	lv_obj_align(lock_time, LV_ALIGN_TOP_MID, 0, 90);
 	wx_lock_build(lock_scr, 196);	/* (hidden while there is none) */
 	np_lock_build(lock_scr);	/* (hidden while nothing plays) */
-	lock_batt = m3_label(lock_scr, "", &lv_font_montserrat_14, lv_color_hex(0xc8c0d0));
+	lock_batt = m3_label(lock_scr, "", &lv_font_montserrat_14, fg);
 	lv_obj_align(lock_batt, LV_ALIGN_BOTTOM_MID, 0, -74);
-	o = m3_label(lock_scr, "Swipe up to unlock", &lv_font_montserrat_14, lv_color_hex(0xb0a8b8));
-	lv_obj_align(o, LV_ALIGN_BOTTOM_MID, 0, -36);
-	o = lv_obj_create(lock_scr);	/* home indicator */
+	lock_hint = m3_label(lock_scr, "Swipe up to unlock", &lv_font_montserrat_14, fg);
+	lv_obj_align(lock_hint, LV_ALIGN_BOTTOM_MID, 0, -36);
+	lock_pill = o = lv_obj_create(lock_scr);	/* home indicator */
 	plain(o);
 	lv_obj_set_size(o, 120, 5);
 	lv_obj_set_style_radius(o, 3, 0);
-	lv_obj_set_style_bg_color(o, lv_color_white(), 0);
+	lv_obj_set_style_bg_color(o, fg, 0);
 	lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
 	lv_obj_set_style_pad_all(o, 0, 0);
 	lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_align(o, LV_ALIGN_BOTTOM_MID, 0, -12);
 	net_ui_sync();		/* (the bar's icons as they are now) */
 	np_sync();
+}
+
+void lock_color_sync(void)
+{
+	lv_color_t fg;
+	lv_obj_t *const l[] = {
+		lock_bar_np, lock_bar_wifi, lock_bar_bt,
+		lock_date, lock_time, lock_batt, lock_hint, wx.l_text,
+	};
+
+	if (!lock_scr || !lv_obj_is_valid(lock_scr))
+		return;
+	fg = lock_text_color();
+	for (unsigned i = 0; i < sizeof(l) / sizeof(l[0]); i++)
+		if (l[i] && lv_obj_is_valid(l[i]))
+			lv_obj_set_style_text_color(l[i], fg, 0);
+	battery_style_label(lock_bar_batt, fg, batt_warn_cached);
+	if (lock_pill && lv_obj_is_valid(lock_pill))
+		lv_obj_set_style_bg_color(lock_pill, fg, 0);
 }
 
 static void ul_free(void)

@@ -55,9 +55,9 @@ static lv_obj_t *segmented_matrix(lv_obj_t *parent, const char *const *map, uint
 	lv_obj_set_style_pad_all(bm, 0, 0);
 	lv_obj_set_style_radius(bm, LV_RADIUS_CIRCLE, LV_PART_ITEMS);
 	lv_obj_set_style_bg_color(bm, M.surface_c_high, LV_PART_ITEMS);
-	lv_obj_set_style_bg_color(bm, M.secondary_c, LV_PART_ITEMS | LV_STATE_CHECKED);
+	lv_obj_set_style_bg_color(bm, M.primary, LV_PART_ITEMS | LV_STATE_CHECKED);
 	lv_obj_set_style_text_color(bm, M.on_surface, LV_PART_ITEMS);
-	lv_obj_set_style_text_color(bm, M.on_secondary_c, LV_PART_ITEMS | LV_STATE_CHECKED);
+	lv_obj_set_style_text_color(bm, M.on_primary, LV_PART_ITEMS | LV_STATE_CHECKED);
 	/* the default theme gives the buttons a shadow (a halo on light) */
 	lv_obj_set_style_shadow_width(bm, 0, LV_PART_ITEMS);
 	lv_obj_set_style_outline_width(bm, 0, LV_PART_ITEMS);
@@ -87,6 +87,7 @@ static void night_sw_cb(lv_event_t *e)
 
 static void night_warmth_cb(lv_event_t *e)
 {
+	lv_event_code_t code = lv_event_get_code(e);
 	int v = lv_slider_get_value(lv_event_get_target(e));
 	bool turned_on = false;
 	char buf[16];
@@ -100,12 +101,14 @@ static void night_warmth_cb(lv_event_t *e)
 		ui_night_sync_widgets();
 	}
 	pf_label_changed(lv_event_get_target(e));
-	if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+	if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
 		qs_night_sync();
 		display_night_apply();
 		conf_save();
-	} else if (turned_on) {
-		qs_night_sync();
+	} else {
+		conf_save_later();
+		if (turned_on)
+			qs_night_sync();
 	}
 }
 
@@ -137,6 +140,7 @@ void ui_auto_bright_off(void)
 		pf_label_changed(auto_bright_sw);
 	}
 	auto_bright_sync();
+	conf_save();
 }
 
 static void auto_bright_cb(lv_event_t *e)
@@ -149,9 +153,16 @@ static void auto_bright_cb(lv_event_t *e)
 
 static void bright_cb(lv_event_t *e)
 {
-	int v = lv_slider_get_value(lv_event_get_target(e));
+	int v;
 	char buf[16];
 
+	if (sd.on)
+		return;
+	if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+		conf_save_flush();
+		return;
+	}
+	v = lv_slider_get_value(lv_event_get_target(e));
 	ui_auto_bright_off();
 	backlight_set(v);
 	conf.bright = v;
@@ -205,6 +216,100 @@ static void plug_cb(lv_event_t *e)
 	conf_save();
 }
 
+static void lock_col_style_dot(lv_obj_t *dot, int idx, bool sel)
+{
+	lv_obj_t *lbl = lv_obj_get_child(dot, 0);
+	lv_color_t bg, fg;
+
+	if (idx == 0) {
+		bg = sel ? M.primary : M.surface_c_highest;
+		fg = sel ? M.on_primary : M.on_surface;
+	} else if (idx == 3) {
+		bg = M.primary;
+		fg = M.on_primary;
+	} else {
+		bg = lv_color_hex(lock_cols[idx].hex);
+		fg = idx == 2 ? lv_color_white() : lv_color_hex(0x18181c);
+	}
+	lv_obj_set_style_bg_color(dot, bg, 0);
+	lv_obj_set_style_border_width(dot, sel ? 3 : 1, 0);
+	lv_obj_set_style_border_color(dot, sel ? M.on_surface : M.outline, 0);
+	if (lbl) {
+		lv_label_set_text(lbl, idx == 0 ? "A" : sel ? LV_SYMBOL_OK : "");
+		lv_obj_set_style_text_color(lbl, fg, 0);
+	}
+}
+
+static void lock_col_cb(lv_event_t *e)
+{
+	lv_obj_t *dot = lv_event_get_target(e);
+	lv_obj_t *row = lv_obj_get_parent(dot);
+	lv_obj_t *val = lv_obj_get_user_data(row);
+	int idx = (int)(intptr_t)lv_event_get_user_data(e);
+
+	if (idx == conf.lock_col || idx < 0 || idx >= N_LOCK_COLS)
+		return;
+	conf.lock_col = idx;
+	for (int i = 0; i < N_LOCK_COLS; i++) {
+		lv_obj_t *d = lv_obj_get_child(row, (int32_t)i);
+
+		if (d)
+			lock_col_style_dot(d, i, i == conf.lock_col);
+	}
+	if (val && lv_obj_is_valid(val))
+		label_set_if_changed(val, lock_cols[conf.lock_col].name);
+	lock_color_sync();
+	pf_label_changed(row);
+	conf_save();
+}
+
+static void lock_col_section(lv_obj_t *body)
+{
+	lv_obj_t *hdr, *val, *row;
+	int cur = (conf.lock_col >= 0 && conf.lock_col < N_LOCK_COLS) ? conf.lock_col : 0;
+
+	hdr = lv_obj_create(body);
+	plain(hdr);
+	lv_obj_set_size(hdr, lv_pct(100), LV_SIZE_CONTENT);
+	lv_obj_set_style_bg_opa(hdr, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_pad_hor(hdr, 8, 0);
+	lv_obj_set_style_pad_top(hdr, 8, 0);
+	lv_obj_set_style_pad_bottom(hdr, 0, 0);
+	lv_obj_remove_flag(hdr, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+	lv_obj_set_flex_flow(hdr, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+			      LV_FLEX_ALIGN_CENTER);
+	m3_label(hdr, "Lock screen text", &lv_font_montserrat_14, M.primary);
+	val = m3_label(hdr, lock_cols[cur].name, &lv_font_montserrat_14, M.on_surface_v);
+
+	row = lv_obj_create(body);
+	plain(row);
+	lv_obj_set_size(row, lv_pct(100), 56);
+	lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_pad_all(row, 0, 0);
+	lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+	lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+			      LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_user_data(row, val);
+	for (int i = 0; i < N_LOCK_COLS; i++) {
+		lv_obj_t *dot = lv_obj_create(row);
+		lv_obj_t *lbl;
+
+		plain(dot);
+		lv_obj_set_size(dot, 40, 40);
+		lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+		lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+		lv_obj_set_style_pad_all(dot, 0, 0);
+		lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+		lbl = m3_label(dot, "", &lv_font_montserrat_14, M.on_surface);
+		lv_obj_remove_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
+		lv_obj_center(lbl);
+		lock_col_style_dot(dot, i, i == cur);
+		lv_obj_add_event_cb(dot, lock_col_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+	}
+}
+
 void open_display(lv_event_t *e)
 {
 	nav_mark(open_display, NULL);
@@ -228,6 +333,7 @@ void open_display(lv_event_t *e)
 	lv_slider_set_range(s, 5, 100);
 	lv_slider_set_value(s, backlight_get(), LV_ANIM_OFF);
 	lv_obj_add_event_cb(s, bright_cb, LV_EVENT_VALUE_CHANGED, NULL);
+	lv_obj_add_event_cb(s, bright_cb, LV_EVENT_RELEASED, NULL);
 	bright_val = slider_value(c);
 	obj_track(&bright_val);
 	lv_label_set_text_fmt(bright_val, "%d%%", backlight_get());
@@ -275,6 +381,7 @@ void open_display(lv_event_t *e)
 		lv_slider_set_value(s, conf.night_warmth, LV_ANIM_OFF);
 		lv_obj_add_event_cb(s, night_warmth_cb, LV_EVENT_VALUE_CHANGED, NULL);
 		lv_obj_add_event_cb(s, night_warmth_cb, LV_EVENT_RELEASED, NULL);
+		lv_obj_add_event_cb(s, night_warmth_cb, LV_EVENT_PRESS_LOST, NULL);
 		night_val = slider_value(c);
 		obj_track(&night_val);
 		lv_label_set_text_fmt(night_val, "%d%%", conf.night_warmth);
@@ -314,6 +421,8 @@ void open_display(lv_event_t *e)
 		lv_obj_add_event_cb(dot, accent_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 	}
 
+	lock_col_section(body);
+
 	m3_section(body, "Screen timeout");
 	c = m3_card(body, M.surface_c);
 	m3_label(c, "Turn the screen off after", &lv_font_montserrat_14, M.on_surface_v);
@@ -351,6 +460,7 @@ static void power_do(lv_event_t *e)
 {
 	intptr_t what = (intptr_t)lv_event_get_user_data(e);
 
+	conf_save_flush();
 	sync();
 	reboot(what == 1 ? RB_POWER_OFF : RB_AUTOBOOT);
 }

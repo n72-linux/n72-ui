@@ -61,7 +61,16 @@ void np_lock_sync(void);
 #define CONF_OLD "/tmp/n72-ui.conf"
 
 
-struct n72_conf conf = { true, 0, 120, 60, true, true, 0, 0, 0, false, false, 50, 0, -1, -1, false, "", false, "", false, "", false, "", 0, 0, false, false };
+struct n72_conf conf = {
+	.dark = true,
+	.idle_s = 120,
+	.vol = 60,
+	.spk = true,
+	.wake_plug = true,
+	.night_warmth = 50,
+	.wifi = -1,
+	.bt = -1,
+};
 
 /*
  * Auto-rotate on: the screen turns with the iPod. Off: it stays as it was
@@ -71,6 +80,15 @@ struct n72_conf conf = { true, 0, 120, 60, true, true, 0, 0, 0, false, false, 50
 const struct accents accents[] = {
 	{ "Violet", 265, 48 }, { "Blue", 215, 60 }, { "Teal", 178, 55 },
 	{ "Green", 135, 40 }, { "Amber", 38, 70 }, { "Rose", 340, 55 },
+};
+
+const struct lock_col_opt lock_cols[N_LOCK_COLS] = {
+	{ "Auto", 0 },		/* adapts to lock wallpaper brightness */
+	{ "White", 0xffffff },
+	{ "Dark", 0x18181c },
+	{ "Accent", 0 },	/* M.primary */
+	{ "Amber", 0xf4b942 },
+	{ "Sky", 0x64b5f6 },
 };
 
 struct wp wp = { .hue = -1 };
@@ -89,9 +107,16 @@ void pg_abort(void);
 
 void conf_load(void)
 {
+	static bool conf_loaded;
 	char line[1300];
-	FILE *f = fopen(CONF_PATH, "r");
-	const char *e = getenv("N72_IDLE_SLEEP");
+	FILE *f;
+	const char *e;
+
+	if (conf_loaded)
+		return;
+	conf_loaded = true;
+	f = fopen(CONF_PATH, "r");
+	e = getenv("N72_IDLE_SLEEP");
 
 	if (!f)
 		f = fopen(CONF_OLD, "r");
@@ -131,12 +156,16 @@ void conf_load(void)
 			conf.night_warmth = v;
 		else if (sscanf(line, "mie=%d", &v) == 1 && v >= 0 && v <= 2)
 			conf.mie_mode = v;
-		else if (sscanf(line, "wifi=%d", &v) == 1)
-			conf.wifi = !!v;
-		else if (sscanf(line, "bt=%d", &v) == 1)
-			conf.bt = !!v;
+		else if (sscanf(line, "wifi=%d", &v) == 1 && v >= -1 && v <= 1)
+			conf.wifi = v;
+		else if (sscanf(line, "bt=%d", &v) == 1 && v >= -1 && v <= 1)
+			conf.bt = v;
 		else if (sscanf(line, "wpaccent=%d", &v) == 1)
 			conf.wp_accent = !!v;
+		else if (sscanf(line, "lockcol=%d", &v) == 1 && v >= 0 && v < N_LOCK_COLS)
+			conf.lock_col = v;
+		else if (sscanf(line, "ipadel=%d", &v) == 1)
+			conf.ipa_del = !!v;
 		else if (!strncmp(line, "wx=", 3)) {
 			int n = 0;
 
@@ -164,19 +193,28 @@ void conf_load(void)
 	fclose(f);
 }
 
+/* A setting that moves a lot (the brightness slider): saved once it rests. */
+static lv_timer_t *conf_save_timer;
+
 void conf_save(void)
 {
 	FILE *f;
 
+	if (conf_save_timer) {
+		lv_timer_delete(conf_save_timer);
+		conf_save_timer = NULL;
+	}
 	mkdir(CONF_DIR, 0755);
 	f = fopen(CONF_PATH ".new", "w");
 	if (!f)
 		return;
 	fprintf(f, "dark=%d\naccent=%d\nidle=%d\nvol=%d\nspk=%d\nplug=%d\nrot=%d\nrotlock=%d\n"
-		"bright=%d\nautobright=%d\nnight=%d\nwarmth=%d\nmie=%d\nwifi=%d\nbt=%d\nwpaccent=%d\n",
+		"bright=%d\nautobright=%d\nnight=%d\nwarmth=%d\nmie=%d\nwifi=%d\nbt=%d\nwpaccent=%d\n"
+		"lockcol=%d\nipadel=%d\n",
 		conf.dark, conf.accent, conf.idle_s, conf.vol, conf.spk, conf.wake_plug,
 		conf.autorot, conf.rotlock, conf.bright, conf.auto_bright, conf.night_shift,
-		conf.night_warmth, conf.mie_mode, conf.wifi, conf.bt, conf.wp_accent);
+		conf.night_warmth, conf.mie_mode, conf.wifi, conf.bt, conf.wp_accent,
+		conf.lock_col, conf.ipa_del);
 	if (conf.dock_set)	/* (only once changed: the file is as it was till then) */
 		fprintf(f, "dock=%s\n", conf.dock);
 	if (conf.order_set)
@@ -190,11 +228,15 @@ void conf_save(void)
 	if (fflush(f) == 0)
 		fsync(fileno(f));
 	fclose(f);
-	rename(CONF_PATH ".new", CONF_PATH);	/* (whole or not at all) */
-}
+	if (rename(CONF_PATH ".new", CONF_PATH) == 0) {
+		int dfd = open(CONF_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 
-/* A setting that moves a lot (the brightness slider): saved once it rests. */
-static lv_timer_t *conf_save_timer;
+		if (dfd >= 0) {
+			fsync(dfd);
+			close(dfd);
+		}
+	}
+}
 
 static void conf_save_cb(lv_timer_t *t)
 {
@@ -211,6 +253,12 @@ void conf_save_later(void)
 		conf_save_timer = lv_timer_create(conf_save_cb, 2000, NULL);
 		lv_timer_set_repeat_count(conf_save_timer, 1);
 	}
+}
+
+void conf_save_flush(void)
+{
+	if (conf_save_timer)
+		conf_save();
 }
 
 /* --------------------------------------------------- Material You theme */
@@ -252,16 +300,31 @@ static void m3_build_palette(void)
 		M.outline = tone(h, snv, 60);	M.outline_v = tone(h, snv, 30);
 		M.error = lv_color_hex(0xffb4ab);
 	} else {
-		M.primary = tone(h, s, 40);	M.on_primary = lv_color_white();
-		M.primary_c = tone(h, s, 90);	M.on_primary_c = tone(h, s, 10);
-		M.secondary_c = tone(h, s / 3, 90); M.on_secondary_c = tone(h, s / 3, 10);
-		M.tertiary_c = tone(h2, s / 2, 90); M.on_tertiary_c = tone(h2, s / 2, 10);
-		M.surface = tone(h, sn, 98);	M.surface_c = tone(h, sn, 94);
-		M.surface_c_high = tone(h, sn, 92); M.surface_c_highest = tone(h, sn, 90);
-		M.on_surface = tone(h, sn, 10);	M.on_surface_v = tone(h, snv, 30);
-		M.outline = tone(h, snv, 50);	M.outline_v = tone(h, snv, 80);
+		uint8_t spc = (uint8_t)LV_MIN(s + 15, 78);
+		uint8_t ssc = (uint8_t)LV_MIN(s / 2 + 10, 48);
+		uint8_t stc = (uint8_t)LV_MIN(s / 2 + 14, 65);
+
+		M.primary = tone(h, s, 40);		M.on_primary = lv_color_white();
+		M.primary_c = tone(h, spc, 78);		M.on_primary_c = tone(h, s, 12);
+		M.secondary_c = tone(h, ssc, 82);	M.on_secondary_c = tone(h, s / 2, 12);
+		M.tertiary_c = tone(h2, stc, 80);	M.on_tertiary_c = tone(h2, s / 2, 12);
+		M.surface = tone(h, sn, 98);		M.surface_c = tone(h, sn, 95);
+		M.surface_c_high = tone(h, sn, 92);	M.surface_c_highest = tone(h, sn, 88);
+		M.on_surface = tone(h, sn, 10);		M.on_surface_v = tone(h, snv, 32);
+		M.outline = tone(h, snv, 50);		M.outline_v = tone(h, snv, 78);
 		M.error = lv_color_hex(0xba1a1a);
 	}
+}
+
+lv_color_t lock_text_color(void)
+{
+	int idx = (conf.lock_col >= 0 && conf.lock_col < N_LOCK_COLS) ? conf.lock_col : 0;
+
+	if (idx == 0)
+		return (lock_wp && wp.luma[WP_LOCK] >= 145) ? lv_color_hex(0x18181c) : lv_color_white();
+	if (idx == 3)
+		return M.primary;
+	return lv_color_hex(lock_cols[idx].hex);
 }
 
 void m3_apply_theme(void)

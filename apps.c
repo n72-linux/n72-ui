@@ -1480,7 +1480,6 @@ static void open_app_detail(lv_event_t *e)
 
 static char ipa_src_path[PATH_MAX];
 static struct ipa_info ipa_cur;
-static bool ipa_del_after;
 static bool ipa_installing;
 static bool ipa_done_ok;
 static char ipa_installed_path[PATH_MAX];
@@ -1491,7 +1490,9 @@ static lv_obj_t *ipa_btn_row;
 
 static void ipa_del_sw_cb(lv_event_t *e)
 {
-	ipa_del_after = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+	conf.ipa_del = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+	pf_label_changed(lv_event_get_target(e));
+	conf_save();
 }
 
 static void ipa_launch_cb(lv_event_t *e)
@@ -1577,7 +1578,7 @@ static void ipa_install_cb(lv_event_t *e)
 		 "rm -rf \"$TMP\"; %s"
 		 "[ -x " IOS_TILES " ] && " IOS_TILES " >/dev/null 2>&1; "
 		 "echo ipa-ok",
-		 qa, qs, qbd, ipa_del_after ? "rm -f \"$SRC\"; " : "");
+		 qa, qs, qbd, conf.ipa_del ? "rm -f \"$SRC\"; " : "");
 	ipa_installing = true;
 	ipa_done_ok = false;
 	if (ipa_status_lbl && lv_obj_is_valid(ipa_status_lbl))
@@ -1699,7 +1700,7 @@ static void open_ipa_install_re(lv_event_t *e)
 				"Delete .ipa after install", "Free space once unpacked",
 				NULL, NULL, NULL, false);
 		sw = ios_switch(lv_switch_create(row));
-		if (ipa_del_after)
+		if (conf.ipa_del)
 			lv_obj_add_state(sw, LV_STATE_CHECKED);
 		lv_obj_add_event_cb(sw, ipa_del_sw_cb, LV_EVENT_VALUE_CHANGED, NULL);
 	}

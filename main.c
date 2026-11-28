@@ -811,6 +811,7 @@ static void als_tick(lv_timer_t *t)
 	als_dir_cnt = 0;
 	from = bl_hw_raw > 0 ? bl_hw_raw : bl_user_raw();
 	bl_user = target;
+	conf.bright = target;
 	to = bl_user_raw();
 	if (from != to) {
 		lv_anim_t a;
@@ -1578,8 +1579,17 @@ static void restore_tty(void)
 		ioctl(tty_fd, KDSETMODE, KD_TEXT);
 }
 
+static volatile sig_atomic_t exit_sig;
+
 static void on_signal(int sig)
 {
+	exit_sig = sig;
+	signal(sig, SIG_DFL);	/* a second signal ends at once */
+}
+
+static void finish_signal(int sig)
+{
+	conf_save_flush();
 	/* the application started goes with the launcher (else a video kept
 	 * playing, with nothing to stop it, after a restart) */
 	if (app_pid > 0)
@@ -1914,6 +1924,8 @@ int main(int argc, char **argv)
 				    (next_timer_ms == UINT32_MAX || (int32_t)(next_timer_ms - tick_ms()) > 0))
 					skip_timers = true;
 			}
+			if (exit_sig)
+				finish_signal((int)exit_sig);
 			if (shot_wanted || scans_wanted)
 				shot_poll(NULL);	/* (asked by SIGUSR1/2) */
 		}

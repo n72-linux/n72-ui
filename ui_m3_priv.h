@@ -52,6 +52,8 @@ struct n72_conf {
 	char wx_name[96];	/* the weather's place (weather.c) */
 	double wx_lat, wx_lon;
 	bool wx_set, wx_f;	/* a place set; Fahrenheit */
+	int lock_col;		/* lock screen text colour preset, 0 = auto */
+	bool ipa_del;		/* delete .ipa after install (apps.c) */
 };
 
 /* ui_m3.c and the files of the user interface, used by main.c and sleep.c */
@@ -101,6 +103,12 @@ struct npl {
 struct accents { const char *name; uint16_t hue; uint8_t sat; };
 
 #define N_ACCENTS ((int)(sizeof(accents) / sizeof(accents[0])))
+
+struct lock_col_opt { const char *name; uint32_t hex; };
+extern const struct lock_col_opt lock_cols[];
+#define N_LOCK_COLS 6
+lv_color_t lock_text_color(void);
+void lock_color_sync(void);
 
 /* Wallpapers (wallpaper.c) */
 enum { WP_HOME, WP_LOCK, WP_KINDS };
@@ -313,6 +321,7 @@ extern bool lock_wp;
 void conf_load(void);
 void conf_save(void);
 void conf_save_later(void);
+void conf_save_flush(void);
 extern struct M M;
 lv_color_t tone(uint16_t h, uint8_t s, uint8_t l);
 void m3_apply_theme(void);
@@ -493,6 +502,8 @@ extern lv_obj_t *lock_scr;
 extern lv_obj_t *lock_time;
 extern lv_obj_t *lock_date;
 extern lv_obj_t *lock_batt;
+extern lv_obj_t *lock_hint;
+extern lv_obj_t *lock_pill;
 void lock_update(void);
 void ui_lock(void);
 void lock_wake(void);

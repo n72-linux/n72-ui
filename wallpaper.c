@@ -1594,6 +1594,7 @@ void open_wallpaper(lv_event_t *e)
 			lv_obj_add_state(sw, LV_STATE_CHECKED);
 		lv_obj_add_event_cb(sw, wp_accent_cb, LV_EVENT_VALUE_CHANGED, NULL);
 	}
+	lock_col_section(body);
 	while (d && (de = readdir(d))) {
 		if (!wp_is_picture(de->d_name))
 			continue;

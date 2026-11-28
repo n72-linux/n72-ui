@@ -1549,6 +1549,7 @@ void ui_apply_saved(void)
 		conf_save();	/* (the first start: what was in /tmp, onto the flash) */
 	if (conf.bright >= 5)
 		backlight_set(conf.bright);
+	ui_bright_sync_widgets(backlight_get());
 	auto_bright_sync();
 	display_night_apply();
 	display_mie_apply();
